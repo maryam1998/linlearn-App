@@ -1,0 +1,10 @@
+{
+  "appId": "com.linglearn.app",
+  "appName": "LingoLearn",
+  "webDir": "www",
+  "server": {
+    "url": "https://maryam1998.github.io/Hope/",
+    "androidScheme": "https",
+    "cleartext": true
+  }
+}
