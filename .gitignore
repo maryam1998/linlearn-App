@@ -9,3 +9,6 @@ android/build/
 android/app/build/
 android/local.properties
 android/.gradle/
+android/gradle/gradle-8.7/
+android/gradle.zip
+android/local-maven-repo/

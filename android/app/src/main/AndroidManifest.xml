@@ -33,9 +33,27 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths"></meta-data>
         </provider>
+
+        <!-- ⭐ این سرویس رو اضافه کردیم برای حباب شناور -->
+        <service
+            android:name=".overlay.BubbleService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
     </application>
 
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- ⭐ مجوز نمایش پنجره روی اپ‌های دیگه (برای حباب شناور) -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- ⭐ مجوز Foreground Service (سرویس پس‌زمینه) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <!-- ⭐ مجوز ضبط صدا (برای مرحله‌های بعدی) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
 </manifest>
