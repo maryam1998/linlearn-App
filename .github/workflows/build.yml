@@ -33,6 +33,13 @@ jobs:
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
+      - name: Download Gradle wrapper (if missing)
+        run: |
+          if [ ! -f android/gradle/wrapper/gradle.zip ]; then
+            mkdir -p android/gradle/wrapper
+            curl -L -o android/gradle/wrapper/gradle.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          fi
+
       - name: Build Debug APK
         run: |
           cd android
