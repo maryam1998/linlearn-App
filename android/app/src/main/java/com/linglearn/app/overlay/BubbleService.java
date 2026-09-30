@@ -81,13 +81,19 @@ public class BubbleService extends Service {
     private static final int SAMPLE_RATE = 16000;
     private static final int CHUNK_MS = 100;
     private static final int CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS / 1000;
-    private static final int MIN_SEG_MS = 2000;
-    private static final int MAX_SEG_MS = 8000;
+    private static final int MIN_SEG_MS = 1500;
+    private static final int MAX_SEG_MS = 4000;
     private static final int SILENCE_CUT_MS = 500;
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
     private static final long PANEL_HIDE_MS = 6000;
+
+    // ---- Network resilience ----
+    private static final int NET_ATTEMPTS = 3;
+    private static final int CONNECT_TIMEOUT_MS = 10000;
+    private static final int TRANSCRIBE_READ_TIMEOUT_MS = 20000;
+    private static final int TRANSLATE_READ_TIMEOUT_MS = 15000;
 
     private static final String PREFS = "bubble_prefs";
     private static final String CHANNEL_ID = "bubble_channel";
@@ -688,7 +694,7 @@ public class BubbleService extends Service {
         if (src != null && !src.isEmpty() && !"auto".equals(src)) {
             url += "?lang=" + URLEncoder.encode(src, "UTF-8");
         }
-        String resp = postBytes(url, "audio/wav", toWav(pcm), 45000);
+        String resp = postBytes(url, "audio/wav", toWav(pcm), TRANSCRIBE_READ_TIMEOUT_MS);
         JSONObject j = new JSONObject(resp);
         return j.optString("text", "").trim();
     }
@@ -701,7 +707,7 @@ public class BubbleService extends Service {
         JSONObject body = new JSONObject();
         body.put(GENERATE_PROMPT_KEY, prompt);
         String resp = postBytes(WORKER_BASE + GENERATE_PATH, "application/json; charset=utf-8",
-                body.toString().getBytes(StandardCharsets.UTF_8), 30000);
+                body.toString().getBytes(StandardCharsets.UTF_8), TRANSLATE_READ_TIMEOUT_MS);
         return extractText(resp);
     }
 
@@ -753,14 +759,53 @@ public class BubbleService extends Service {
         return b.array();
     }
 
+    private static class HttpStatusException extends IOException {
+        final int code;
+
+        HttpStatusException(int code, String body) {
+            super("HTTP " + code + " " + body);
+            this.code = code;
+        }
+    }
+
+    // Retries on dropped/stale connections ("unexpected end of stream"), timeouts and 5xx/429.
     private static String postBytes(String urlStr, String contentType, byte[] body, int readTimeoutMs)
+            throws IOException {
+        IOException last = null;
+        for (int attempt = 1; attempt <= NET_ATTEMPTS; attempt++) {
+            try {
+                return postOnce(urlStr, contentType, body, readTimeoutMs);
+            } catch (IOException e) {
+                last = e;
+                if (e instanceof HttpStatusException) {
+                    int code = ((HttpStatusException) e).code;
+                    if (code < 500 && code != 429) throw e;
+                }
+                Log.w(TAG, "request attempt " + attempt + " failed: " + e);
+                if (attempt == NET_ATTEMPTS) break;
+                try {
+                    Thread.sleep(300L * attempt);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+        throw last;
+    }
+
+    private static String postOnce(String urlStr, String contentType, byte[] body, int readTimeoutMs)
             throws IOException {
         HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
         try {
             c.setRequestMethod("POST");
-            c.setConnectTimeout(15000);
+            c.setConnectTimeout(CONNECT_TIMEOUT_MS);
             c.setReadTimeout(readTimeoutMs);
             c.setDoOutput(true);
+            c.setUseCaches(false);
+            // Fresh connection every time: a pooled keep-alive socket that the carrier/Cloudflare
+            // already closed is what causes "unexpected end of stream on ...Address".
+            c.setRequestProperty("Connection", "close");
             c.setRequestProperty("Content-Type", contentType);
             c.setFixedLengthStreamingMode(body.length);
             try (OutputStream os = c.getOutputStream()) {
@@ -769,7 +814,7 @@ public class BubbleService extends Service {
             int code = c.getResponseCode();
             InputStream is = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
             String resp = readAll(is);
-            if (code < 200 || code >= 300) throw new IOException("HTTP " + code + " " + resp);
+            if (code < 200 || code >= 300) throw new HttpStatusException(code, resp);
             return resp;
         } finally {
             c.disconnect();
@@ -788,6 +833,11 @@ public class BubbleService extends Service {
 
     private static String briefErr(Exception e) {
         String m = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        if (m.contains("unexpected end of stream") || m.contains("Unable to resolve host")
+                || m.contains("timed out") || m.contains("Connection reset")
+                || m.contains("Software caused connection abort")) {
+            return "Network unstable, retrying next segment";
+        }
         return m.length() > 120 ? m.substring(0, 120) + "…" : m;
     }
 
