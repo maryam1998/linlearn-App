@@ -22,7 +22,7 @@ import okhttp3.Response;
  * (getFilesDir()/sherpa/&lt;lang&gt;/) and how to download them on demand from HuggingFace.
  *
  * Models are NEVER bundled in the APK. Languages without an entry in {@link #SPECS}
- * (Persian, Arabic, Turkish, ...) are "unsupported": the caller falls back to the Google/server path.
+ * (Japanese, Hebrew, Hindi, Urdu, ...) are "unsupported": the caller falls back to the Google/server path.
  *
  * To add a language, add one more {@code SPECS.put(...)} line below.
  */
@@ -53,21 +53,102 @@ final class SherpaModelManager {
     private static final Map<String, Spec> SPECS;
     static {
         Map<String, Spec> m = new HashMap<>();
-        // English: streaming Zipformer (int8 encoder/joiner = ~72 MB total)
+
+        // ---------- English ----------
         m.put("en", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
                 "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
                 "decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
                 "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
                 "tokens.txt"));
-        // Chinese (+English): bilingual streaming Zipformer
+
+        // ---------- Spanish (Kroko) ----------
+        // Covers both bookbot and Kroko variants; using bookbot repo for exact file names.
+        m.put("es", new Spec(
+                "bookbot/sherpa-onnx-zipformer-streaming-robust-es-v0",
+                "encoder.onnx",
+                "decoder.onnx",
+                "joiner.onnx",
+                "tokens.txt"));
+
+        // ---------- French ----------
+        m.put("fr", new Spec(
+                "shaojieli/sherpa-onnx-streaming-zipformer-fr-2023-04-14",
+                "encoder-epoch-29-avg-9-with-averaged-model.int8.onnx",
+                "decoder-epoch-29-avg-9-with-averaged-model.int8.onnx",
+                "joiner-epoch-29-avg-9-with-averaged-model.int8.onnx",
+                "tokens.txt"));
+
+        // ---------- German (Kroko) ----------
+        // Kroko provides int8 quantized models. Adjust repo/file names if you find a specific HF repo.
+        m.put("de", new Spec(
+                "Banafo/Kroko-ASR",
+                "encoder.int8.onnx",
+                "decoder.int8.onnx",
+                "joiner.int8.onnx",
+                "tokens.txt"));
+
+        // ---------- Italian (Kroko) ----------
+        m.put("it", new Spec(
+                "Banafo/Kroko-ASR",
+                "encoder.int8.onnx",
+                "decoder.int8.onnx",
+                "joiner.int8.onnx",
+                "tokens.txt"));
+
+        // ---------- Portuguese (Kroko) ----------
+        m.put("pt", new Spec(
+                "Banafo/Kroko-ASR",
+                "encoder.int8.onnx",
+                "decoder.int8.onnx",
+                "joiner.int8.onnx",
+                "tokens.txt"));
+
+        // ---------- Turkish (Kroko) ----------
+        m.put("tr", new Spec(
+                "Banafo/Kroko-ASR",
+                "encoder.int8.onnx",
+                "decoder.int8.onnx",
+                "joiner.int8.onnx",
+                "tokens.txt"));
+
+        // ---------- Russian (VOSK) ----------
+        m.put("ru", new Spec(
+                "csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-2025-08-16",
+                "encoder.onnx",
+                "decoder.onnx",
+                "joiner.onnx",
+                "tokens.txt"));
+
+        // ---------- Chinese (+English bilingual) ----------
         m.put("zh", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
                 "encoder-epoch-99-avg-1.int8.onnx",
                 "decoder-epoch-99-avg-1.onnx",
                 "joiner-epoch-99-avg-1.int8.onnx",
                 "tokens.txt"));
-        // de / fr / es (Kroko), ja, ko: add here once you have the exact HuggingFace repo + file names.
+
+        // ---------- Korean ----------
+        m.put("ko", new Spec(
+                "k2-fsa/sherpa-onnx-streaming-zipformer-korean-2024-06-16",
+                "encoder-epoch-99-avg-1.int8.onnx",
+                "decoder-epoch-99-avg-1.int8.onnx",
+                "joiner-epoch-99-avg-1.int8.onnx",
+                "tokens.txt"));
+
+        // ---------- Japanese ----------
+        // No official streaming Zipformer model. Falls back to server/Google.
+        // (Offline model exists but is not suitable for live streaming.)
+
+        // ---------- Hebrew ----------
+        // No streaming Zipformer model. Falls back to server/Google.
+
+        // ---------- Hindi ----------
+        // No streaming Zipformer model. Falls back to server/Google.
+
+        // ---------- Urdu ----------
+        // No streaming Zipformer model. Falls back to server/Google.
+
         SPECS = Collections.unmodifiableMap(m);
     }
 
