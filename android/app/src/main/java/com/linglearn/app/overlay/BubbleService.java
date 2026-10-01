@@ -183,6 +183,30 @@ public class BubbleService extends Service {
         e.apply();
     }
 
+    /** Translation tone: "neutral" (default), "formal" or "casual". */
+    public static void saveTone(Context ctx, String tone) {
+        if (tone == null) return;
+        String t = tone.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!t.equals("formal") && !t.equals("casual") && !t.equals("neutral")) return;
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("tone", t).apply();
+    }
+
+    /** Caption display mode: "both" (default, original + translation), "original" or "translation". */
+    public static void saveDisplayMode(Context ctx, String mode) {
+        if (mode == null) return;
+        String m = mode.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!m.equals("both") && !m.equals("original") && !m.equals("translation")) return;
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("displayMode", m).apply();
+    }
+
+    private String displayMode() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getString("displayMode", "both");
+    }
+
+    private String tone() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getString("tone", "neutral");
+    }
+
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService net = Executors.newSingleThreadExecutor();
     private final ExecutorService netTr = Executors.newFixedThreadPool(2);
@@ -505,6 +529,14 @@ public class BubbleService extends Service {
         ensurePanel();
         String newSrc = src == null ? "" : src;
         String newTr = tr == null ? "" : tr;
+        String mode = displayMode();
+        if ("original".equals(mode)) {
+            newTr = "";
+        } else if ("translation".equals(mode)) {
+            // translation only; until it arrives (or if it is empty) show the original so the panel is never blank
+            if (!newTr.isEmpty() && !newTr.equals("…")) newSrc = "";
+            else if (newTr.equals("…") && !newSrc.isEmpty()) newTr = "";
+        }
         boolean changed = !newSrc.equals(shownSrc) || !newTr.equals(shownTr) || !panelShown;
         if (changed) {
             shownSrc = newSrc;
@@ -1186,6 +1218,12 @@ public class BubbleService extends Service {
         String name = LANG_NAMES.containsKey(target) ? LANG_NAMES.get(target) : target;
         String prompt = "Translate the following text to " + name
                 + ". Reply with ONLY the translation, no quotes, no explanations.";
+        String tone = tone();
+        if ("formal".equals(tone)) {
+            prompt += " Use a formal, polite register.";
+        } else if ("casual".equals(tone)) {
+            prompt += " Use a casual, spoken, everyday register.";
+        }
         if (prevContext != null && !prevContext.isEmpty()) {
             prompt += "\n\nPrevious sentence (context only, do NOT translate it): " + prevContext;
         }
