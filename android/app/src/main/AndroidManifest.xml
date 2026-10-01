@@ -1,12 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Needed on Android 11+ so the app can see the system speech-recognition service -->
-    <queries>
-        <intent>
-            <action android:name="android.speech.RecognitionService" />
-        </intent>
-    </queries>
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"
@@ -18,7 +20,7 @@
 
         <activity
             android:name=".MainActivity"
-            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode|navigation|density"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|locale|smallestScreenSize|screenLayout|uiMode"
             android:exported="true"
             android:label="@string/title_activity_main"
             android:launchMode="singleTask"
@@ -30,32 +32,22 @@
         </activity>
 
         <activity
-            android:name=".overlay.ProjectionActivity"
-            android:configChanges="orientation|screenSize|keyboardHidden"
-            android:excludeFromRecents="true"
-            android:exported="false"
-            android:launchMode="singleTask"
-            android:noHistory="true"
-            android:taskAffinity=""
-            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
-
-        <!-- Invisible, touch-through host for Google speech recognition (keeps the mic allowed) -->
-        <activity
             android:name=".overlay.SpeechHostActivity"
             android:excludeFromRecents="true"
             android:exported="false"
-            android:launchMode="singleTask"
-            android:taskAffinity=""
+            android:launchMode="singleInstance"
+            android:noHistory="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <activity
+            android:name=".overlay.ProjectionActivity"
+            android:exported="false"
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
 
         <service
             android:name=".overlay.BubbleService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection|specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="floating_translation_bubble" />
-        </service>
+            android:foregroundServiceType="mediaProjection|specialUse" />
 
         <provider
             android:name="androidx.core.content.FileProvider"
@@ -67,13 +59,4 @@
                 android:resource="@xml/file_paths" />
         </provider>
     </application>
-
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 </manifest>
