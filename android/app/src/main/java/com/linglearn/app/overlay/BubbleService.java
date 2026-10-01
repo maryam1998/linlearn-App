@@ -29,6 +29,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.speech.SpeechRecognizer;
 import android.util.DisplayMetrics;
@@ -42,7 +43,6 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 
 import com.google.mlkit.common.model.DownloadConditions;
@@ -100,16 +100,15 @@ public class BubbleService extends Service {
     private static final int CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS / 1000;
     private static final int MIN_SEG_MS = 800;
     private static final int MAX_SEG_MS = 2000;
-    private static final int SILENCE_CUT_MS = 1400;   // ← مثل LingoNative: ۱.۴ ثانیه
+    private static final int SILENCE_CUT_MS = 1400;   // مثل LingoNative
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
     private static final int ASR_WATCHDOG_VOICED_MS = 15000;
     private static final int MAX_TEXT_PENDING = 6;
-    private static final int MAX_HISTORY = 30;
 
     private static final long PANEL_HIDE_MS = 6000;
-    private static final long PANEL_HIDE_MS_RECORDING = 120000;   // ← ۲ دقیقه موقع ضبط
+    private static final long PANEL_HIDE_MS_RECORDING = 60000;
 
     private static final int NET_ATTEMPTS = 3;
     private static final OkHttpClient HTTP = new OkHttpClient.Builder()
@@ -154,6 +153,7 @@ public class BubbleService extends Service {
         LANG_NAMES.put("pt", "Portuguese");
         LANG_NAMES.put("ur", "Urdu");
         LANG_NAMES.put("nl", "Dutch");
+        LANG_NAMES.put("he", "Hebrew");
 
         LOCALE_TAGS.put("fa", "fa-IR");
         LOCALE_TAGS.put("en", "en-US");
@@ -171,6 +171,7 @@ public class BubbleService extends Service {
         LOCALE_TAGS.put("pt", "pt-BR");
         LOCALE_TAGS.put("ur", "ur-PK");
         LOCALE_TAGS.put("nl", "nl-NL");
+        LOCALE_TAGS.put("he", "he-IL");
     }
 
     public static void saveLangs(Context ctx, String target, String source) {
@@ -192,13 +193,13 @@ public class BubbleService extends Service {
     private WindowManager.LayoutParams bubbleLp;
     private int bubbleSize;
 
-    // Panel با تاریخچه
     private LinearLayout panel;
-    private ScrollView historyScroll;
-    private LinearLayout historyList;
-    private TextView tvCurrent;
+    private TextView tvSrc;
+    private TextView tvTr;
     private WindowManager.LayoutParams panelLp;
     private boolean panelShown = false;
+    private String shownSrc = "";
+    private String shownTr = "";
     private final Runnable hidePanel = this::removePanel;
 
     private ObjectAnimator pulse;
@@ -218,6 +219,11 @@ public class BubbleService extends Service {
     private Translator localTr;
     private String localTrKey = "";
     private volatile boolean localReady = false;
+    private String lastPartialSrc = "";
+    private String liveTr = "";
+    private int partialSeq = 0;
+    private int shownPartialSeq = 0;
+    private String liveTrSrc = "";
     private int finalSeq = 0;
     private int shownFinalSeq = 0;
 
@@ -242,7 +248,7 @@ public class BubbleService extends Service {
         if (ACTION_PROJECTION_RESULT.equals(action)) {
             handleProjectionResult(intent);
         } else if (ACTION_PROJECTION_DENIED.equals(action)) {
-            showStatus(isFa() ? "مجوز ضبط صدا داده نشد" : "Audio capture permission denied");
+            showText("", isFa() ? "مجوز ضبط صدا داده نشد" : "Audio capture permission denied");
         } else {
             running = true;
             addBubbleIfNeeded();
@@ -365,7 +371,7 @@ public class BubbleService extends Service {
 
             @Override
             public boolean onSingleTapConfirmed(MotionEvent e) {
-                showStatus(isFa()
+                showText("", isFa()
                         ? "نگه‌داشتن: شروع/توقف ضبط  ·  دوبار لمس: بستن"
                         : "Long-press: start/stop  ·  Double-tap: close");
                 return true;
@@ -430,34 +436,29 @@ public class BubbleService extends Service {
         bg.setStroke(dp(1), COLOR_GOLD);
         panel.setBackground(bg);
 
-        // ScrollView برای تاریخچه
-        historyScroll = new ScrollView(this);
-        historyScroll.setVerticalScrollBarEnabled(false);
-        LinearLayout.LayoutParams scrollLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(260));
-        historyScroll.setLayoutParams(scrollLp);
+        tvSrc = new TextView(this);
+        tvSrc.setTextColor(Color.parseColor("#C8CCD8"));
+        tvSrc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        tvSrc.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+        tvSrc.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
 
-        historyList = new LinearLayout(this);
-        historyList.setOrientation(LinearLayout.VERTICAL);
-        historyScroll.addView(historyList);
-        panel.addView(historyScroll);
+        tvTr = new TextView(this);
+        tvTr.setTextColor(Color.WHITE);
+        tvTr.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        tvTr.setTypeface(Typeface.DEFAULT_BOLD);
+        tvTr.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+        tvTr.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
+        tvTr.setPadding(0, dp(4), 0, 0);
 
-        // متن فعلی (partial)
-        tvCurrent = new TextView(this);
-        tvCurrent.setTextColor(Color.parseColor("#C8CCD8"));
-        tvCurrent.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        tvCurrent.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
-        tvCurrent.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
-        tvCurrent.setPadding(0, dp(6), 0, 0);
-        tvCurrent.setVisibility(View.GONE);
-        panel.addView(tvCurrent);
+        panel.addView(tvSrc);
+        panel.addView(tvTr);
 
         panelLp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
     }
@@ -482,88 +483,33 @@ public class BubbleService extends Service {
         try { wm.updateViewLayout(panel, panelLp); } catch (Exception ignored) {}
     }
 
-    private void showPanel() {
+    private void showText(String src, String tr) {
         if (wm == null || bubble == null) return;
         ensurePanel();
-        computePanelPos();
-        try {
-            if (!panelShown) { wm.addView(panel, panelLp); panelShown = true; }
-            else wm.updateViewLayout(panel, panelLp);
-        } catch (Exception e) { Log.w(TAG, "panel show failed", e); }
+        String newSrc = src == null ? "" : src;
+        String newTr = tr == null ? "" : tr;
+        boolean changed = !newSrc.equals(shownSrc) || !newTr.equals(shownTr) || !panelShown;
+        if (changed) {
+            shownSrc = newSrc;
+            shownTr = newTr;
+            boolean hasSrc = !newSrc.isEmpty();
+            tvSrc.setText(newSrc);
+            tvSrc.setVisibility(hasSrc ? View.VISIBLE : View.GONE);
+            boolean hasTr = !newTr.isEmpty();
+            tvTr.setText(newTr);
+            tvTr.setVisibility(hasTr ? View.VISIBLE : View.GONE);
+            tvTr.setPadding(0, hasSrc ? dp(4) : 0, 0, 0);
+
+            computePanelPos();
+            try {
+                if (!panelShown) { wm.addView(panel, panelLp); panelShown = true; }
+                else wm.updateViewLayout(panel, panelLp);
+            } catch (Exception e) { Log.w(TAG, "panel show failed", e); }
+        }
 
         main.removeCallbacks(hidePanel);
         long delay = recording ? PANEL_HIDE_MS_RECORDING : PANEL_HIDE_MS;
         main.postDelayed(hidePanel, delay);
-    }
-
-    /** پیام وضعیت کوتاه (مثلاً «در حال گوش دادن...») در ناحیه فعلی */
-    private void showStatus(String text) {
-        if (wm == null || bubble == null) return;
-        ensurePanel();
-        if (text == null || text.isEmpty()) {
-            tvCurrent.setVisibility(View.GONE);
-        } else {
-            tvCurrent.setText(text);
-            tvCurrent.setVisibility(View.VISIBLE);
-        }
-        showPanel();
-    }
-
-    /** متن partial فعلی (بدون ترجمه) */
-    private void showPartial(String text) {
-        if (wm == null || bubble == null) return;
-        ensurePanel();
-        if (text == null || text.isEmpty()) {
-            tvCurrent.setVisibility(View.GONE);
-        } else {
-            tvCurrent.setText(text);
-            tvCurrent.setVisibility(View.VISIBLE);
-        }
-        showPanel();
-    }
-
-    /** اضافه کردن یک جمله‌ی کامل به تاریخچه. برمی‌گردونه TextView ترجمه رو برای آپدیت بعدی. */
-    private TextView addFinalSegment(String src, String trPlaceholder) {
-        if (wm == null || bubble == null) return null;
-        ensurePanel();
-
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.VERTICAL);
-        row.setPadding(0, dp(8), 0, dp(8));
-
-        if (src != null && !src.isEmpty()) {
-            TextView tvS = new TextView(this);
-            tvS.setText(src);
-            tvS.setTextColor(Color.parseColor("#C8CCD8"));
-            tvS.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-            tvS.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
-            tvS.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
-            row.addView(tvS);
-        }
-
-        TextView tvT = new TextView(this);
-        tvT.setText(trPlaceholder == null ? "…" : trPlaceholder);
-        tvT.setTextColor(Color.WHITE);
-        tvT.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
-        tvT.setTypeface(Typeface.DEFAULT_BOLD);
-        tvT.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
-        tvT.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
-        tvT.setPadding(0, dp(3), 0, 0);
-        row.addView(tvT);
-
-        historyList.addView(row);
-
-        while (historyList.getChildCount() > MAX_HISTORY) {
-            historyList.removeViewAt(0);
-        }
-
-        // پاک کردن متن partial فعلی
-        tvCurrent.setText("");
-        tvCurrent.setVisibility(View.GONE);
-
-        historyScroll.post(() -> historyScroll.fullScroll(View.FOCUS_DOWN));
-        showPanel();
-        return tvT;
     }
 
     private void removePanel() {
@@ -571,6 +517,8 @@ public class BubbleService extends Service {
             try { wm.removeView(panel); } catch (Exception ignored) {}
         }
         panelShown = false;
+        shownSrc = "";
+        shownTr = "";
     }
 
     private void setRecordingUi(boolean rec) {
@@ -595,7 +543,7 @@ public class BubbleService extends Service {
         if (mediaProjection == null) {
             Intent i = new Intent(this, ProjectionActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             try { startActivity(i); }
-            catch (Exception e) { Log.e(TAG, "cannot launch ProjectionActivity", e); showStatus("⚠ " + briefErr(e)); }
+            catch (Exception e) { Log.e(TAG, "cannot launch ProjectionActivity", e); showText("", "⚠ " + briefErr(e)); }
             return;
         }
         startCapture();
@@ -619,7 +567,7 @@ public class BubbleService extends Service {
             startCapture();
         } catch (Exception e) {
             Log.e(TAG, "projection failed", e);
-            showStatus("⚠ " + briefErr(e));
+            showText("", "⚠ " + briefErr(e));
         }
     }
 
@@ -631,22 +579,18 @@ public class BubbleService extends Service {
     private void startCapture() {
         if (mediaProjection == null || recording) return;
         prepareLocalTranslator();
+        shownPartialSeq = partialSeq;
+        liveTr = ""; liveTrSrc = ""; lastPartialSrc = "";
         speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
         final String src = effectiveSource();
-
-        // ۱. اول Sherpa (آفلاین، جریانی، سریع)
         if (src != null && !"auto".equals(src) && SherpaModelManager.isAvailable(src)) {
             if (startSherpaEngine(src)) return;
         }
-
-        // ۲. بعد Google
         boolean micOk = Build.VERSION.SDK_INT >= 33
                 && src != null && !src.isEmpty() && !"auto".equals(src)
                 && SpeechRecognizer.isRecognitionAvailable(this);
         if (micOk && startMicEngine(src)) return;
-
-        // ۳. در نهایت سرور
         beginCapture();
     }
 
@@ -666,7 +610,7 @@ public class BubbleService extends Service {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
                     .putExtra(SpeechHostActivity.EXTRA_LANG_TAG, localeTag(src));
             startActivity(i);
-            showStatus(msg("🎙 گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
+            showText("", msg("🎙 گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
             return true;
         } catch (Exception e) {
             Log.w(TAG, "cannot start recognizer engine", e);
@@ -690,7 +634,7 @@ public class BubbleService extends Service {
             rec.startRecording();
             final AudioRecord fr = rec;
             new Thread(() -> runSherpa(fr, src), "bubble-feed").start();
-            showStatus(msg("🎙 ترجمه آفلاین فعال…", "🎙 Offline mode active…"));
+            showText("", msg("🎙 گوش‌دادن به صدای سیستم (آفلاین)…", "🎙 Listening to system audio (offline)…"));
             return true;
         } catch (Exception e) {
             Log.w(TAG, "cannot start sherpa engine", e);
@@ -841,7 +785,7 @@ public class BubbleService extends Service {
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
         beginCapture();
-        if (notice != null) showStatus(notice);
+        if (notice != null) showText("", notice);
     }
 
     private void restartSpeechHost() {
@@ -896,12 +840,12 @@ public class BubbleService extends Service {
             record = rec;
             recording = true;
             setRecordingUi(true);
-            showStatus(msg("🎙 در حال گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
+            showText("", msg("🎙 در حال گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
             new Thread(() -> captureLoop(rec), "bubble-capture").start();
         } catch (Exception e) {
             Log.e(TAG, "startCapture failed", e);
             recording = false; setRecordingUi(false);
-            showStatus("⚠ " + briefErr(e));
+            showText("", "⚠ " + briefErr(e));
         }
     }
 
@@ -913,7 +857,7 @@ public class BubbleService extends Service {
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
         setRecordingUi(false);
-        showStatus(msg("ضبط متوقف شد", "Stopped"));
+        showText("", msg("ضبط متوقف شد", "Stopped"));
     }
 
     private void captureLoop(AudioRecord rec) {
@@ -978,7 +922,7 @@ public class BubbleService extends Service {
         BubbleService s = instance;
         if (s == null || !s.micEngine) return;
         s.stopRecording();
-        s.showStatus(s.msg("مجوز میکروفون لازم است", "Microphone permission required"));
+        s.showText("", s.msg("مجوز میکروفون لازم است", "Microphone permission required"));
     }
 
     static void asrClosed() {
@@ -1011,8 +955,6 @@ public class BubbleService extends Service {
                 .addOnFailureListener(e -> {
                     Log.w(TAG, "translation model download failed", e);
                     if (tr == localTr) {
-                        if (recording) showStatus(msg("دانلود مدل ترجمه ناموفق بود؛ اینترنت را بررسی کنید",
-                                "Translation model download failed - check internet"));
                         main.postDelayed(() -> { if (tr == localTr && !localReady) prepareLocalTranslator(); }, 8000);
                     }
                 });
@@ -1023,43 +965,49 @@ public class BubbleService extends Service {
         if (t != null) { try { t.close(); } catch (Exception ignored) {} }
     }
 
-    /** Partial فقط متن اصلی رو نشون می‌ده — دقیقاً مثل LingoNative */
+    /**
+     * مثل LingoNative: فقط متن اصلی رو نشون بده، ترجمه partial نمی‌کنیم.
+     * ترجمه فقط روی onFinalText (پایان جمله بعد از ۱.۴ ثانیه سکوت) اجرا می‌شه.
+     */
     private void onPartialText(final String text) {
-        showPartial(text);
+        showText(text, "");
+        lastPartialSrc = text;
+        gotAsrText = true;
     }
 
-    /** وقتی جمله کامل شد، متن نهایی + ترجمه به تاریخچه اضافه می‌شه */
     private void onFinalText(final String text) {
+        partialSeq++; shownPartialSeq = partialSeq;
+        lastPartialSrc = "";
+        liveTr = ""; liveTrSrc = "";
         final int fseq = ++finalSeq;
-        final TextView trView = addFinalSegment(text, "…");
-        if (trView == null) return;
-
         final Translator tr = localTr;
         if (localReady && tr != null) {
+            showText(text, "…");
             tr.translate(text)
                     .addOnSuccessListener(out -> {
                         if (fseq < shownFinalSeq) return;
                         shownFinalSeq = fseq;
-                        main.post(() -> trView.setText(out));
+                        showText(text, out);
                     })
                     .addOnFailureListener(e -> {
                         Log.w(TAG, "local translate failed", e);
-                        remoteTranslateToView(text, fseq, trView);
+                        remoteTranslate(text, fseq);
                     });
             return;
         }
-        remoteTranslateToView(text, fseq, trView);
+        remoteTranslate(text, fseq);
     }
 
-    private void remoteTranslateToView(final String text, final int fseq, final TextView trView) {
+    private void remoteTranslate(final String text, final int fseq) {
         if (!hasInternet()) {
             if (fseq >= shownFinalSeq) {
                 shownFinalSeq = fseq;
-                main.post(() -> trView.setText(msg("ترجمه در دسترس نیست (آفلاین)", "No translation (offline)")));
+                showText(text, msg("ترجمه در دسترس نیست (آفلاین)", "No translation (offline)"));
             }
             return;
         }
-        submitText(text, fseq, trView);
+        showText(text, "…");
+        submitText(text, fseq);
     }
 
     private boolean hasInternet() {
@@ -1091,15 +1039,15 @@ public class BubbleService extends Service {
         } catch (Exception e) { pending.decrementAndGet(); }
     }
 
-    private void submitText(final String text, final int fseq, final TextView trView) {
+    private void submitText(final String text, final int fseq) {
         if (textPending.get() >= MAX_TEXT_PENDING) {
             Log.w(TAG, "dropping translation (backlog)");
-            main.post(() -> trView.setText(""));
+            main.post(() -> showText(text, ""));
             return;
         }
         textPending.incrementAndGet();
         try {
-            netTr.execute(() -> { try { translateAndShow(text, fseq, trView); } finally { textPending.decrementAndGet(); } });
+            netTr.execute(() -> { try { translateAndShow(text, fseq); } finally { textPending.decrementAndGet(); } });
         } catch (Exception e) { textPending.decrementAndGet(); }
     }
 
@@ -1111,11 +1059,11 @@ public class BubbleService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "transcribe failed", e);
             final String m = netErrText(e);
-            main.post(() -> showStatus(m));
+            main.post(() -> showText("", m));
         }
     }
 
-    private void translateAndShow(final String text, final int fseq, final TextView trView) {
+    private void translateAndShow(final String text, final int fseq) {
         String tr;
         try { tr = translate(text); }
         catch (Exception e) { Log.w(TAG, "translate failed", e); tr = netErrText(e); }
@@ -1123,7 +1071,7 @@ public class BubbleService extends Service {
         main.post(() -> {
             if (fseq < shownFinalSeq) return;
             shownFinalSeq = fseq;
-            trView.setText(shown);
+            showText(text, shown);
         });
     }
 
