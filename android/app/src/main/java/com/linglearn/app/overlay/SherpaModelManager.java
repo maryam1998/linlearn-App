@@ -44,7 +44,7 @@ final class SherpaModelManager {
     static {
         Map<String, Spec> m = new HashMap<>();
 
-        // ============ انگلیسی (تأییدشده) ============
+        // انگلیسی (streaming zipformer)
         m.put("en", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
                 "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
@@ -52,7 +52,7 @@ final class SherpaModelManager {
                 "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
                 "tokens.txt"));
 
-        // ============ چینی + انگلیسی (تأییدشده) ============
+        // چینی + انگلیسی
         m.put("zh", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
                 "encoder-epoch-99-avg-1.int8.onnx",
@@ -60,7 +60,7 @@ final class SherpaModelManager {
                 "joiner-epoch-99-avg-1.int8.onnx",
                 "tokens.txt"));
 
-        // ============ کره‌ای (تأییدشده) ============
+        // کره‌ای
         m.put("ko", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-korean-2024-06-16",
                 "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
@@ -68,29 +68,7 @@ final class SherpaModelManager {
                 "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
                 "tokens.txt"));
 
-        // ============ Kroko (اروپایی) ============
-        // توجه: الگوی فایل این مدل‌ها متفاوته؛ قبل از استفاده تست کن.
-        // اگه خطا داد، مدل رو حذف کن (کامنت کن) و از مسیر Google/server استفاده کن.
-        m.put("de", kroko("de"));
-        m.put("fr", kroko("fr"));
-        m.put("es", kroko("es"));
-        m.put("it", kroko("it"));
-        m.put("pt", kroko("pt"));
-
-        // زبان‌هایی که Sherpa جریانی نداره (به Google/server fallback می‌رن):
-        // fa, ar, tr, he, hi, ur, ru, nl, ja
-
         SPECS = Collections.unmodifiableMap(m);
-    }
-
-    /** ساخت spec برای مدل‌های Kroko (ساختار استاندارد). */
-    private static Spec kroko(String lang) {
-        return new Spec(
-                "kroko-ai/kroko-onnx-streaming-asr",
-                "encoder-" + lang + ".onnx",
-                "decoder-" + lang + ".onnx",
-                "joiner-" + lang + ".onnx",
-                "tokens-" + lang + ".txt");
     }
 
     private static final OkHttpClient HTTP = new OkHttpClient();
