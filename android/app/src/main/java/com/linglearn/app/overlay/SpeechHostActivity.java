@@ -16,6 +16,7 @@ import android.speech.RecognitionSupportCallback;
 import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.util.Log;
+import android.view.Gravity;
 import android.view.WindowManager;
 
 import java.util.ArrayList;
@@ -53,6 +54,15 @@ public class SpeechHostActivity extends Activity {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                 | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL);
+        // Android 12+ blocks touches that pass through another app's visible, non-transparent
+        // window even when it is FLAG_NOT_TOUCHABLE -> the app underneath (YouTube/VLC/...) was
+        // un-tappable while this host was alive. Fully transparent + 1x1 px = exempt / no overlap.
+        WindowManager.LayoutParams wlp = getWindow().getAttributes();
+        wlp.alpha = 0f;
+        wlp.width = 1;
+        wlp.height = 1;
+        wlp.gravity = Gravity.TOP | Gravity.START;
+        getWindow().setAttributes(wlp);
 
         String t = getIntent().getStringExtra(EXTRA_LANG_TAG);
         if (t != null && !t.isEmpty()) langTag = t;
