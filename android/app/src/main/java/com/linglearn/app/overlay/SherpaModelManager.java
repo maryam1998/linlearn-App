@@ -61,8 +61,7 @@ final class SherpaModelManager {
                 "joiner-epoch-99-avg-1.int8.onnx",
                 "tokens.txt"));
 
-        // 📌 برای اضافه کردن زبان‌های دیگه (کره‌ای، فرانسوی، آلمانی...)
-        // از این لینک استفاده کن:
+        // 📌 برای اضافه کردن زبان‌های دیگه، از این لینک استفاده کن:
         // https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/zipformer-transducer-models.html
 
         SPECS = Collections.unmodifiableMap(m);
@@ -70,6 +69,7 @@ final class SherpaModelManager {
 
     private static final OkHttpClient HTTP = new OkHttpClient();
     private static final AtomicBoolean DOWNLOADING = new AtomicBoolean(false);
+    private static volatile boolean DOWNLOADING_STATE = false;
 
     static String normalize(String lang) {
         if (lang == null) return null;
@@ -83,6 +83,10 @@ final class SherpaModelManager {
     static boolean isAvailable(String lang) {
         String l = normalize(lang);
         return l != null && SPECS.containsKey(l);
+    }
+
+    static boolean isDownloading() {
+        return DOWNLOADING_STATE;
     }
 
     private static File dirFor(Context ctx, String l) {
@@ -118,6 +122,7 @@ final class SherpaModelManager {
             if (cb != null) cb.onError(l, new IllegalStateException("another download is running"));
             return;
         }
+        DOWNLOADING_STATE = true;
         Thread t = new Thread(() -> {
             try {
                 File dir = dirFor(app, l);
@@ -153,6 +158,7 @@ final class SherpaModelManager {
                 if (cb != null) cb.onError(l, e);
             } finally {
                 DOWNLOADING.set(false);
+                DOWNLOADING_STATE = false;
             }
         }, "sherpa-download");
         t.setDaemon(true);
