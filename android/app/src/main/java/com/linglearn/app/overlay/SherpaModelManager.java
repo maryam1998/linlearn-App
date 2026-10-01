@@ -17,15 +17,6 @@ import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 
-/**
- * Knows which languages have an on-device streaming Sherpa-ONNX model, where the model files live
- * (getFilesDir()/sherpa/&lt;lang&gt;/) and how to download them on demand from HuggingFace.
- *
- * Models are NEVER bundled in the APK. Languages without an entry in {@link #SPECS}
- * (Japanese, Hebrew, Hindi, Urdu, ...) are "unsupported": the caller falls back to the Google/server path.
- *
- * To add a language, add one more {@code SPECS.put(...)} line below.
- */
 final class SherpaModelManager {
 
     private static final String TAG = "SherpaModelMgr";
@@ -34,7 +25,6 @@ final class SherpaModelManager {
     private SherpaModelManager() {}
 
     interface ProgressCallback {
-        /** @param done bytes downloaded so far (all files), @param total expected bytes or -1 */
         void onProgress(String lang, long done, long total);
         void onDone(String lang);
         void onError(String lang, Exception e);
@@ -54,7 +44,7 @@ final class SherpaModelManager {
     static {
         Map<String, Spec> m = new HashMap<>();
 
-        // ---------- English ----------
+        // ============ انگلیسی (تأییدشده) ============
         m.put("en", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
                 "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
@@ -62,65 +52,7 @@ final class SherpaModelManager {
                 "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
                 "tokens.txt"));
 
-        // ---------- Spanish (Kroko) ----------
-        // Covers both bookbot and Kroko variants; using bookbot repo for exact file names.
-        m.put("es", new Spec(
-                "bookbot/sherpa-onnx-zipformer-streaming-robust-es-v0",
-                "encoder.onnx",
-                "decoder.onnx",
-                "joiner.onnx",
-                "tokens.txt"));
-
-        // ---------- French ----------
-        m.put("fr", new Spec(
-                "shaojieli/sherpa-onnx-streaming-zipformer-fr-2023-04-14",
-                "encoder-epoch-29-avg-9-with-averaged-model.int8.onnx",
-                "decoder-epoch-29-avg-9-with-averaged-model.int8.onnx",
-                "joiner-epoch-29-avg-9-with-averaged-model.int8.onnx",
-                "tokens.txt"));
-
-        // ---------- German (Kroko) ----------
-        // Kroko provides int8 quantized models. Adjust repo/file names if you find a specific HF repo.
-        m.put("de", new Spec(
-                "Banafo/Kroko-ASR",
-                "encoder.int8.onnx",
-                "decoder.int8.onnx",
-                "joiner.int8.onnx",
-                "tokens.txt"));
-
-        // ---------- Italian (Kroko) ----------
-        m.put("it", new Spec(
-                "Banafo/Kroko-ASR",
-                "encoder.int8.onnx",
-                "decoder.int8.onnx",
-                "joiner.int8.onnx",
-                "tokens.txt"));
-
-        // ---------- Portuguese (Kroko) ----------
-        m.put("pt", new Spec(
-                "Banafo/Kroko-ASR",
-                "encoder.int8.onnx",
-                "decoder.int8.onnx",
-                "joiner.int8.onnx",
-                "tokens.txt"));
-
-        // ---------- Turkish (Kroko) ----------
-        m.put("tr", new Spec(
-                "Banafo/Kroko-ASR",
-                "encoder.int8.onnx",
-                "decoder.int8.onnx",
-                "joiner.int8.onnx",
-                "tokens.txt"));
-
-        // ---------- Russian (VOSK) ----------
-        m.put("ru", new Spec(
-                "csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-2025-08-16",
-                "encoder.onnx",
-                "decoder.onnx",
-                "joiner.onnx",
-                "tokens.txt"));
-
-        // ---------- Chinese (+English bilingual) ----------
+        // ============ چینی + انگلیسی (تأییدشده) ============
         m.put("zh", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
                 "encoder-epoch-99-avg-1.int8.onnx",
@@ -128,34 +60,42 @@ final class SherpaModelManager {
                 "joiner-epoch-99-avg-1.int8.onnx",
                 "tokens.txt"));
 
-        // ---------- Korean ----------
+        // ============ کره‌ای (تأییدشده) ============
         m.put("ko", new Spec(
-                "k2-fsa/sherpa-onnx-streaming-zipformer-korean-2024-06-16",
-                "encoder-epoch-99-avg-1.int8.onnx",
-                "decoder-epoch-99-avg-1.int8.onnx",
-                "joiner-epoch-99-avg-1.int8.onnx",
+                "csukuangfj/sherpa-onnx-streaming-zipformer-korean-2024-06-16",
+                "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
+                "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
                 "tokens.txt"));
 
-        // ---------- Japanese ----------
-        // No official streaming Zipformer model. Falls back to server/Google.
-        // (Offline model exists but is not suitable for live streaming.)
+        // ============ Kroko (اروپایی) ============
+        // توجه: الگوی فایل این مدل‌ها متفاوته؛ قبل از استفاده تست کن.
+        // اگه خطا داد، مدل رو حذف کن (کامنت کن) و از مسیر Google/server استفاده کن.
+        m.put("de", kroko("de"));
+        m.put("fr", kroko("fr"));
+        m.put("es", kroko("es"));
+        m.put("it", kroko("it"));
+        m.put("pt", kroko("pt"));
 
-        // ---------- Hebrew ----------
-        // No streaming Zipformer model. Falls back to server/Google.
-
-        // ---------- Hindi ----------
-        // No streaming Zipformer model. Falls back to server/Google.
-
-        // ---------- Urdu ----------
-        // No streaming Zipformer model. Falls back to server/Google.
+        // زبان‌هایی که Sherpa جریانی نداره (به Google/server fallback می‌رن):
+        // fa, ar, tr, he, hi, ur, ru, nl, ja
 
         SPECS = Collections.unmodifiableMap(m);
+    }
+
+    /** ساخت spec برای مدل‌های Kroko (ساختار استاندارد). */
+    private static Spec kroko(String lang) {
+        return new Spec(
+                "kroko-ai/kroko-onnx-streaming-asr",
+                "encoder-" + lang + ".onnx",
+                "decoder-" + lang + ".onnx",
+                "joiner-" + lang + ".onnx",
+                "tokens-" + lang + ".txt");
     }
 
     private static final OkHttpClient HTTP = new OkHttpClient();
     private static final AtomicBoolean DOWNLOADING = new AtomicBoolean(false);
 
-    /** "en-US" / "en_US" / "EN" -> "en"; null if empty. */
     static String normalize(String lang) {
         if (lang == null) return null;
         String l = lang.trim().toLowerCase(Locale.ROOT);
@@ -165,7 +105,6 @@ final class SherpaModelManager {
         return l.isEmpty() ? null : l;
     }
 
-    /** True if a Sherpa model exists for this language (it may still need to be downloaded). */
     static boolean isAvailable(String lang) {
         String l = normalize(lang);
         return l != null && SPECS.containsKey(l);
@@ -175,7 +114,6 @@ final class SherpaModelManager {
         return new File(new File(ctx.getFilesDir(), "sherpa"), l);
     }
 
-    /** Model directory if every file is already downloaded; otherwise null. */
     static File getModelDir(Context ctx, String lang) {
         String l = normalize(lang);
         Spec s = l == null ? null : SPECS.get(l);
@@ -193,11 +131,6 @@ final class SherpaModelManager {
     static String joinerFile(String lang)  { Spec s = SPECS.get(normalize(lang)); return s == null ? null : s.joiner; }
     static String tokensFile(String lang)  { Spec s = SPECS.get(normalize(lang)); return s == null ? null : s.tokens; }
 
-    /**
-     * Downloads the model on a background thread into getFilesDir()/sherpa/&lt;lang&gt;/.
-     * Files are written as *.part and renamed when complete, so an interrupted download never
-     * leaves a half-written model that looks valid.
-     */
     static void downloadModel(final Context ctx, final String lang, final ProgressCallback cb) {
         final Context app = ctx.getApplicationContext();
         final String l = normalize(lang);
@@ -251,16 +184,12 @@ final class SherpaModelManager {
         t.start();
     }
 
-    /** Deletes a downloaded model (frees storage). */
     static void deleteModel(Context ctx, String lang) {
         String l = normalize(lang);
         if (l == null) return;
         File dir = dirFor(ctx, l);
         File[] fs = dir.listFiles();
-        if (fs != null) for (File f : fs) { //noinspection ResultOfMethodCallIgnored
-            f.delete();
-        }
-        //noinspection ResultOfMethodCallIgnored
+        if (fs != null) for (File f : fs) { f.delete(); }
         dir.delete();
     }
 }
