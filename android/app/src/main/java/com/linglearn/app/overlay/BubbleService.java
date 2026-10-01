@@ -1,6 +1,7 @@
 package com.linglearn.app.overlay;
 
 import android.animation.ObjectAnimator;
+import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -21,11 +22,15 @@ import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.provider.Settings;
+import android.speech.SpeechRecognizer;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
@@ -45,20 +50,40 @@ import org.json.JSONTokener;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.net.ConnectException;
+import java.net.SocketTimeoutException;
 import java.net.URLEncoder;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+
+/**
+ * Floating bubble: live-translates what is playing on the phone.
+ *
+ * Engine A (preferred, same idea as the Native app's "Google" caption engine): Google speech
+ *   recognition through android.speech.SpeechRecognizer, hosted in the invisible
+ *   SpeechHostActivity (so the mic is allowed while the bubble sits over Instagram/TikTok).
+ *   Needs Android 13+ and an explicit source language. Only the recognised TEXT goes to the Worker
+ *   (/api/generate) for translation.
+ * Engine B (fallback): system-audio capture (MediaProjection) -> VAD-cut WAV segments ->
+ *   Worker /api/transcribe (Whisper). Used when engine A is unavailable / language unsupported.
+ */
+@SuppressLint("NewApi")
 public class BubbleService extends Service {
 
     private static final String TAG = "BubbleService";
@@ -72,12 +97,12 @@ public class BubbleService extends Service {
 
     // ---- Backend (your Cloudflare Worker) ----
     private static final String WORKER_BASE = "https://phrasebook-api.maryam-s-sharifiyan.workers.dev";
-    private static final String TRANSCRIBE_PATH = "/api/transcribe";
+    private static final String TRANSCRIBE_PATH = "/api/transcribe";   // fallback engine only
     private static final String GENERATE_PATH = "/api/generate";
     // JSON key your /api/generate expects the prompt under:
     private static final String GENERATE_PROMPT_KEY = "prompt";
 
-    // ---- Audio / segmentation tuning ----
+    // ---- Audio / segmentation tuning (used by the fallback engine) ----
     private static final int SAMPLE_RATE = 16000;
     private static final int CHUNK_MS = 100;
     private static final int CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS / 1000;
@@ -87,13 +112,18 @@ public class BubbleService extends Service {
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
+    private static final int MAX_TEXT_PENDING = 6;
     private static final long PANEL_HIDE_MS = 6000;
 
-    // ---- Network resilience ----
+    // ---- Network (OkHttp) ----
     private static final int NET_ATTEMPTS = 3;
-    private static final int CONNECT_TIMEOUT_MS = 10000;
-    private static final int TRANSCRIBE_READ_TIMEOUT_MS = 20000;
-    private static final int TRANSLATE_READ_TIMEOUT_MS = 15000;
+    private static final OkHttpClient HTTP = new OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(40, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .build();
 
     private static final String PREFS = "bubble_prefs";
     private static final String CHANNEL_ID = "bubble_channel";
@@ -105,6 +135,8 @@ public class BubbleService extends Service {
     public static volatile boolean running = false;
 
     private static final Map<String, String> LANG_NAMES = new HashMap<>();
+    // UI language code -> BCP-47 tag handed to the platform recognizer
+    private static final Map<String, String> LOCALE_TAGS = new HashMap<>();
     static {
         LANG_NAMES.put("fa", "Persian");
         LANG_NAMES.put("en", "English");
@@ -122,6 +154,23 @@ public class BubbleService extends Service {
         LANG_NAMES.put("pt", "Portuguese");
         LANG_NAMES.put("ur", "Urdu");
         LANG_NAMES.put("nl", "Dutch");
+
+        LOCALE_TAGS.put("fa", "fa-IR");
+        LOCALE_TAGS.put("en", "en-US");
+        LOCALE_TAGS.put("ar", "ar-SA");
+        LOCALE_TAGS.put("tr", "tr-TR");
+        LOCALE_TAGS.put("de", "de-DE");
+        LOCALE_TAGS.put("fr", "fr-FR");
+        LOCALE_TAGS.put("es", "es-ES");
+        LOCALE_TAGS.put("it", "it-IT");
+        LOCALE_TAGS.put("ru", "ru-RU");
+        LOCALE_TAGS.put("zh", "zh-CN");
+        LOCALE_TAGS.put("ja", "ja-JP");
+        LOCALE_TAGS.put("ko", "ko-KR");
+        LOCALE_TAGS.put("hi", "hi-IN");
+        LOCALE_TAGS.put("pt", "pt-BR");
+        LOCALE_TAGS.put("ur", "ur-PK");
+        LOCALE_TAGS.put("nl", "nl-NL");
     }
 
     public static void saveLangs(Context ctx, String target, String source) {
@@ -156,6 +205,10 @@ public class BubbleService extends Service {
     private AudioRecord record;
     private volatile boolean recording = false;
 
+    // ---- Engine A state ----
+    private static volatile BubbleService instance;
+    private volatile boolean micEngine = false;
+
     @Override
     public IBinder onBind(Intent intent) {
         return null;
@@ -164,6 +217,7 @@ public class BubbleService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent != null ? intent.getAction() : null;
+        instance = this;
 
         if (ACTION_HIDE.equals(action)) {
             shutdown();
@@ -491,6 +545,10 @@ public class BubbleService extends Service {
     // Recording control
     // ------------------------------------------------------------------
 
+    private String msg(String fa, String en) {
+        return isFa() ? fa : en;
+    }
+
     private void toggleRecording() {
         if (recording) {
             stopRecording();
@@ -535,7 +593,44 @@ public class BubbleService extends Service {
         }
     }
 
+    private static String localeTag(String lang) {
+        String t = LOCALE_TAGS.get(lang);
+        return t != null ? t : lang;
+    }
+
+    /** Picks the engine: Google speech (engine A) when possible, else Worker/Whisper (engine B). */
     private void startCapture() {
+        if (mediaProjection == null || recording) return;
+        final String src = sourceLang();
+        boolean micOk = Build.VERSION.SDK_INT >= 33
+                && src != null && !src.isEmpty() && !"auto".equals(src)
+                && SpeechRecognizer.isRecognitionAvailable(this);
+        if (micOk && startMicEngine(src)) return;
+        beginCapture();
+    }
+
+    private boolean startMicEngine(String src) {
+        try {
+            Intent i = new Intent(this, SpeechHostActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                    .putExtra(SpeechHostActivity.EXTRA_LANG_TAG, localeTag(src));
+            micEngine = true;
+            recording = true;
+            setRecordingUi(true);
+            startActivity(i);
+            showText("", msg("🎙 گوش‌دادن…", "🎙 Listening…"));
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "cannot start SpeechHostActivity", e);
+            micEngine = false;
+            recording = false;
+            setRecordingUi(false);
+            return false;
+        }
+    }
+
+    /** Engine B: capture system audio and send VAD-cut segments to the Worker. */
+    private void beginCapture() {
         if (mediaProjection == null || recording) return;
         try {
             AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
@@ -563,7 +658,7 @@ public class BubbleService extends Service {
             record = rec;
             recording = true;
             setRecordingUi(true);
-            showText("", isFa() ? "🎙 در حال گوش‌دادن به صدای سیستم…" : "🎙 Listening to system audio…");
+            showText("", msg("🎙 در حال گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
             Thread t = new Thread(() -> captureLoop(rec), "bubble-capture");
             t.start();
         } catch (Exception e) {
@@ -577,6 +672,10 @@ public class BubbleService extends Service {
     private void stopRecording() {
         if (!recording) return;
         recording = false;
+        if (micEngine) {
+            micEngine = false;
+            SpeechHostActivity.finishIfRunning();
+        }
         AudioRecord r = record;
         record = null;
         if (r != null) {
@@ -586,8 +685,12 @@ public class BubbleService extends Service {
             }
         }
         setRecordingUi(false);
-        showText("", isFa() ? "ضبط متوقف شد" : "Stopped");
+        showText("", msg("ضبط متوقف شد", "Stopped"));
     }
+
+    // ------------------------------------------------------------------
+    // Engine B capture loop (Worker/Whisper fallback)
+    // ------------------------------------------------------------------
 
     private void captureLoop(AudioRecord rec) {
         byte[] buf = new byte[CHUNK_BYTES];
@@ -598,11 +701,10 @@ public class BubbleService extends Service {
                 int n = rec.read(buf, 0, buf.length);
                 if (n < 0) break;
                 if (n == 0) continue;
-                int chunkMs = n * 1000 / (SAMPLE_RATE * 2);
-                boolean loud = rms(buf, n) > SILENCE_RMS;
                 seg.write(buf, 0, n);
+                int chunkMs = n * 1000 / (SAMPLE_RATE * 2);
                 segMs += chunkMs;
-                if (loud) {
+                if (rms(buf, n) > SILENCE_RMS) {
                     voicedMs += chunkMs;
                     silentMs = 0;
                 } else {
@@ -645,8 +747,81 @@ public class BubbleService extends Service {
     }
 
     // ------------------------------------------------------------------
-    // Network: transcribe + translate
+    // Engine A bridge: SpeechHostActivity -> service (all calls arrive on the main thread)
     // ------------------------------------------------------------------
+
+    static void asrPartial(String text) {
+        BubbleService s = instance;
+        if (s != null && s.micEngine) s.showText(text, "");
+    }
+
+    static void asrFinal(String text) {
+        BubbleService s = instance;
+        if (s != null && s.micEngine) s.onFinalText(text);
+    }
+
+    /** Google recognizer can't do this language / keeps failing: continue with the Worker engine. */
+    static void asrFallback() {
+        BubbleService s = instance;
+        if (s == null || !s.micEngine) return;
+        s.micEngine = false;
+        s.recording = false; // lets beginCapture() start
+        s.beginCapture();
+        s.showText("", s.msg("تشخیص گفتار گوگل در دسترس نیست؛ حالت سرور فعال شد",
+                "Google speech unavailable; using server"));
+    }
+
+    static void asrNeedsPermission() {
+        BubbleService s = instance;
+        if (s == null || !s.micEngine) return;
+        s.stopRecording();
+        s.showText("", s.msg("مجوز میکروفون لازم است", "Microphone permission required"));
+    }
+
+    /** The invisible speech window was closed (back button, system, ...). */
+    static void asrClosed() {
+        BubbleService s = instance;
+        if (s != null && s.micEngine) s.stopRecording();
+    }
+
+    /** Final recognised text: show it, then translate (text only) if we are online. */
+    private void onFinalText(final String text) {
+        if (!hasInternet()) {
+            showText(text, msg("ترجمه در دسترس نیست (آفلاین)", "No translation (offline)"));
+            return;
+        }
+        showText(text, "…");
+        submitText(text);
+    }
+
+    // ------------------------------------------------------------------
+    // Network: translate (always) + transcribe (fallback engine only)
+    // ------------------------------------------------------------------
+
+    private boolean hasInternet() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+            if (cm == null) return true;
+            Network n = cm.getActiveNetwork();
+            if (n == null) return false;
+            NetworkCapabilities c = cm.getNetworkCapabilities(n);
+            return c != null && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    private boolean isOfflineError(Exception e) {
+        return e instanceof UnknownHostException
+                || e instanceof ConnectException
+                || e instanceof SocketTimeoutException
+                || !hasInternet();
+    }
+
+    private String netErrText(Exception e) {
+        if (isOfflineError(e)) return msg("ترجمه در دسترس نیست (آفلاین)", "No translation (offline)");
+        return "⚠ " + briefErr(e);
+    }
 
     private void submit(final byte[] pcm) {
         if (pending.get() >= MAX_PENDING) {
@@ -667,25 +842,50 @@ public class BubbleService extends Service {
         }
     }
 
+    private void submitText(final String text) {
+        if (pending.get() >= MAX_TEXT_PENDING) {
+            Log.w(TAG, "dropping translation (backlog)");
+            main.post(() -> showText(text, ""));
+            return;
+        }
+        pending.incrementAndGet();
+        try {
+            net.execute(() -> {
+                try {
+                    translateAndShow(text);
+                } finally {
+                    pending.decrementAndGet();
+                }
+            });
+        } catch (Exception e) {
+            pending.decrementAndGet();
+        }
+    }
+
+    // Fallback engine: audio segment -> text -> translation.
     private void processSegment(byte[] pcm) {
         try {
             final String text = transcribe(pcm);
             if (text.isEmpty()) return;
             main.post(() -> showText(text, "…"));
-            String tr;
-            try {
-                tr = translate(text);
-            } catch (Exception e) {
-                Log.w(TAG, "translate failed", e);
-                tr = "⚠ " + briefErr(e);
-            }
-            final String shown = tr;
-            main.post(() -> showText(text, shown));
+            translateAndShow(text);
         } catch (Exception e) {
             Log.w(TAG, "transcribe failed", e);
-            final String msg = "⚠ " + briefErr(e);
-            main.post(() -> showText("", msg));
+            final String m = netErrText(e);
+            main.post(() -> showText("", m));
         }
+    }
+
+    private void translateAndShow(final String text) {
+        String tr;
+        try {
+            tr = translate(text);
+        } catch (Exception e) {
+            Log.w(TAG, "translate failed", e);
+            tr = netErrText(e);
+        }
+        final String shown = tr;
+        main.post(() -> showText(text, shown));
     }
 
     private String transcribe(byte[] pcm) throws Exception {
@@ -694,7 +894,7 @@ public class BubbleService extends Service {
         if (src != null && !src.isEmpty() && !"auto".equals(src)) {
             url += "?lang=" + URLEncoder.encode(src, "UTF-8");
         }
-        String resp = postBytes(url, "audio/wav", toWav(pcm), TRANSCRIBE_READ_TIMEOUT_MS);
+        String resp = postBytes(url, "audio/wav", toWav(pcm));
         JSONObject j = new JSONObject(resp);
         return j.optString("text", "").trim();
     }
@@ -707,7 +907,7 @@ public class BubbleService extends Service {
         JSONObject body = new JSONObject();
         body.put(GENERATE_PROMPT_KEY, prompt);
         String resp = postBytes(WORKER_BASE + GENERATE_PATH, "application/json; charset=utf-8",
-                body.toString().getBytes(StandardCharsets.UTF_8), TRANSLATE_READ_TIMEOUT_MS);
+                body.toString().getBytes(StandardCharsets.UTF_8));
         return extractText(resp);
     }
 
@@ -768,15 +968,15 @@ public class BubbleService extends Service {
         }
     }
 
-    // Retries on dropped/stale connections ("unexpected end of stream"), timeouts and 5xx/429.
-    private static String postBytes(String urlStr, String contentType, byte[] body, int readTimeoutMs)
-            throws IOException {
+    // OkHttp (connect 10s / read 15s). Retries dropped connections, timeouts and 5xx/429.
+    private static String postBytes(String url, String contentType, byte[] body) throws IOException {
         IOException last = null;
         for (int attempt = 1; attempt <= NET_ATTEMPTS; attempt++) {
             try {
-                return postOnce(urlStr, contentType, body, readTimeoutMs);
+                return postOnce(url, contentType, body);
             } catch (IOException e) {
                 last = e;
+                if (e instanceof UnknownHostException) throw e; // offline: don't keep retrying
                 if (e instanceof HttpStatusException) {
                     int code = ((HttpStatusException) e).code;
                     if (code < 500 && code != 429) throw e;
@@ -794,41 +994,17 @@ public class BubbleService extends Service {
         throw last;
     }
 
-    private static String postOnce(String urlStr, String contentType, byte[] body, int readTimeoutMs)
-            throws IOException {
-        HttpURLConnection c = (HttpURLConnection) new URL(urlStr).openConnection();
-        try {
-            c.setRequestMethod("POST");
-            c.setConnectTimeout(CONNECT_TIMEOUT_MS);
-            c.setReadTimeout(readTimeoutMs);
-            c.setDoOutput(true);
-            c.setUseCaches(false);
-            // Fresh connection every time: a pooled keep-alive socket that the carrier/Cloudflare
-            // already closed is what causes "unexpected end of stream on ...Address".
-            c.setRequestProperty("Connection", "close");
-            c.setRequestProperty("Content-Type", contentType);
-            c.setFixedLengthStreamingMode(body.length);
-            try (OutputStream os = c.getOutputStream()) {
-                os.write(body);
-            }
-            int code = c.getResponseCode();
-            InputStream is = (code >= 200 && code < 300) ? c.getInputStream() : c.getErrorStream();
-            String resp = readAll(is);
-            if (code < 200 || code >= 300) throw new HttpStatusException(code, resp);
+    private static String postOnce(String url, String contentType, byte[] body) throws IOException {
+        Request req = new Request.Builder()
+                .url(url)
+                .post(RequestBody.create(body, MediaType.get(contentType)))
+                .build();
+        try (Response r = HTTP.newCall(req).execute()) {
+            ResponseBody rb = r.body();
+            String resp = rb == null ? "" : rb.string();
+            if (!r.isSuccessful()) throw new HttpStatusException(r.code(), resp);
             return resp;
-        } finally {
-            c.disconnect();
         }
-    }
-
-    private static String readAll(InputStream is) throws IOException {
-        if (is == null) return "";
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] b = new byte[4096];
-        int n;
-        while ((n = is.read(b)) > 0) out.write(b, 0, n);
-        is.close();
-        return out.toString("UTF-8");
     }
 
     private static String briefErr(Exception e) {
@@ -855,6 +1031,11 @@ public class BubbleService extends Service {
         running = false;
         main.removeCallbacksAndMessages(null);
         recording = false;
+        if (micEngine) {
+            micEngine = false;
+            SpeechHostActivity.finishIfRunning();
+        }
+        instance = null;
         AudioRecord r = record;
         record = null;
         if (r != null) {
