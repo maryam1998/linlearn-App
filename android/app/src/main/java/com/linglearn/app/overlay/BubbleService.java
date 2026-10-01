@@ -30,7 +30,6 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.provider.Settings;
-import android.speech.SpeechRecognizer;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
@@ -105,7 +104,6 @@ public class BubbleService extends Service {
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
-    private static final int ASR_WATCHDOG_VOICED_MS = 15000;
     private static final int MAX_TEXT_PENDING = 6;
 
     private static final long PANEL_HIDE_MS = 6000;
@@ -133,7 +131,6 @@ public class BubbleService extends Service {
     private static final int COLOR_GOLD = Color.parseColor("#C9A227");
     private static final int COLOR_REC = Color.parseColor("#E53935");
 
-    // پنل: تنظیمات اندازه
     private static final int PANEL_MAX_ROWS = 20;
     private static final int PANEL_DEFAULT_HEIGHT_DP = 180;
     private static final int PANEL_MIN_WIDTH_DP = 200;
@@ -223,7 +220,6 @@ public class BubbleService extends Service {
     private WindowManager.LayoutParams bubbleLp;
     private int bubbleSize;
 
-    // ======= پنل به‌روزشده =======
     private ScrollView panel;
     private LinearLayout panelList;
     private WindowManager.LayoutParams panelLp;
@@ -233,6 +229,7 @@ public class BubbleService extends Service {
     private String lastPartialSrc = "";
     private String shownSrc = "";
     private String shownTr = "";
+    private LinearLayout currentRow = null;
     private final Runnable hidePanel = this::removePanel;
 
     private ObjectAnimator pulse;
@@ -244,7 +241,6 @@ public class BubbleService extends Service {
     private volatile boolean recording = false;
 
     private static volatile BubbleService instance;
-    private volatile boolean micEngine = false;
     private volatile SherpaEngine sherpaEngine;
     private volatile boolean gotAsrText = false;
     private volatile int voicedSinceText = 0;
@@ -255,9 +251,6 @@ public class BubbleService extends Service {
     private int finalSeq = 0;
     private int shownFinalSeq = 0;
     private volatile String prevFinalText = "";
-
-    private int speechHostRestarts = 0;
-    private static final int MAX_SPEECH_HOST_RESTARTS = 40;
 
     @Override
     public IBinder onBind(Intent intent) { return null; }
@@ -282,6 +275,14 @@ public class BubbleService extends Service {
             running = true;
             addBubbleIfNeeded();
             prepareLocalTranslator();
+
+            // ✅ دانلود خودکار مدل Sherpa اگه نبود
+            final String srcLang = effectiveSource();
+            if (srcLang != null && !"auto".equals(srcLang)
+                    && SherpaModelManager.isAvailable(srcLang)
+                    && SherpaModelManager.getModelDir(this, srcLang) == null) {
+                startModelDownload(srcLang);
+            }
         }
         return START_NOT_STICKY;
     }
@@ -454,7 +455,6 @@ public class BubbleService extends Service {
 
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 
-    // ============ پنل جدید با ScrollView ============
     private void ensurePanel() {
         if (panel != null) return;
 
@@ -485,7 +485,6 @@ public class BubbleService extends Service {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
 
-        // هندل تغییر اندازه (گوشه‌ی پایین-راست)
         panel.setOnTouchListener(new View.OnTouchListener() {
             float downX, downY;
             int startW, startH;
@@ -549,8 +548,6 @@ public class BubbleService extends Service {
         computePanelPos();
         try { wm.updateViewLayout(panel, panelLp); } catch (Exception ignored) {}
     }
-
-    private LinearLayout currentRow = null;
 
     private void showText(String src, String tr) {
         if (wm == null || bubble == null) return;
@@ -699,53 +696,22 @@ public class BubbleService extends Service {
         }
     }
 
-    private static String localeTag(String lang) {
-        String t = LOCALE_TAGS.get(lang);
-        return t != null ? t : lang;
-    }
-
     private void startCapture() {
         if (mediaProjection == null || recording) return;
         prepareLocalTranslator();
         prevFinalText = "";
-        speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
         final String src = effectiveSource();
-        if (src != null && !"auto".equals(src) && SherpaModelManager.isAvailable(src)) {
+
+        // مسیر Sherpa (آفلاین، سریع، پایدار)
+        if (src != null && !"auto".equals(src)
+                && SherpaModelManager.isAvailable(src)
+                && SherpaModelManager.getModelDir(this, src) != null) {
             if (startSherpaEngine(src)) return;
         }
-        boolean micOk = Build.VERSION.SDK_INT >= 33
-                && src != null && !src.isEmpty() && !"auto".equals(src)
-                && SpeechRecognizer.isRecognitionAvailable(this);
-        if (micOk && startMicEngine(src)) return;
-        beginCapture();
-    }
 
-    private boolean startMicEngine(String src) {
-        AudioRecord rec = null;
-        try {
-            rec = buildPlaybackRecord();
-            if (rec == null) return false;
-            record = rec;
-            micEngine = true;
-            recording = true;
-            setRecordingUi(true);
-            rec.startRecording();
-            final AudioRecord fr = rec;
-            new Thread(() -> feedLoop(fr), "bubble-feed").start();
-            Intent i = new Intent(this, SpeechHostActivity.class)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                    .putExtra(SpeechHostActivity.EXTRA_LANG_TAG, localeTag(src));
-            startActivity(i);
-            showText("", msg("🎙 گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
-            return true;
-        } catch (Exception e) {
-            Log.w(TAG, "cannot start recognizer engine", e);
-            micEngine = false; recording = false; setRecordingUi(false);
-            PcmFeed.close();
-            if (rec != null) { record = null; try { rec.stop(); } catch (Exception ignored) {} try { rec.release(); } catch (Exception ignored) {} }
-            return false;
-        }
+        // مسیر سرور (بدون Google — چون Google باعث ANR می‌شد)
+        beginCapture();
     }
 
     private boolean startSherpaEngine(final String src) {
@@ -755,7 +721,6 @@ public class BubbleService extends Service {
             rec = buildPlaybackRecord();
             if (rec == null) return false;
             record = rec;
-            micEngine = true;
             recording = true;
             setRecordingUi(true);
             rec.startRecording();
@@ -765,7 +730,7 @@ public class BubbleService extends Service {
             return true;
         } catch (Exception e) {
             Log.w(TAG, "cannot start sherpa engine", e);
-            micEngine = false; recording = false; setRecordingUi(false);
+            recording = false; setRecordingUi(false);
             if (rec != null) { record = null; try { rec.stop(); } catch (Exception ignored) {} try { rec.release(); } catch (Exception ignored) {} }
             return false;
         }
@@ -773,10 +738,10 @@ public class BubbleService extends Service {
 
     private void runSherpa(final AudioRecord rec, final String src) {
         SherpaEngine eng = SherpaEngine.create(getApplicationContext(), src);
-        boolean stillActive = recording && micEngine && record == rec;
+        boolean stillActive = recording && record == rec;
         if (eng != null && stillActive) {
             sherpaEngine = eng;
-            if (!(recording && micEngine && record == rec)) { releaseSherpa(); stillActive = false; }
+            if (!(recording && record == rec)) { releaseSherpa(); stillActive = false; }
         } else {
             if (eng != null) eng.release();
             if (stillActive) {
@@ -837,7 +802,7 @@ public class BubbleService extends Service {
         final short[] in = new short[frame];
         final byte[] out = new byte[(frame * SAMPLE_RATE / rate + 4) * 2];
         try {
-            while (recording && micEngine && record == rec) {
+            while (recording && record == rec) {
                 int n = rec.read(in, 0, frame);
                 if (n < 0) break;
                 if (n == 0) continue;
@@ -845,18 +810,6 @@ public class BubbleService extends Service {
                 final SherpaEngine se = sherpaEngine;
                 if (se != null) {
                     se.accept(out, outBytes);
-                } else {
-                    PcmFeed.write(out, outBytes);
-                }
-                if (!gotAsrText) {
-                    if (rms16(in, n) > SILENCE_RMS) voicedSinceText += 20;
-                    if (voicedSinceText >= ASR_WATCHDOG_VOICED_MS) {
-                        voicedSinceText = 0;
-                        main.post(() -> fallbackToServer(
-                                msg("تشخیص گفتار روی صدای سیستم کار نکرد؛ حالت سرور فعال شد",
-                                        "Recognizer can't hear system audio; using server")));
-                        break;
-                    }
                 }
             }
         } catch (Exception e) {
@@ -864,7 +817,7 @@ public class BubbleService extends Service {
         } finally {
             try { rec.stop(); } catch (Exception ignored) {}
             try { rec.release(); } catch (Exception ignored) {}
-            if (recording && micEngine && record == rec) {
+            if (recording && record == rec) {
                 record = null; recording = false;
                 main.post(() -> setRecordingUi(false));
             }
@@ -903,40 +856,12 @@ public class BubbleService extends Service {
     }
 
     private void fallbackToServer(String notice) {
-        if (!micEngine) return;
-        micEngine = false;
         recording = false;
         releaseSherpa();
-        SpeechHostActivity.finishIfRunning();
-        PcmFeed.close();
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
         beginCapture();
         if (notice != null) showText("", notice);
-    }
-
-    private void restartSpeechHost() {
-        if (!recording || !micEngine) return;
-        if (speechHostRestarts >= MAX_SPEECH_HOST_RESTARTS) {
-            fallbackToServer(null); return;
-        }
-        final String src = effectiveSource();
-        if (src == null || src.isEmpty() || "auto".equals(src)) {
-            fallbackToServer(null); return;
-        }
-        speechHostRestarts++;
-        main.postDelayed(() -> {
-            if (!recording || !micEngine) return;
-            try {
-                Intent i = new Intent(this, SpeechHostActivity.class)
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                        .putExtra(SpeechHostActivity.EXTRA_LANG_TAG, localeTag(src));
-                startActivity(i);
-            } catch (Exception e) {
-                Log.w(TAG, "restart speech host failed", e);
-                fallbackToServer(null);
-            }
-        }, 200);
     }
 
     private void beginCapture() {
@@ -979,7 +904,6 @@ public class BubbleService extends Service {
     private void stopRecording() {
         if (!recording) return;
         recording = false;
-        if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); PcmFeed.close(); }
         releaseSherpa();
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
@@ -1030,32 +954,18 @@ public class BubbleService extends Service {
 
     static void asrPartial(String text) {
         BubbleService s = instance;
-        if (s != null && s.micEngine) { s.gotAsrText = true; s.onPartialText(text); }
+        if (s != null) { s.gotAsrText = true; s.onPartialText(text); }
     }
 
     static void asrFinal(String text) {
         BubbleService s = instance;
-        if (s != null && s.micEngine) { s.gotAsrText = true; s.onFinalText(text); }
+        if (s != null) { s.gotAsrText = true; s.onFinalText(text); }
     }
 
     static void asrFallback() {
         BubbleService s = instance;
-        if (s == null || !s.micEngine) return;
-        s.fallbackToServer(s.msg("تشخیص گفتار گوگل در دسترس نیست؛ حالت سرور فعال شد",
-                "Google speech unavailable; using server"));
-    }
-
-    static void asrNeedsPermission() {
-        BubbleService s = instance;
-        if (s == null || !s.micEngine) return;
-        s.stopRecording();
-        s.showText("", s.msg("مجوز میکروفون لازم است", "Microphone permission required"));
-    }
-
-    static void asrClosed() {
-        BubbleService s = instance;
-        if (s == null || !s.micEngine) return;
-        s.restartSpeechHost();
+        if (s == null) return;
+        s.fallbackToServer(s.msg("حالت سرور فعال شد", "Using server"));
     }
 
     private void prepareLocalTranslator() {
@@ -1075,9 +985,7 @@ public class BubbleService extends Service {
         final Translator tr = localTr;
         tr.downloadModelIfNeeded(new DownloadConditions.Builder().build())
                 .addOnSuccessListener(v -> {
-                    if (tr == localTr) {
-                        localReady = true;
-                    }
+                    if (tr == localTr) localReady = true;
                 })
                 .addOnFailureListener(e -> {
                     Log.w(TAG, "translation model download failed", e);
@@ -1330,6 +1238,41 @@ public class BubbleService extends Service {
         return m.length() > 120 ? m.substring(0, 120) + "…" : m;
     }
 
+    private void startModelDownload(final String lang) {
+        showText("", isFa()
+                ? "📥 دانلود مدل آفلاین (یک‌بار)..."
+                : "📥 Downloading offline model (one time)...");
+        SherpaModelManager.downloadModel(this, lang, new SherpaModelManager.ProgressCallback() {
+            private int lastReportedMb = -1;
+
+            @Override
+            public void onProgress(String lang, long done, long total) {
+                final int mb = (int) (done / (1024 * 1024));
+                if (mb != lastReportedMb && mb % 5 == 0) {
+                    lastReportedMb = mb;
+                    main.post(() -> showText("", isFa()
+                            ? "📥 دانلود مدل: " + mb + " MB"
+                            : "📥 Downloading model: " + mb + " MB"));
+                }
+            }
+
+            @Override
+            public void onDone(String lang) {
+                main.post(() -> showText("", isFa()
+                        ? "✅ مدل آفلاین آماده شد"
+                        : "✅ Offline model ready"));
+            }
+
+            @Override
+            public void onError(String lang, Exception e) {
+                Log.w(TAG, "model download failed", e);
+                main.post(() -> showText("", isFa()
+                        ? "❌ دانلود مدل ناموفق"
+                        : "❌ Model download failed"));
+            }
+        });
+    }
+
     private void shutdown() { cleanup(); stopForeground(true); stopSelf(); }
 
     private void cleanup() {
@@ -1337,9 +1280,7 @@ public class BubbleService extends Service {
         main.removeCallbacksAndMessages(null);
         closeLocalTranslator();
         recording = false;
-        if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); }
         releaseSherpa();
-        PcmFeed.close();
         instance = null;
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
