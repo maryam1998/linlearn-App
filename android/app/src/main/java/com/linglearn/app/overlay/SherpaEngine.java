@@ -53,7 +53,7 @@ final class SherpaEngine {
             OnlineModelConfig mc = new OnlineModelConfig();
             mc.setTransducer(tr);
             mc.setTokens(new File(dir, SherpaModelManager.tokensFile(lang)).getAbsolutePath());
-            mc.setNumThreads(Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2)));
+            mc.setNumThreads(Math.max(1, Math.min(2, Runtime.getRuntime().availableProcessors() / 2)));
             mc.setDebug(false);
             mc.setProvider("cpu");
 
@@ -61,18 +61,19 @@ final class SherpaEngine {
             fc.setSampleRate(SAMPLE_RATE);
             fc.setFeatureDim(80);
 
-            // تنظیم دقیق Endpoint — دقیقاً مثل LingoNative
-            // rule1: 2.4s (جمله کامل قطع)
-            // rule2: 1.4s (جمله فعلی بسته بشه) ← مهم‌ترین
-            // rule3: 20s (حداکثر طول جمله)
-            EndpointConfig ec = new EndpointConfig();
-            try { ec.setRule1MinTrailingSilence(2.4f); } catch (Throwable ignored) {}
-            try { ec.setRule2MinTrailingSilence(1.4f); } catch (Throwable ignored) {}
-            try { ec.setRule3MinUtteranceLength(20f); } catch (Throwable ignored) {}
-
             OnlineRecognizerConfig cfg = new OnlineRecognizerConfig();
             cfg.setFeatConfig(fc);
             cfg.setModelConfig(mc);
+
+            // Endpoint مثل LingoNative: سکوت ۱.۴ ثانیه = پایان جمله
+            EndpointConfig ec = new EndpointConfig();
+            try {
+                ec.setRule1MinTrailingSilence(1.4f);
+                ec.setRule2MinTrailingSilence(0.8f);
+                ec.setRule3MinUtteranceLength(20f);
+            } catch (Throwable t) {
+                Log.w(TAG, "custom endpoint not supported, using defaults", t);
+            }
             cfg.setEndpointConfig(ec);
             cfg.setEnableEndpoint(true);
             cfg.setDecodingMethod("greedy_search");
