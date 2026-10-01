@@ -273,13 +273,7 @@ public class BubbleService extends Service {
             running = true;
             addBubbleIfNeeded();
             prepareLocalTranslator();
-
-            final String srcLang = effectiveSource();
-            if (srcLang != null && !"auto".equals(srcLang)
-                    && SherpaModelManager.isAvailable(srcLang)
-                    && SherpaModelManager.getModelDir(this, srcLang) == null) {
-                startModelDownload(srcLang);
-            }
+            // ✅ دانلود خودکار حذف شد. کاربر از تنظیمات دانلود می‌کنه.
         }
         return START_NOT_STICKY;
     }
@@ -704,6 +698,16 @@ public class BubbleService extends Service {
                 && SherpaModelManager.getModelDir(this, src) != null) {
             if (startSherpaEngine(src)) return;
         }
+
+        // اگه مدل دانلود نشده باشه، پیام می‌دیم
+        if (src != null && !"auto".equals(src)
+                && SherpaModelManager.isAvailable(src)
+                && SherpaModelManager.getModelDir(this, src) == null) {
+            showText("", msg("⚠ ابتدا مدل را از تنظیمات دانلود کنید",
+                    "⚠ Please download the model from Settings"));
+            return;
+        }
+
         beginCapture();
     }
 
@@ -1221,41 +1225,6 @@ public class BubbleService extends Service {
             return "Network unstable, retrying next segment";
         }
         return m.length() > 120 ? m.substring(0, 120) + "…" : m;
-    }
-
-    private void startModelDownload(final String lang) {
-        showText("", isFa()
-                ? "📥 دانلود مدل آفلاین (یک‌بار)..."
-                : "📥 Downloading offline model (one time)...");
-        SherpaModelManager.downloadModel(this, lang, new SherpaModelManager.ProgressCallback() {
-            private int lastReportedMb = -1;
-
-            @Override
-            public void onProgress(String lang, long done, long total) {
-                final int mb = (int) (done / (1024 * 1024));
-                if (mb != lastReportedMb && mb % 5 == 0) {
-                    lastReportedMb = mb;
-                    main.post(() -> showText("", isFa()
-                            ? "📥 دانلود مدل: " + mb + " MB"
-                            : "📥 Downloading model: " + mb + " MB"));
-                }
-            }
-
-            @Override
-            public void onDone(String lang) {
-                main.post(() -> showText("", isFa()
-                        ? "✅ مدل آفلاین آماده شد"
-                        : "✅ Offline model ready"));
-            }
-
-            @Override
-            public void onError(String lang, Exception e) {
-                Log.w(TAG, "model download failed", e);
-                main.post(() -> showText("", isFa()
-                        ? "❌ دانلود مدل ناموفق"
-                        : "❌ Model download failed"));
-            }
-        });
     }
 
     private void shutdown() { cleanup(); stopForeground(true); stopSelf(); }
