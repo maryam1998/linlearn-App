@@ -20,7 +20,8 @@ import okhttp3.Response;
 final class SherpaModelManager {
 
     private static final String TAG = "SherpaModelMgr";
-    private static final String HF_BASE = "https://huggingface.co/";
+    // ✅ آینه چینی (از ایران قابل دسترسه)
+    private static final String HF_BASE = "https://hf-mirror.com/";
 
     private SherpaModelManager() {}
 
@@ -44,7 +45,7 @@ final class SherpaModelManager {
     static {
         Map<String, Spec> m = new HashMap<>();
 
-        // انگلیسی
+        // ✅ انگلیسی - Streaming Zipformer
         m.put("en", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
                 "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
@@ -52,13 +53,17 @@ final class SherpaModelManager {
                 "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
                 "tokens.txt"));
 
-        // چینی + انگلیسی
+        // ✅ چینی + انگلیسی - Streaming Zipformer
         m.put("zh", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
                 "encoder-epoch-99-avg-1.int8.onnx",
                 "decoder-epoch-99-avg-1.onnx",
                 "joiner-epoch-99-avg-1.int8.onnx",
                 "tokens.txt"));
+
+        // 📌 برای اضافه کردن زبان‌های دیگه (کره‌ای، فرانسوی، آلمانی...)
+        // از این لینک استفاده کن:
+        // https://k2-fsa.github.io/sherpa/onnx/pretrained_models/online-transducer/zipformer-transducer-models.html
 
         SPECS = Collections.unmodifiableMap(m);
     }
