@@ -109,7 +109,7 @@ public class BubbleService extends Service {
     private static final long PANEL_HIDE_MS = 6000;
     private static final long PANEL_HIDE_MS_RECORDING = 60000;
 
-    private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 120;
+    private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 80;
     private static final long REMOTE_PARTIAL_INTERVAL_MS = 1200;
 
     private static final int NET_ATTEMPTS = 3;
@@ -198,6 +198,8 @@ public class BubbleService extends Service {
     private TextView tvTr;
     private WindowManager.LayoutParams panelLp;
     private boolean panelShown = false;
+    private String shownSrc = "";   // what the panel currently displays (diff check)
+    private String shownTr = "";
     private final Runnable hidePanel = this::removePanel;
 
     private ObjectAnimator pulse;
@@ -479,19 +481,26 @@ public class BubbleService extends Service {
     private void showText(String src, String tr) {
         if (wm == null || bubble == null) return;
         ensurePanel();
-        boolean hasSrc = src != null && !src.isEmpty();
-        tvSrc.setText(hasSrc ? src : "");
-        tvSrc.setVisibility(hasSrc ? View.VISIBLE : View.GONE);
-        boolean hasTr = tr != null && !tr.isEmpty();
-        tvTr.setText(hasTr ? tr : "");
-        tvTr.setVisibility(hasTr ? View.VISIBLE : View.GONE);
-        tvTr.setPadding(0, hasSrc ? dp(4) : 0, 0, 0);
+        String newSrc = src == null ? "" : src;
+        String newTr = tr == null ? "" : tr;
+        boolean changed = !newSrc.equals(shownSrc) || !newTr.equals(shownTr) || !panelShown;
+        if (changed) {
+            shownSrc = newSrc;
+            shownTr = newTr;
+            boolean hasSrc = !newSrc.isEmpty();
+            tvSrc.setText(newSrc);
+            tvSrc.setVisibility(hasSrc ? View.VISIBLE : View.GONE);
+            boolean hasTr = !newTr.isEmpty();
+            tvTr.setText(newTr);
+            tvTr.setVisibility(hasTr ? View.VISIBLE : View.GONE);
+            tvTr.setPadding(0, hasSrc ? dp(4) : 0, 0, 0);
 
-        computePanelPos();
-        try {
-            if (!panelShown) { wm.addView(panel, panelLp); panelShown = true; }
-            else wm.updateViewLayout(panel, panelLp);
-        } catch (Exception e) { Log.w(TAG, "panel show failed", e); }
+            computePanelPos();
+            try {
+                if (!panelShown) { wm.addView(panel, panelLp); panelShown = true; }
+                else wm.updateViewLayout(panel, panelLp);
+            } catch (Exception e) { Log.w(TAG, "panel show failed", e); }
+        }
 
         main.removeCallbacks(hidePanel);
         long delay = recording ? PANEL_HIDE_MS_RECORDING : PANEL_HIDE_MS;
@@ -503,6 +512,8 @@ public class BubbleService extends Service {
             try { wm.removeView(panel); } catch (Exception ignored) {}
         }
         panelShown = false;
+        shownSrc = "";
+        shownTr = "";
     }
 
     private void setRecordingUi(boolean rec) {
@@ -803,13 +814,14 @@ public class BubbleService extends Service {
         if (!hasInternet()) return;
         lastRemotePartialAt = now;
         final String snap = text;
+        final int seqAtStart = partialSeq;
         try {
             netTr.execute(() -> {
                 String tr;
                 try { tr = translate(snap); } catch (Exception e) { return; }
                 final String shown = tr;
                 main.post(() -> {
-                    if (!recording || localReady) return;
+                    if (!recording || localReady || seqAtStart != partialSeq) return;
                     liveTr = shown;
                     liveTrSrc = snap;
                     String cur = lastPartialSrc.isEmpty() ? snap : lastPartialSrc;
