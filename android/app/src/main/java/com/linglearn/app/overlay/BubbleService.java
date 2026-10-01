@@ -98,9 +98,9 @@ public class BubbleService extends Service {
     private static final int SAMPLE_RATE = 16000;
     private static final int CHUNK_MS = 100;
     private static final int CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS / 1000;
-    private static final int MIN_SEG_MS = 1200;
-    private static final int MAX_SEG_MS = 3000;
-    private static final int SILENCE_CUT_MS = 350;
+    private static final int MIN_SEG_MS = 800;
+    private static final int MAX_SEG_MS = 2000;
+    private static final int SILENCE_CUT_MS = 300;
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
@@ -112,7 +112,7 @@ public class BubbleService extends Service {
     private static final long PANEL_HIDE_MS_RECORDING = 60000;
 
     private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 80;
-    private static final long REMOTE_PARTIAL_INTERVAL_MS = 1200;
+    private static final long REMOTE_PARTIAL_INTERVAL_MS = 700;
 
     private static final int NET_ATTEMPTS = 3;
     private static final OkHttpClient HTTP = new OkHttpClient.Builder()
@@ -331,6 +331,22 @@ public class BubbleService extends Service {
 
     private String sourceLang() {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getString("source", "auto");
+    }
+
+    /** True when the app explicitly told us the spoken language (not "auto"). */
+    private boolean srcExplicit() {
+        String s = sourceLang();
+        return s != null && !s.isEmpty() && !"auto".equals(s);
+    }
+
+    /**
+     * Spoken language actually used. "auto" is slow (server transcription + LLM translation),
+     * so for a language-learning app we assume English unless the target itself is English.
+     * Pass sourceLang from the web app to override.
+     */
+    private String effectiveSource() {
+        if (srcExplicit()) return sourceLang();
+        return "en".equals(targetLang()) ? "auto" : "en";
     }
 
     private boolean isFa() { return "fa".equals(targetLang()); }
@@ -583,7 +599,7 @@ public class BubbleService extends Service {
         liveTr = ""; liveTrSrc = ""; lastPartialSrc = "";
         speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
-        final String src = sourceLang();
+        final String src = effectiveSource();
         boolean micOk = Build.VERSION.SDK_INT >= 33
                 && src != null && !src.isEmpty() && !"auto".equals(src)
                 && SpeechRecognizer.isRecognitionAvailable(this);
@@ -740,7 +756,7 @@ public class BubbleService extends Service {
         if (speechHostRestarts >= MAX_SPEECH_HOST_RESTARTS) {
             fallbackToServer(null); return;
         }
-        final String src = sourceLang();
+        final String src = effectiveSource();
         if (src == null || src.isEmpty() || "auto".equals(src)) {
             fallbackToServer(null); return;
         }
@@ -878,7 +894,7 @@ public class BubbleService extends Service {
     }
 
     private void prepareLocalTranslator() {
-        String src = TranslateLanguage.fromLanguageTag(sourceLang());
+        String src = TranslateLanguage.fromLanguageTag(effectiveSource());
         String tgt = TranslateLanguage.fromLanguageTag(targetLang());
         final boolean wasReady = localReady;
         if (src == null || tgt == null || src.equals(tgt)) { closeLocalTranslator(); return; }
@@ -893,8 +909,20 @@ public class BubbleService extends Service {
         }
         final Translator tr = localTr;
         tr.downloadModelIfNeeded(new DownloadConditions.Builder().build())
-                .addOnSuccessListener(v -> { if (tr == localTr) localReady = true; })
-                .addOnFailureListener(e -> Log.w(TAG, "translation model download failed", e));
+                .addOnSuccessListener(v -> {
+                    if (tr == localTr) {
+                        localReady = true;
+                        if (recording) showText(shownSrc, shownTr);
+                    }
+                })
+                .addOnFailureListener(e -> {
+                    Log.w(TAG, "translation model download failed", e);
+                    if (tr == localTr) {
+                        if (recording) showText("", msg("دانلود مدل ترجمه ناموفق بود؛ اینترنت را بررسی کنید",
+                                "Translation model download failed - check internet"));
+                        main.postDelayed(() -> { if (tr == localTr && !localReady) prepareLocalTranslator(); }, 8000);
+                    }
+                });
     }
 
     private void closeLocalTranslator() {
@@ -969,7 +997,7 @@ public class BubbleService extends Service {
         liveTr = ""; liveTrSrc = "";
         final int fseq = ++finalSeq;
         final Translator tr = localTr;
-        if (localReady && tr != null) {
+        if (localReady && tr != null && (micEngine || srcExplicit())) {
             if (!keepTr.isEmpty() && text.equals(keepSrc)) {
                 shownFinalSeq = fseq; showText(text, keepTr); return;
             }
