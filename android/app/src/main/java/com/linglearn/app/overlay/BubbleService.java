@@ -100,15 +100,19 @@ public class BubbleService extends Service {
     private static final int CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS / 1000;
     private static final int MIN_SEG_MS = 800;
     private static final int MAX_SEG_MS = 2000;
-    private static final int SILENCE_CUT_MS = 1400;   // مثل LingoNative
+    private static final int SILENCE_CUT_MS = 300;
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
+    // If loud audio plays this long and the recognizer never produced text, switch to the server.
     private static final int ASR_WATCHDOG_VOICED_MS = 15000;
     private static final int MAX_TEXT_PENDING = 6;
 
     private static final long PANEL_HIDE_MS = 6000;
     private static final long PANEL_HIDE_MS_RECORDING = 60000;
+
+    private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 80;
+    private static final long REMOTE_PARTIAL_INTERVAL_MS = 700;
 
     private static final int NET_ATTEMPTS = 3;
     private static final OkHttpClient HTTP = new OkHttpClient.Builder()
@@ -153,7 +157,6 @@ public class BubbleService extends Service {
         LANG_NAMES.put("pt", "Portuguese");
         LANG_NAMES.put("ur", "Urdu");
         LANG_NAMES.put("nl", "Dutch");
-        LANG_NAMES.put("he", "Hebrew");
 
         LOCALE_TAGS.put("fa", "fa-IR");
         LOCALE_TAGS.put("en", "en-US");
@@ -171,7 +174,6 @@ public class BubbleService extends Service {
         LOCALE_TAGS.put("pt", "pt-BR");
         LOCALE_TAGS.put("ur", "ur-PK");
         LOCALE_TAGS.put("nl", "nl-NL");
-        LOCALE_TAGS.put("he", "he-IL");
     }
 
     public static void saveLangs(Context ctx, String target, String source) {
@@ -198,7 +200,7 @@ public class BubbleService extends Service {
     private TextView tvTr;
     private WindowManager.LayoutParams panelLp;
     private boolean panelShown = false;
-    private String shownSrc = "";
+    private String shownSrc = "";   // what the panel currently displays (diff check)
     private String shownTr = "";
     private final Runnable hidePanel = this::removePanel;
 
@@ -211,8 +213,8 @@ public class BubbleService extends Service {
     private volatile boolean recording = false;
 
     private static volatile BubbleService instance;
-    private volatile boolean micEngine = false;
-    private volatile SherpaEngine sherpaEngine;
+    private volatile boolean micEngine = false;   // true = Android recognizer fed with SYSTEM audio
+    private volatile SherpaEngine sherpaEngine;   // on-device Sherpa-ONNX recognizer (null = Google/server path)
     private volatile boolean gotAsrText = false;
     private volatile int voicedSinceText = 0;
 
@@ -221,11 +223,20 @@ public class BubbleService extends Service {
     private volatile boolean localReady = false;
     private String lastPartialSrc = "";
     private String liveTr = "";
+    private long lastPartialAt = 0;
+    private long lastRemotePartialAt = 0;
     private int partialSeq = 0;
     private int shownPartialSeq = 0;
+    private boolean partialBusy = false;
     private String liveTrSrc = "";
     private int finalSeq = 0;
     private int shownFinalSeq = 0;
+    private boolean partialScheduled = false;
+    private volatile String prevFinalText = "";   // previous final sentence, sent as translation context
+    private final Runnable partialRunnable = () -> {
+        partialScheduled = false;
+        translatePartialNow();
+    };
 
     private int speechHostRestarts = 0;
     private static final int MAX_SPEECH_HOST_RESTARTS = 40;
@@ -324,11 +335,17 @@ public class BubbleService extends Service {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getString("source", "auto");
     }
 
+    /** True when the app explicitly told us the spoken language (not "auto"). */
     private boolean srcExplicit() {
         String s = sourceLang();
         return s != null && !s.isEmpty() && !"auto".equals(s);
     }
 
+    /**
+     * Spoken language actually used. "auto" is slow (server transcription + LLM translation),
+     * so for a language-learning app we assume English unless the target itself is English.
+     * Pass sourceLang from the web app to override.
+     */
     private String effectiveSource() {
         if (srcExplicit()) return sourceLang();
         return "en".equals(targetLang()) ? "auto" : "en";
@@ -579,12 +596,15 @@ public class BubbleService extends Service {
     private void startCapture() {
         if (mediaProjection == null || recording) return;
         prepareLocalTranslator();
+        prevFinalText = "";
+        partialBusy = false;
         shownPartialSeq = partialSeq;
         liveTr = ""; liveTrSrc = ""; lastPartialSrc = "";
         speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
         final String src = effectiveSource();
         if (src != null && !"auto".equals(src) && SherpaModelManager.isAvailable(src)) {
+            // Sherpa path: feedLoop feeds the OnlineStream (no SpeechHostActivity)
             if (startSherpaEngine(src)) return;
         }
         boolean micOk = Build.VERSION.SDK_INT >= 33
@@ -594,6 +614,10 @@ public class BubbleService extends Service {
         beginCapture();
     }
 
+    /**
+     * Recognizer engine: captures the phone's PLAYBACK audio (not the microphone), converts it to
+     * 16 kHz mono PCM16 and streams it to SpeechRecognizer through PcmFeed / EXTRA_AUDIO_SOURCE.
+     */
     private boolean startMicEngine(String src) {
         AudioRecord rec = null;
         try {
@@ -621,14 +645,19 @@ public class BubbleService extends Service {
         }
     }
 
+    /**
+     * Sherpa engine: same playback capture + feedLoop as the recognizer engine, but the 16 kHz PCM
+     * goes to SherpaEngine instead of PcmFeed. Returns false (-> Google/server path) if the model
+     * is not downloaded or the capture cannot start.
+     */
     private boolean startSherpaEngine(final String src) {
-        if (SherpaModelManager.getModelDir(this, src) == null) return false;
+        if (SherpaModelManager.getModelDir(this, src) == null) return false;   // not downloaded yet
         AudioRecord rec = null;
         try {
             rec = buildPlaybackRecord();
             if (rec == null) return false;
             record = rec;
-            micEngine = true;
+            micEngine = true;          // so feedLoop runs and asr* callbacks are accepted
             recording = true;
             setRecordingUi(true);
             rec.startRecording();
@@ -644,11 +673,13 @@ public class BubbleService extends Service {
         }
     }
 
+    /** Feed-thread entry for Sherpa: loads the model off the main thread, then runs feedLoop. */
     private void runSherpa(final AudioRecord rec, final String src) {
         SherpaEngine eng = SherpaEngine.create(getApplicationContext(), src);
         boolean stillActive = recording && micEngine && record == rec;
         if (eng != null && stillActive) {
             sherpaEngine = eng;
+            // stop/cleanup may have run between the check and the assignment
             if (!(recording && micEngine && record == rec)) { releaseSherpa(); stillActive = false; }
         } else {
             if (eng != null) eng.release();
@@ -659,7 +690,7 @@ public class BubbleService extends Service {
             stillActive = false;
         }
         if (stillActive) {
-            feedLoop(rec);
+            feedLoop(rec);   // releases rec in its finally
         } else {
             try { rec.stop(); } catch (Exception ignored) {}
             try { rec.release(); } catch (Exception ignored) {}
@@ -672,6 +703,7 @@ public class BubbleService extends Service {
         if (e != null) e.release();
     }
 
+    /** Playback-capture AudioRecord at the best native rate (48 kHz, then 44.1 kHz, then 16 kHz). */
     private AudioRecord buildPlaybackRecord() {
         if (mediaProjection == null) return null;
         AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
@@ -706,7 +738,7 @@ public class BubbleService extends Service {
 
     private void feedLoop(final AudioRecord rec) {
         final int rate = rec.getSampleRate() > 0 ? rec.getSampleRate() : SAMPLE_RATE;
-        final int frame = Math.max(1, rate / 50);
+        final int frame = Math.max(1, rate / 50);                   // 20 ms of input
         final short[] in = new short[frame];
         final byte[] out = new byte[(frame * SAMPLE_RATE / rate + 4) * 2];
         try {
@@ -744,6 +776,7 @@ public class BubbleService extends Service {
         }
     }
 
+    /** Box-filter downsample of mono PCM16 to 16 kHz little-endian bytes. Returns byte count. */
     private static int toPcm16k(short[] in, int n, int rate, byte[] out) {
         int outN;
         if (rate == SAMPLE_RATE) {
@@ -775,6 +808,7 @@ public class BubbleService extends Service {
         return Math.sqrt(sum / (double) n);
     }
 
+    /** Leaves the recognizer engine and uses the server (chunked transcribe) path instead. */
     private void fallbackToServer(String notice) {
         if (!micEngine) return;
         micEngine = false;
@@ -950,11 +984,14 @@ public class BubbleService extends Service {
                 .addOnSuccessListener(v -> {
                     if (tr == localTr) {
                         localReady = true;
+                        if (recording) showText(shownSrc, shownTr);
                     }
                 })
                 .addOnFailureListener(e -> {
                     Log.w(TAG, "translation model download failed", e);
                     if (tr == localTr) {
+                        if (recording) showText("", msg("دانلود مدل ترجمه ناموفق بود؛ اینترنت را بررسی کنید",
+                                "Translation model download failed - check internet"));
                         main.postDelayed(() -> { if (tr == localTr && !localReady) prepareLocalTranslator(); }, 8000);
                     }
                 });
@@ -965,24 +1002,80 @@ public class BubbleService extends Service {
         if (t != null) { try { t.close(); } catch (Exception ignored) {} }
     }
 
-    /**
-     * مثل LingoNative: فقط متن اصلی رو نشون بده، ترجمه partial نمی‌کنیم.
-     * ترجمه فقط روی onFinalText (پایان جمله بعد از ۱.۴ ثانیه سکوت) اجرا می‌شه.
-     */
     private void onPartialText(final String text) {
-        showText(text, "");
+        showText(text, liveTr);
+        if (!localReady || localTr == null) { remotePartialTranslate(text); return; }
         lastPartialSrc = text;
-        gotAsrText = true;
+        long wait = lastPartialAt + PARTIAL_TRANSLATE_INTERVAL_MS - SystemClock.uptimeMillis();
+        if (wait <= 0) translatePartialNow();
+        else if (!partialScheduled) {
+            partialScheduled = true;
+            main.postDelayed(partialRunnable, wait);
+        }
+    }
+
+    private void translatePartialNow() {
+        final String src = lastPartialSrc;
+        final Translator tr = localTr;
+        if (src.isEmpty() || tr == null || !localReady || partialBusy) return;
+        partialBusy = true;
+        lastPartialAt = SystemClock.uptimeMillis();
+        final int seq = ++partialSeq;
+        tr.translate(src).addOnCompleteListener(task -> {
+            partialBusy = false;
+            if (task.isSuccessful() && recording && seq > shownPartialSeq) {
+                shownPartialSeq = seq;
+                liveTr = task.getResult();
+                liveTrSrc = src;
+                String cur = lastPartialSrc.isEmpty() ? src : lastPartialSrc;
+                showText(cur, liveTr);
+            }
+            if (recording && !lastPartialSrc.isEmpty() && !lastPartialSrc.equals(src)) {
+                translatePartialNow();
+            }
+        });
+    }
+
+    private void remotePartialTranslate(final String text) {
+        if (text == null || text.isEmpty()) return;
+        long now = SystemClock.uptimeMillis();
+        if (now - lastRemotePartialAt < REMOTE_PARTIAL_INTERVAL_MS) return;
+        if (!hasInternet()) return;
+        lastRemotePartialAt = now;
+        final String snap = text;
+        final int seqAtStart = partialSeq;
+        try {
+            netTr.execute(() -> {
+                String tr;
+                try { tr = translate(snap); } catch (Exception e) { return; }
+                final String shown = tr;
+                main.post(() -> {
+                    if (!recording || localReady || seqAtStart != partialSeq) return;
+                    liveTr = shown;
+                    liveTrSrc = snap;
+                    String cur = lastPartialSrc.isEmpty() ? snap : lastPartialSrc;
+                    showText(cur, shown);
+                });
+            });
+        } catch (Exception ignored) {}
     }
 
     private void onFinalText(final String text) {
         partialSeq++; shownPartialSeq = partialSeq;
+        main.removeCallbacks(partialRunnable); partialScheduled = false;
         lastPartialSrc = "";
+        final String keepTr = liveTr;
+        final String keepSrc = liveTrSrc;
         liveTr = ""; liveTrSrc = "";
         final int fseq = ++finalSeq;
+        final String ctxPrev = prevFinalText;
+        prevFinalText = text;
         final Translator tr = localTr;
-        if (localReady && tr != null) {
-            showText(text, "…");
+        if (localReady && tr != null && (micEngine || srcExplicit())) {
+            if (!keepTr.isEmpty() && text.equals(keepSrc)) {
+                shownFinalSeq = fseq; showText(text, keepTr); return;
+            }
+            showText(text, keepTr);
             tr.translate(text)
                     .addOnSuccessListener(out -> {
                         if (fseq < shownFinalSeq) return;
@@ -991,14 +1084,14 @@ public class BubbleService extends Service {
                     })
                     .addOnFailureListener(e -> {
                         Log.w(TAG, "local translate failed", e);
-                        remoteTranslate(text, fseq);
+                        remoteTranslate(text, fseq, ctxPrev);
                     });
             return;
         }
-        remoteTranslate(text, fseq);
+        remoteTranslate(text, fseq, ctxPrev);
     }
 
-    private void remoteTranslate(final String text, final int fseq) {
+    private void remoteTranslate(final String text, final int fseq, final String ctxPrev) {
         if (!hasInternet()) {
             if (fseq >= shownFinalSeq) {
                 shownFinalSeq = fseq;
@@ -1007,7 +1100,7 @@ public class BubbleService extends Service {
             return;
         }
         showText(text, "…");
-        submitText(text, fseq);
+        submitText(text, fseq, ctxPrev);
     }
 
     private boolean hasInternet() {
@@ -1039,7 +1132,7 @@ public class BubbleService extends Service {
         } catch (Exception e) { pending.decrementAndGet(); }
     }
 
-    private void submitText(final String text, final int fseq) {
+    private void submitText(final String text, final int fseq, final String ctxPrev) {
         if (textPending.get() >= MAX_TEXT_PENDING) {
             Log.w(TAG, "dropping translation (backlog)");
             main.post(() -> showText(text, ""));
@@ -1047,7 +1140,7 @@ public class BubbleService extends Service {
         }
         textPending.incrementAndGet();
         try {
-            netTr.execute(() -> { try { translateAndShow(text, fseq); } finally { textPending.decrementAndGet(); } });
+            netTr.execute(() -> { try { translateAndShow(text, fseq, ctxPrev); } finally { textPending.decrementAndGet(); } });
         } catch (Exception e) { textPending.decrementAndGet(); }
     }
 
@@ -1063,9 +1156,9 @@ public class BubbleService extends Service {
         }
     }
 
-    private void translateAndShow(final String text, final int fseq) {
+    private void translateAndShow(final String text, final int fseq, final String ctxPrev) {
         String tr;
-        try { tr = translate(text); }
+        try { tr = translate(text, ctxPrev); }
         catch (Exception e) { Log.w(TAG, "translate failed", e); tr = netErrText(e); }
         final String shown = tr;
         main.post(() -> {
@@ -1086,11 +1179,17 @@ public class BubbleService extends Service {
         return j.optString("text", "").trim();
     }
 
-    private String translate(String text) throws Exception {
+    private String translate(String text) throws Exception { return translate(text, null); }
+
+    private String translate(String text, String prevContext) throws Exception {
         String target = targetLang();
         String name = LANG_NAMES.containsKey(target) ? LANG_NAMES.get(target) : target;
         String prompt = "Translate the following text to " + name
-                + ". Reply with ONLY the translation, no quotes, no explanations.\n\nText: " + text;
+                + ". Reply with ONLY the translation, no quotes, no explanations.";
+        if (prevContext != null && !prevContext.isEmpty()) {
+            prompt += "\n\nPrevious sentence (context only, do NOT translate it): " + prevContext;
+        }
+        prompt += "\n\nText: " + text;
         JSONObject body = new JSONObject();
         body.put(GENERATE_PROMPT_KEY, prompt);
         String resp = postBytes(HTTP_FAST, 2, WORKER_BASE + GENERATE_PATH,
