@@ -40,13 +40,13 @@ jobs:
             curl -L -o android/gradle/wrapper/gradle.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
           fi
 
-      # ✅ مرحله جدید: دانلود خودکار فایل AAR شرپا
       - name: Download Sherpa-ONNX AAR
         run: |
           mkdir -p android/app/libs
+          rm -f android/app/libs/*.aar
           curl -L --retry 3 --retry-delay 5 \
-            -o android/app/libs/sherpa-onnx-static-link-onnxruntime-1.12.8.aar \
-            "https://huggingface.co/csukuangfj/sherpa-onnx-libs/resolve/main/android/aar/1.12.8/sherpa-onnx-static-link-onnxruntime-1.12.8.aar"
+            -o android/app/libs/sherpa-onnx-1.13.4.aar \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar"
           ls -lh android/app/libs/
 
       - name: Build Debug APK
