@@ -4,11 +4,15 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.media.projection.MediaProjectionConfig;
 import android.media.projection.MediaProjectionManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.util.Log;
 
 public class ProjectionActivity extends Activity {
 
+    private static final String TAG = "ProjectionActivity";
     private static final int REQ_AUDIO = 1;
     private static final int REQ_PROJECTION = 2;
 
@@ -37,7 +41,28 @@ public class ProjectionActivity extends Activity {
 
     private void launchProjection() {
         MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-        startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION);
+        if (mpm == null) {
+            Log.e(TAG, "MediaProjectionManager is null");
+            deny();
+            return;
+        }
+
+        Intent intent;
+        if (Build.VERSION.SDK_INT >= 34) {
+            // Android 14+: فقط Entire Screen (نه تک‌اپ) → اپ‌های دیگه قفل نمی‌شن
+            intent = mpm.createScreenCaptureIntent(
+                    MediaProjectionConfig.createConfigForDefaultDisplay()
+            );
+        } else {
+            intent = mpm.createScreenCaptureIntent();
+        }
+
+        try {
+            startActivityForResult(intent, REQ_PROJECTION);
+        } catch (Exception e) {
+            Log.e(TAG, "cannot launch projection intent", e);
+            deny();
+        }
     }
 
     @Override
