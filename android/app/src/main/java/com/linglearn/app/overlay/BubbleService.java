@@ -104,6 +104,8 @@ public class BubbleService extends Service {
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
+    // If loud audio plays this long and the recognizer never produced text, switch to the server.
+    private static final int ASR_WATCHDOG_VOICED_MS = 15000;
     private static final int MAX_TEXT_PENDING = 6;
 
     private static final long PANEL_HIDE_MS = 6000;
@@ -211,7 +213,9 @@ public class BubbleService extends Service {
     private volatile boolean recording = false;
 
     private static volatile BubbleService instance;
-    private volatile boolean micEngine = false;
+    private volatile boolean micEngine = false;   // true = Android recognizer fed with SYSTEM audio
+    private volatile boolean gotAsrText = false;
+    private volatile int voicedSinceText = 0;
 
     private Translator localTr;
     private String localTrKey = "";
@@ -578,6 +582,7 @@ public class BubbleService extends Service {
         shownPartialSeq = partialSeq;
         liveTr = ""; liveTrSrc = ""; lastPartialSrc = "";
         speechHostRestarts = 0;
+        gotAsrText = false; voicedSinceText = 0;
         final String src = sourceLang();
         boolean micOk = Build.VERSION.SDK_INT >= 33
                 && src != null && !src.isEmpty() && !"auto".equals(src)
@@ -586,32 +591,158 @@ public class BubbleService extends Service {
         beginCapture();
     }
 
+    /**
+     * Recognizer engine: captures the phone's PLAYBACK audio (not the microphone), converts it to
+     * 16 kHz mono PCM16 and streams it to SpeechRecognizer through PcmFeed / EXTRA_AUDIO_SOURCE.
+     */
     private boolean startMicEngine(String src) {
+        AudioRecord rec = null;
         try {
-            Intent i = new Intent(this, SpeechHostActivity.class)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
-                    .putExtra(SpeechHostActivity.EXTRA_LANG_TAG, localeTag(src));
+            rec = buildPlaybackRecord();
+            if (rec == null) return false;
+            record = rec;
             micEngine = true;
             recording = true;
             setRecordingUi(true);
+            rec.startRecording();
+            final AudioRecord fr = rec;
+            new Thread(() -> feedLoop(fr), "bubble-feed").start();
+            Intent i = new Intent(this, SpeechHostActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                    .putExtra(SpeechHostActivity.EXTRA_LANG_TAG, localeTag(src));
             startActivity(i);
-            showText("", msg("🎙 گوش‌دادن…", "🎙 Listening…"));
+            showText("", msg("🎙 گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
             return true;
         } catch (Exception e) {
-            Log.w(TAG, "cannot start SpeechHostActivity", e);
+            Log.w(TAG, "cannot start recognizer engine", e);
             micEngine = false; recording = false; setRecordingUi(false);
+            PcmFeed.close();
+            if (rec != null) { record = null; try { rec.stop(); } catch (Exception ignored) {} try { rec.release(); } catch (Exception ignored) {} }
             return false;
         }
+    }
+
+    /** Playback-capture AudioRecord at the best native rate (48 kHz, then 44.1 kHz, then 16 kHz). */
+    private AudioRecord buildPlaybackRecord() {
+        if (mediaProjection == null) return null;
+        AudioPlaybackCaptureConfiguration cfg = new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build();
+        int[] rates = {48000, 44100, SAMPLE_RATE};
+        for (int rate : rates) {
+            AudioRecord r = null;
+            try {
+                int min = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT);
+                r = new AudioRecord.Builder()
+                        .setAudioFormat(new AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(rate)
+                                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                                .build())
+                        .setBufferSizeInBytes(Math.max(min, rate / 5 * 2))
+                        .setAudioPlaybackCaptureConfig(cfg)
+                        .build();
+                if (r.getState() == AudioRecord.STATE_INITIALIZED) return r;
+                r.release();
+            } catch (Exception e) {
+                Log.w(TAG, "playback record @" + rate + " failed", e);
+                if (r != null) { try { r.release(); } catch (Exception ignored) {} }
+            }
+        }
+        return null;
+    }
+
+    private void feedLoop(final AudioRecord rec) {
+        final int rate = rec.getSampleRate() > 0 ? rec.getSampleRate() : SAMPLE_RATE;
+        final int frame = Math.max(1, rate / 50);                   // 20 ms of input
+        final short[] in = new short[frame];
+        final byte[] out = new byte[(frame * SAMPLE_RATE / rate + 4) * 2];
+        try {
+            while (recording && micEngine && record == rec) {
+                int n = rec.read(in, 0, frame);
+                if (n < 0) break;
+                if (n == 0) continue;
+                int outBytes = toPcm16k(in, n, rate, out);
+                PcmFeed.write(out, outBytes);
+                if (!gotAsrText) {
+                    if (rms16(in, n) > SILENCE_RMS) voicedSinceText += 20;
+                    if (voicedSinceText >= ASR_WATCHDOG_VOICED_MS) {
+                        voicedSinceText = 0;
+                        main.post(() -> fallbackToServer(
+                                msg("تشخیص گفتار روی صدای سیستم کار نکرد؛ حالت سرور فعال شد",
+                                        "Recognizer can't hear system audio; using server")));
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "feed loop", e);
+        } finally {
+            try { rec.stop(); } catch (Exception ignored) {}
+            try { rec.release(); } catch (Exception ignored) {}
+            if (recording && micEngine && record == rec) {
+                record = null; recording = false;
+                main.post(() -> setRecordingUi(false));
+            }
+        }
+    }
+
+    /** Box-filter downsample of mono PCM16 to 16 kHz little-endian bytes. Returns byte count. */
+    private static int toPcm16k(short[] in, int n, int rate, byte[] out) {
+        int outN;
+        if (rate == SAMPLE_RATE) {
+            outN = Math.min(n, out.length / 2);
+            for (int j = 0; j < outN; j++) {
+                out[2 * j] = (byte) (in[j] & 0xff);
+                out[2 * j + 1] = (byte) ((in[j] >> 8) & 0xff);
+            }
+            return outN * 2;
+        }
+        outN = Math.min((int) ((long) n * SAMPLE_RATE / rate), out.length / 2);
+        for (int j = 0; j < outN; j++) {
+            int a = (int) ((long) j * rate / SAMPLE_RATE);
+            int b = Math.min(n, (int) ((long) (j + 1) * rate / SAMPLE_RATE));
+            if (b <= a) b = Math.min(n, a + 1);
+            int sum = 0;
+            for (int k = a; k < b; k++) sum += in[k];
+            short s = (short) (sum / (b - a));
+            out[2 * j] = (byte) (s & 0xff);
+            out[2 * j + 1] = (byte) ((s >> 8) & 0xff);
+        }
+        return outN * 2;
+    }
+
+    private static double rms16(short[] s, int n) {
+        if (n <= 0) return 0;
+        long sum = 0;
+        for (int i = 0; i < n; i++) sum += (long) s[i] * s[i];
+        return Math.sqrt(sum / (double) n);
+    }
+
+    /** Leaves the recognizer engine and uses the server (chunked transcribe) path instead. */
+    private void fallbackToServer(String notice) {
+        if (!micEngine) return;
+        micEngine = false;
+        recording = false;
+        SpeechHostActivity.finishIfRunning();
+        PcmFeed.close();
+        AudioRecord r = record; record = null;
+        if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
+        beginCapture();
+        if (notice != null) showText("", notice);
     }
 
     private void restartSpeechHost() {
         if (!recording || !micEngine) return;
         if (speechHostRestarts >= MAX_SPEECH_HOST_RESTARTS) {
-            micEngine = false; recording = false; beginCapture(); return;
+            fallbackToServer(null); return;
         }
         final String src = sourceLang();
         if (src == null || src.isEmpty() || "auto".equals(src)) {
-            micEngine = false; recording = false; beginCapture(); return;
+            fallbackToServer(null); return;
         }
         speechHostRestarts++;
         main.postDelayed(() -> {
@@ -623,7 +754,7 @@ public class BubbleService extends Service {
                 startActivity(i);
             } catch (Exception e) {
                 Log.w(TAG, "restart speech host failed", e);
-                micEngine = false; recording = false; beginCapture();
+                fallbackToServer(null);
             }
         }, 200);
     }
@@ -668,7 +799,7 @@ public class BubbleService extends Service {
     private void stopRecording() {
         if (!recording) return;
         recording = false;
-        if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); }
+        if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); PcmFeed.close(); }
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
         setRecordingUi(false);
@@ -718,20 +849,18 @@ public class BubbleService extends Service {
 
     static void asrPartial(String text) {
         BubbleService s = instance;
-        if (s != null && s.micEngine) s.onPartialText(text);
+        if (s != null && s.micEngine) { s.gotAsrText = true; s.onPartialText(text); }
     }
 
     static void asrFinal(String text) {
         BubbleService s = instance;
-        if (s != null && s.micEngine) s.onFinalText(text);
+        if (s != null && s.micEngine) { s.gotAsrText = true; s.onFinalText(text); }
     }
 
     static void asrFallback() {
         BubbleService s = instance;
         if (s == null || !s.micEngine) return;
-        s.micEngine = false; s.recording = false;
-        s.beginCapture();
-        s.showText("", s.msg("تشخیص گفتار گوگل در دسترس نیست؛ حالت سرور فعال شد",
+        s.fallbackToServer(s.msg("تشخیص گفتار گوگل در دسترس نیست؛ حالت سرور فعال شد",
                 "Google speech unavailable; using server"));
     }
 
@@ -1067,6 +1196,7 @@ public class BubbleService extends Service {
         closeLocalTranslator();
         recording = false;
         if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); }
+        PcmFeed.close();
         instance = null;
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }

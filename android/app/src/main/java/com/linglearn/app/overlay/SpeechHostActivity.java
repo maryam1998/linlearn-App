@@ -4,10 +4,12 @@ import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.media.AudioFormat;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.ParcelFileDescriptor;
 import android.speech.RecognitionListener;
 import android.speech.RecognitionSupport;
 import android.speech.RecognitionSupportCallback;
@@ -36,6 +38,8 @@ public class SpeechHostActivity extends Activity {
     private boolean preferOffline = false;
     private boolean began = false;
     private int errorStreak = 0;
+    // Read end of the pipe that carries the captured SYSTEM audio for the current session.
+    private ParcelFileDescriptor audioSrc;
 
     static void finishIfRunning() {
         final SpeechHostActivity a = current;
@@ -117,6 +121,7 @@ public class SpeechHostActivity extends Activity {
             try { r.cancel(); } catch (Exception ignored) {}
             try { r.destroy(); } catch (Exception ignored) {}
         }
+        closeAudioSrc();
         if (current == this) current = null;
         BubbleService.asrClosed();
     }
@@ -151,9 +156,25 @@ public class SpeechHostActivity extends Activity {
         began = true; listen();
     }
 
+    private void closeAudioSrc() {
+        ParcelFileDescriptor p = audioSrc; audioSrc = null;
+        if (p != null) { try { p.close(); } catch (Exception ignored) {} }
+    }
+
     private void listen() {
         if (isFinishing() || rec == null) return;
         recIntent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, preferOffline);
+        // Every session gets a fresh pipe; BubbleService pours the captured playback audio
+        // (16 kHz mono PCM16) into it, so the recognizer transcribes what the phone PLAYS,
+        // not what the microphone hears. Needs Android 13+ (API 33).
+        closeAudioSrc();
+        ParcelFileDescriptor src = PcmFeed.open();
+        if (src == null) { hardError(); return; }
+        audioSrc = src;
+        recIntent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE, src);
+        recIntent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_CHANNEL_COUNT, 1);
+        recIntent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_ENCODING, AudioFormat.ENCODING_PCM_16BIT);
+        recIntent.putExtra(RecognizerIntent.EXTRA_AUDIO_SOURCE_SAMPLING_RATE, 16000);
         try { rec.startListening(recIntent); }
         catch (Exception e) { Log.w(TAG, "startListening failed", e); hardError(); }
     }
