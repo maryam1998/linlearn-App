@@ -29,6 +29,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.speech.SpeechRecognizer;
 import android.util.DisplayMetrics;
@@ -43,6 +44,12 @@ import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+
+import com.google.mlkit.common.model.DownloadConditions;
+import com.google.mlkit.nl.translate.TranslateLanguage;
+import com.google.mlkit.nl.translate.Translation;
+import com.google.mlkit.nl.translate.Translator;
+import com.google.mlkit.nl.translate.TranslatorOptions;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -114,6 +121,8 @@ public class BubbleService extends Service {
     private static final int MAX_PENDING = 3;
     private static final int MAX_TEXT_PENDING = 6;
     private static final long PANEL_HIDE_MS = 6000;
+    // Live translation of partial speech: at most one local translation per this interval.
+    private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 250;
 
     // ---- Network (OkHttp) ----
     private static final int NET_ATTEMPTS = 3;
@@ -208,6 +217,20 @@ public class BubbleService extends Service {
     // ---- Engine A state ----
     private static volatile BubbleService instance;
     private volatile boolean micEngine = false;
+
+    // ---- Local (on-device) translation: instant, works offline once the model is downloaded ----
+    private Translator localTr;                 // main thread only
+    private String localTrKey = "";
+    private volatile boolean localReady = false;
+    private String lastPartialSrc = "";
+    private String liveTr = "";
+    private long lastPartialAt = 0;
+    private int partialSeq = 0;
+    private boolean partialScheduled = false;
+    private final Runnable partialRunnable = () -> {
+        partialScheduled = false;
+        translatePartialNow();
+    };
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -601,6 +624,7 @@ public class BubbleService extends Service {
     /** Picks the engine: Google speech (engine A) when possible, else Worker/Whisper (engine B). */
     private void startCapture() {
         if (mediaProjection == null || recording) return;
+        prepareLocalTranslator();
         final String src = sourceLang();
         boolean micOk = Build.VERSION.SDK_INT >= 33
                 && src != null && !src.isEmpty() && !"auto".equals(src)
@@ -752,7 +776,7 @@ public class BubbleService extends Service {
 
     static void asrPartial(String text) {
         BubbleService s = instance;
-        if (s != null && s.micEngine) s.showText(text, "");
+        if (s != null && s.micEngine) s.onPartialText(text);
     }
 
     static void asrFinal(String text) {
@@ -784,8 +808,100 @@ public class BubbleService extends Service {
         if (s != null && s.micEngine) s.stopRecording();
     }
 
-    /** Final recognised text: show it, then translate (text only) if we are online. */
+    // ------------------------------------------------------------------
+    // Live translation (local ML Kit first, Worker as fallback)
+    // ------------------------------------------------------------------
+
+    private void prepareLocalTranslator() {
+        String src = TranslateLanguage.fromLanguageTag(sourceLang());
+        String tgt = TranslateLanguage.fromLanguageTag(targetLang());
+        localReady = false;
+        if (src == null || tgt == null || src.equals(tgt)) {
+            closeLocalTranslator();
+            return;
+        }
+        String key = src + ">" + tgt;
+        if (!key.equals(localTrKey) || localTr == null) {
+            closeLocalTranslator();
+            localTr = Translation.getClient(new TranslatorOptions.Builder()
+                    .setSourceLanguage(src)
+                    .setTargetLanguage(tgt)
+                    .build());
+            localTrKey = key;
+        }
+        final Translator tr = localTr;
+        tr.downloadModelIfNeeded(new DownloadConditions.Builder().build())
+                .addOnSuccessListener(v -> {
+                    if (tr == localTr) localReady = true;
+                })
+                .addOnFailureListener(e -> Log.w(TAG, "translation model download failed", e));
+    }
+
+    private void closeLocalTranslator() {
+        Translator t = localTr;
+        localTr = null;
+        localTrKey = "";
+        localReady = false;
+        if (t != null) {
+            try {
+                t.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /** Partial speech: show the source at once, translate it locally (throttled) as it grows. */
+    private void onPartialText(final String text) {
+        if (!localReady || localTr == null) {
+            showText(text, "");
+            return;
+        }
+        showText(text, liveTr); // keep the last translation on screen: no flicker
+        lastPartialSrc = text;
+        long wait = lastPartialAt + PARTIAL_TRANSLATE_INTERVAL_MS - SystemClock.uptimeMillis();
+        if (wait <= 0) {
+            translatePartialNow();
+        } else if (!partialScheduled) {
+            partialScheduled = true;
+            main.postDelayed(partialRunnable, wait);
+        }
+    }
+
+    private void translatePartialNow() {
+        final String src = lastPartialSrc;
+        final Translator tr = localTr;
+        if (src.isEmpty() || tr == null || !localReady) return;
+        lastPartialAt = SystemClock.uptimeMillis();
+        final int seq = ++partialSeq;
+        tr.translate(src).addOnSuccessListener(out -> {
+            if (seq != partialSeq || !recording) return; // a newer partial/final took over
+            liveTr = out;
+            showText(src, out);
+        });
+    }
+
+    /** Final recognised text (either engine): translate locally if possible, else via the Worker. */
     private void onFinalText(final String text) {
+        partialSeq++; // drop in-flight partial translations
+        main.removeCallbacks(partialRunnable);
+        partialScheduled = false;
+        lastPartialSrc = "";
+        liveTr = "";
+        final Translator tr = localTr;
+        if (localReady && tr != null) {
+            showText(text, "");
+            tr.translate(text)
+                    .addOnSuccessListener(out -> showText(text, out))
+                    .addOnFailureListener(e -> {
+                        Log.w(TAG, "local translate failed", e);
+                        remoteTranslate(text);
+                    });
+            return;
+        }
+        remoteTranslate(text);
+    }
+
+    private void remoteTranslate(final String text) {
         if (!hasInternet()) {
             showText(text, msg("ترجمه در دسترس نیست (آفلاین)", "No translation (offline)"));
             return;
@@ -867,8 +983,7 @@ public class BubbleService extends Service {
         try {
             final String text = transcribe(pcm);
             if (text.isEmpty()) return;
-            main.post(() -> showText(text, "…"));
-            translateAndShow(text);
+            main.post(() -> onFinalText(text));
         } catch (Exception e) {
             Log.w(TAG, "transcribe failed", e);
             final String m = netErrText(e);
@@ -1030,6 +1145,7 @@ public class BubbleService extends Service {
     private void cleanup() {
         running = false;
         main.removeCallbacksAndMessages(null);
+        closeLocalTranslator();
         recording = false;
         if (micEngine) {
             micEngine = false;
