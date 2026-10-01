@@ -106,13 +106,10 @@ public class BubbleService extends Service {
     private static final int MAX_PENDING = 3;
     private static final int MAX_TEXT_PENDING = 6;
 
-    // Panel auto-hide: only when NOT recording. While recording, keep it visible.
     private static final long PANEL_HIDE_MS = 6000;
     private static final long PANEL_HIDE_MS_RECORDING = 60000;
 
     private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 120;
-    // When the on-device model isn't ready, fall back to remote partial translation,
-    // but heavily throttled so we don't hammer the server.
     private static final long REMOTE_PARTIAL_INTERVAL_MS = 1200;
 
     private static final int NET_ATTEMPTS = 3;
@@ -233,14 +230,11 @@ public class BubbleService extends Service {
         translatePartialNow();
     };
 
-    // Restart SpeechHostActivity after Google's recognizer times out (silence).
     private int speechHostRestarts = 0;
     private static final int MAX_SPEECH_HOST_RESTARTS = 40;
 
     @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
+    public IBinder onBind(Intent intent) { return null; }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
@@ -333,16 +327,11 @@ public class BubbleService extends Service {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getString("source", "auto");
     }
 
-    private boolean isFa() {
-        return "fa".equals(targetLang());
-    }
+    private boolean isFa() { return "fa".equals(targetLang()); }
 
     private void addBubbleIfNeeded() {
         if (bubble != null) return;
-        if (!Settings.canDrawOverlays(this)) {
-            shutdown();
-            return;
-        }
+        if (!Settings.canDrawOverlays(this)) { shutdown(); return; }
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         bubbleSize = dp(56);
 
@@ -381,11 +370,7 @@ public class BubbleService extends Service {
                 return true;
             }
 
-            @Override
-            public boolean onDoubleTap(MotionEvent e) {
-                shutdown();
-                return true;
-            }
+            @Override public boolean onDoubleTap(MotionEvent e) { shutdown(); return true; }
 
             @Override
             public void onLongPress(MotionEvent e) {
@@ -404,10 +389,8 @@ public class BubbleService extends Service {
                 gestures.onTouchEvent(e);
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
-                        downX = e.getRawX();
-                        downY = e.getRawY();
-                        startX = bubbleLp.x;
-                        startY = bubbleLp.y;
+                        downX = e.getRawX(); downY = e.getRawY();
+                        startX = bubbleLp.x; startY = bubbleLp.y;
                         dragging = false;
                         return true;
                     case MotionEvent.ACTION_MOVE:
@@ -417,10 +400,7 @@ public class BubbleService extends Service {
                         if (dragging) {
                             bubbleLp.x = clamp(Math.round(startX + dx), 0, screenW() - bubbleSize);
                             bubbleLp.y = clamp(Math.round(startY + dy), 0, screenH() - bubbleSize);
-                            try {
-                                wm.updateViewLayout(bubble, bubbleLp);
-                            } catch (Exception ignored) {
-                            }
+                            try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
                             movePanel();
                         }
                         return true;
@@ -432,17 +412,11 @@ public class BubbleService extends Service {
             }
         });
 
-        try {
-            wm.addView(bubble, bubbleLp);
-        } catch (Exception e) {
-            Log.e(TAG, "addView failed", e);
-            shutdown();
-        }
+        try { wm.addView(bubble, bubbleLp); }
+        catch (Exception e) { Log.e(TAG, "addView failed", e); shutdown(); }
     }
 
-    private static int clamp(int v, int lo, int hi) {
-        return Math.max(lo, Math.min(hi, v));
-    }
+    private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 
     private void ensurePanel() {
         if (panel != null) return;
@@ -499,10 +473,7 @@ public class BubbleService extends Service {
     private void movePanel() {
         if (!panelShown || panel == null) return;
         computePanelPos();
-        try {
-            wm.updateViewLayout(panel, panelLp);
-        } catch (Exception ignored) {
-        }
+        try { wm.updateViewLayout(panel, panelLp); } catch (Exception ignored) {}
     }
 
     private void showText(String src, String tr) {
@@ -518,17 +489,10 @@ public class BubbleService extends Service {
 
         computePanelPos();
         try {
-            if (!panelShown) {
-                wm.addView(panel, panelLp);
-                panelShown = true;
-            } else {
-                wm.updateViewLayout(panel, panelLp);
-            }
-        } catch (Exception e) {
-            Log.w(TAG, "panel show failed", e);
-        }
+            if (!panelShown) { wm.addView(panel, panelLp); panelShown = true; }
+            else wm.updateViewLayout(panel, panelLp);
+        } catch (Exception e) { Log.w(TAG, "panel show failed", e); }
 
-        // Key fix: while recording, keep the panel on screen. Only auto-hide when idle.
         main.removeCallbacks(hidePanel);
         long delay = recording ? PANEL_HIDE_MS_RECORDING : PANEL_HIDE_MS;
         main.postDelayed(hidePanel, delay);
@@ -536,10 +500,7 @@ public class BubbleService extends Service {
 
     private void removePanel() {
         if (panelShown && panel != null && wm != null) {
-            try {
-                wm.removeView(panel);
-            } catch (Exception ignored) {
-            }
+            try { wm.removeView(panel); } catch (Exception ignored) {}
         }
         panelShown = false;
     }
@@ -547,10 +508,7 @@ public class BubbleService extends Service {
     private void setRecordingUi(boolean rec) {
         if (bubbleBg == null) return;
         bubbleBg.setStroke(dp(rec ? 4 : 3), rec ? COLOR_REC : COLOR_GOLD);
-        if (pulse != null) {
-            pulse.cancel();
-            pulse = null;
-        }
+        if (pulse != null) { pulse.cancel(); pulse = null; }
         if (rec) {
             pulse = ObjectAnimator.ofFloat(bubble, View.ALPHA, 1f, 0.55f);
             pulse.setDuration(700);
@@ -562,23 +520,14 @@ public class BubbleService extends Service {
         }
     }
 
-    private String msg(String fa, String en) {
-        return isFa() ? fa : en;
-    }
+    private String msg(String fa, String en) { return isFa() ? fa : en; }
 
     private void toggleRecording() {
-        if (recording) {
-            stopRecording();
-            return;
-        }
+        if (recording) { stopRecording(); return; }
         if (mediaProjection == null) {
             Intent i = new Intent(this, ProjectionActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            try {
-                startActivity(i);
-            } catch (Exception e) {
-                Log.e(TAG, "cannot launch ProjectionActivity", e);
-                showText("", "⚠ " + briefErr(e));
-            }
+            try { startActivity(i); }
+            catch (Exception e) { Log.e(TAG, "cannot launch ProjectionActivity", e); showText("", "⚠ " + briefErr(e)); }
             return;
         }
         startCapture();
@@ -594,12 +543,8 @@ public class BubbleService extends Service {
             MediaProjectionManager mpm = getSystemService(MediaProjectionManager.class);
             final MediaProjection mp = mpm.getMediaProjection(rc, data);
             mp.registerCallback(new MediaProjection.Callback() {
-                @Override
-                public void onStop() {
-                    if (mediaProjection == mp) {
-                        mediaProjection = null;
-                        stopRecording();
-                    }
+                @Override public void onStop() {
+                    if (mediaProjection == mp) { mediaProjection = null; stopRecording(); }
                 }
             }, main);
             mediaProjection = mp;
@@ -620,9 +565,7 @@ public class BubbleService extends Service {
         prepareLocalTranslator();
         partialBusy = false;
         shownPartialSeq = partialSeq;
-        liveTr = "";
-        liveTrSrc = "";
-        lastPartialSrc = "";
+        liveTr = ""; liveTrSrc = ""; lastPartialSrc = "";
         speechHostRestarts = 0;
         final String src = sourceLang();
         boolean micOk = Build.VERSION.SDK_INT >= 33
@@ -645,32 +588,21 @@ public class BubbleService extends Service {
             return true;
         } catch (Exception e) {
             Log.w(TAG, "cannot start SpeechHostActivity", e);
-            micEngine = false;
-            recording = false;
-            setRecordingUi(false);
+            micEngine = false; recording = false; setRecordingUi(false);
             return false;
         }
     }
 
-    /** Try to reopen the invisible speech host after Google's recognizer timed out. */
     private void restartSpeechHost() {
         if (!recording || !micEngine) return;
         if (speechHostRestarts >= MAX_SPEECH_HOST_RESTARTS) {
-            // Fall back to server transcription if the recognizer keeps dying.
-            micEngine = false;
-            recording = false;
-            beginCapture();
-            return;
+            micEngine = false; recording = false; beginCapture(); return;
         }
         final String src = sourceLang();
         if (src == null || src.isEmpty() || "auto".equals(src)) {
-            micEngine = false;
-            recording = false;
-            beginCapture();
-            return;
+            micEngine = false; recording = false; beginCapture(); return;
         }
         speechHostRestarts++;
-        // Small delay so Android fully tears down the old activity before we relaunch.
         main.postDelayed(() -> {
             if (!recording || !micEngine) return;
             try {
@@ -680,9 +612,7 @@ public class BubbleService extends Service {
                 startActivity(i);
             } catch (Exception e) {
                 Log.w(TAG, "restart speech host failed", e);
-                micEngine = false;
-                recording = false;
-                beginCapture();
+                micEngine = false; recording = false; beginCapture();
             }
         }, 200);
     }
@@ -716,12 +646,10 @@ public class BubbleService extends Service {
             recording = true;
             setRecordingUi(true);
             showText("", msg("🎙 در حال گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
-            Thread t = new Thread(() -> captureLoop(rec), "bubble-capture");
-            t.start();
+            new Thread(() -> captureLoop(rec), "bubble-capture").start();
         } catch (Exception e) {
             Log.e(TAG, "startCapture failed", e);
-            recording = false;
-            setRecordingUi(false);
+            recording = false; setRecordingUi(false);
             showText("", "⚠ " + briefErr(e));
         }
     }
@@ -729,15 +657,9 @@ public class BubbleService extends Service {
     private void stopRecording() {
         if (!recording) return;
         recording = false;
-        if (micEngine) {
-            micEngine = false;
-            SpeechHostActivity.finishIfRunning();
-        }
-        AudioRecord r = record;
-        record = null;
-        if (r != null) {
-            try { r.stop(); } catch (Exception ignored) {}
-        }
+        if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); }
+        AudioRecord r = record; record = null;
+        if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
         setRecordingUi(false);
         showText("", msg("ضبط متوقف شد", "Stopped"));
     }
@@ -754,32 +676,22 @@ public class BubbleService extends Service {
                 seg.write(buf, 0, n);
                 int chunkMs = n * 1000 / (SAMPLE_RATE * 2);
                 segMs += chunkMs;
-                if (rms(buf, n) > SILENCE_RMS) {
-                    voicedMs += chunkMs;
-                    silentMs = 0;
-                } else {
-                    silentMs += chunkMs;
-                }
+                if (rms(buf, n) > SILENCE_RMS) { voicedMs += chunkMs; silentMs = 0; }
+                else silentMs += chunkMs;
                 boolean cut = segMs >= MAX_SEG_MS || (segMs >= MIN_SEG_MS && silentMs >= SILENCE_CUT_MS);
                 if (cut) {
                     if (voicedMs >= MIN_VOICED_MS) submit(seg.toByteArray());
-                    seg.reset();
-                    segMs = voicedMs = silentMs = 0;
+                    seg.reset(); segMs = voicedMs = silentMs = 0;
                 } else if (voicedMs == 0 && segMs >= 1000) {
-                    seg.reset();
-                    segMs = silentMs = 0;
+                    seg.reset(); segMs = silentMs = 0;
                 }
             }
             if (voicedMs >= MIN_VOICED_MS) submit(seg.toByteArray());
-        } catch (Exception e) {
-            Log.e(TAG, "capture loop", e);
-        } finally {
+        } catch (Exception e) { Log.e(TAG, "capture loop", e); }
+        finally {
             try { rec.stop(); } catch (Exception ignored) {}
             rec.release();
-            if (recording) {
-                recording = false;
-                main.post(() -> setRecordingUi(false));
-            }
+            if (recording) { recording = false; main.post(() -> setRecordingUi(false)); }
         }
     }
 
@@ -806,8 +718,7 @@ public class BubbleService extends Service {
     static void asrFallback() {
         BubbleService s = instance;
         if (s == null || !s.micEngine) return;
-        s.micEngine = false;
-        s.recording = false;
+        s.micEngine = false; s.recording = false;
         s.beginCapture();
         s.showText("", s.msg("تشخیص گفتار گوگل در دسترس نیست؛ حالت سرور فعال شد",
                 "Google speech unavailable; using server"));
@@ -820,11 +731,6 @@ public class BubbleService extends Service {
         s.showText("", s.msg("مجوز میکروفون لازم است", "Microphone permission required"));
     }
 
-    /**
-     * The invisible speech window closed — usually because Google's recognizer hit a silence
-     * timeout. The old behavior killed recording entirely. Now we try to relaunch it instead,
-     * so live translation keeps flowing while the user is still watching.
-     */
     static void asrClosed() {
         BubbleService s = instance;
         if (s == null || !s.micEngine) return;
@@ -835,53 +741,34 @@ public class BubbleService extends Service {
         String src = TranslateLanguage.fromLanguageTag(sourceLang());
         String tgt = TranslateLanguage.fromLanguageTag(targetLang());
         final boolean wasReady = localReady;
-        if (src == null || tgt == null || src.equals(tgt)) {
-            closeLocalTranslator();
-            return;
-        }
+        if (src == null || tgt == null || src.equals(tgt)) { closeLocalTranslator(); return; }
         String key = src + ">" + tgt;
         if (key.equals(localTrKey) && localTr != null && wasReady) return;
         localReady = false;
         if (!key.equals(localTrKey) || localTr == null) {
             closeLocalTranslator();
             localTr = Translation.getClient(new TranslatorOptions.Builder()
-                    .setSourceLanguage(src)
-                    .setTargetLanguage(tgt)
-                    .build());
+                    .setSourceLanguage(src).setTargetLanguage(tgt).build());
             localTrKey = key;
         }
         final Translator tr = localTr;
         tr.downloadModelIfNeeded(new DownloadConditions.Builder().build())
-                .addOnSuccessListener(v -> {
-                    if (tr == localTr) localReady = true;
-                })
+                .addOnSuccessListener(v -> { if (tr == localTr) localReady = true; })
                 .addOnFailureListener(e -> Log.w(TAG, "translation model download failed", e));
     }
 
     private void closeLocalTranslator() {
-        Translator t = localTr;
-        localTr = null;
-        localTrKey = "";
-        localReady = false;
-        if (t != null) {
-            try { t.close(); } catch (Exception ignored) {}
-        }
+        Translator t = localTr; localTr = null; localTrKey = ""; localReady = false;
+        if (t != null) { try { t.close(); } catch (Exception ignored) {} }
     }
 
     private void onPartialText(final String text) {
-        // Always show the source right away so the user sees progress.
         showText(text, liveTr);
-
-        if (!localReady || localTr == null) {
-            // Model not ready yet: fall back to remote partial translation (heavily throttled).
-            remotePartialTranslate(text);
-            return;
-        }
+        if (!localReady || localTr == null) { remotePartialTranslate(text); return; }
         lastPartialSrc = text;
         long wait = lastPartialAt + PARTIAL_TRANSLATE_INTERVAL_MS - SystemClock.uptimeMillis();
-        if (wait <= 0) {
-            translatePartialNow();
-        } else if (!partialScheduled) {
+        if (wait <= 0) translatePartialNow();
+        else if (!partialScheduled) {
             partialScheduled = true;
             main.postDelayed(partialRunnable, wait);
         }
@@ -909,7 +796,6 @@ public class BubbleService extends Service {
         });
     }
 
-    /** Remote partial translation with a hard throttle — used while the local model is loading. */
     private void remotePartialTranslate(final String text) {
         if (text == null || text.isEmpty()) return;
         long now = SystemClock.uptimeMillis();
@@ -920,11 +806,7 @@ public class BubbleService extends Service {
         try {
             netTr.execute(() -> {
                 String tr;
-                try {
-                    tr = translate(snap);
-                } catch (Exception e) {
-                    return;
-                }
+                try { tr = translate(snap); } catch (Exception e) { return; }
                 final String shown = tr;
                 main.post(() -> {
                     if (!recording || localReady) return;
@@ -934,27 +816,21 @@ public class BubbleService extends Service {
                     showText(cur, shown);
                 });
             });
-        } catch (Exception ignored) {
-        }
+        } catch (Exception ignored) {}
     }
 
     private void onFinalText(final String text) {
-        partialSeq++;
-        shownPartialSeq = partialSeq;
-        main.removeCallbacks(partialRunnable);
-        partialScheduled = false;
+        partialSeq++; shownPartialSeq = partialSeq;
+        main.removeCallbacks(partialRunnable); partialScheduled = false;
         lastPartialSrc = "";
         final String keepTr = liveTr;
         final String keepSrc = liveTrSrc;
-        liveTr = "";
-        liveTrSrc = "";
+        liveTr = ""; liveTrSrc = "";
         final int fseq = ++finalSeq;
         final Translator tr = localTr;
         if (localReady && tr != null) {
             if (!keepTr.isEmpty() && text.equals(keepSrc)) {
-                shownFinalSeq = fseq;
-                showText(text, keepTr);
-                return;
+                shownFinalSeq = fseq; showText(text, keepTr); return;
             }
             showText(text, keepTr);
             tr.translate(text)
@@ -992,16 +868,12 @@ public class BubbleService extends Service {
             if (n == null) return false;
             NetworkCapabilities c = cm.getNetworkCapabilities(n);
             return c != null && c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
-        } catch (Exception e) {
-            return true;
-        }
+        } catch (Exception e) { return true; }
     }
 
     private boolean isOfflineError(Exception e) {
-        return e instanceof UnknownHostException
-                || e instanceof ConnectException
-                || e instanceof SocketTimeoutException
-                || !hasInternet();
+        return e instanceof UnknownHostException || e instanceof ConnectException
+                || e instanceof SocketTimeoutException || !hasInternet();
     }
 
     private String netErrText(Exception e) {
@@ -1010,19 +882,11 @@ public class BubbleService extends Service {
     }
 
     private void submit(final byte[] pcm) {
-        if (pending.get() >= MAX_PENDING) {
-            Log.w(TAG, "dropping segment (backlog)");
-            return;
-        }
+        if (pending.get() >= MAX_PENDING) { Log.w(TAG, "dropping segment (backlog)"); return; }
         pending.incrementAndGet();
         try {
-            net.execute(() -> {
-                try { processSegment(pcm); }
-                finally { pending.decrementAndGet(); }
-            });
-        } catch (Exception e) {
-            pending.decrementAndGet();
-        }
+            net.execute(() -> { try { processSegment(pcm); } finally { pending.decrementAndGet(); } });
+        } catch (Exception e) { pending.decrementAndGet(); }
     }
 
     private void submitText(final String text, final int fseq) {
@@ -1033,13 +897,8 @@ public class BubbleService extends Service {
         }
         textPending.incrementAndGet();
         try {
-            netTr.execute(() -> {
-                try { translateAndShow(text, fseq); }
-                finally { textPending.decrementAndGet(); }
-            });
-        } catch (Exception e) {
-            textPending.decrementAndGet();
-        }
+            netTr.execute(() -> { try { translateAndShow(text, fseq); } finally { textPending.decrementAndGet(); } });
+        } catch (Exception e) { textPending.decrementAndGet(); }
     }
 
     private void processSegment(byte[] pcm) {
@@ -1056,12 +915,8 @@ public class BubbleService extends Service {
 
     private void translateAndShow(final String text, final int fseq) {
         String tr;
-        try {
-            tr = translate(text);
-        } catch (Exception e) {
-            Log.w(TAG, "translate failed", e);
-            tr = netErrText(e);
-        }
+        try { tr = translate(text); }
+        catch (Exception e) { Log.w(TAG, "translate failed", e); tr = netErrText(e); }
         final String shown = tr;
         main.post(() -> {
             if (fseq < shownFinalSeq) return;
@@ -1088,7 +943,8 @@ public class BubbleService extends Service {
                 + ". Reply with ONLY the translation, no quotes, no explanations.\n\nText: " + text;
         JSONObject body = new JSONObject();
         body.put(GENERATE_PROMPT_KEY, prompt);
-        String resp = postBytes(HTTP_FAST, 2, WORKER_BASE + GENERATE_PATH, "application/json; charset=utf-8",
+        String resp = postBytes(HTTP_FAST, 2, WORKER_BASE + GENERATE_PATH,
+                "application/json; charset=utf-8",
                 body.toString().getBytes(StandardCharsets.UTF_8));
         return extractText(resp);
     }
@@ -1108,10 +964,7 @@ public class BubbleService extends Service {
             String[] keys = {"text", "result", "response", "output", "translation", "reply",
                     "content", "message", "choices", "candidates", "parts"};
             for (String k : keys) {
-                if (j.has(k)) {
-                    String s = dig(j.opt(k));
-                    if (s != null) return s;
-                }
+                if (j.has(k)) { String s = dig(j.opt(k)); if (s != null) return s; }
             }
         } else if (o instanceof JSONArray) {
             JSONArray a = (JSONArray) o;
@@ -1142,10 +995,7 @@ public class BubbleService extends Service {
 
     private static class HttpStatusException extends IOException {
         final int code;
-        HttpStatusException(int code, String body) {
-            super("HTTP " + code + " " + body);
-            this.code = code;
-        }
+        HttpStatusException(int code, String body) { super("HTTP " + code + " " + body); this.code = code; }
     }
 
     private static String postBytes(String url, String contentType, byte[] body) throws IOException {
@@ -1156,9 +1006,8 @@ public class BubbleService extends Service {
                                     byte[] body) throws IOException {
         IOException last = null;
         for (int attempt = 1; attempt <= attempts; attempt++) {
-            try {
-                return postOnce(client, url, contentType, body);
-            } catch (IOException e) {
+            try { return postOnce(client, url, contentType, body); }
+            catch (IOException e) {
                 last = e;
                 if (e instanceof UnknownHostException) throw e;
                 if (e instanceof HttpStatusException) {
@@ -1168,10 +1017,7 @@ public class BubbleService extends Service {
                 Log.w(TAG, "request attempt " + attempt + " failed: " + e);
                 if (attempt == attempts) break;
                 try { Thread.sleep(300L * attempt); }
-                catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw e;
-                }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); throw e; }
             }
         }
         throw last;
@@ -1201,36 +1047,20 @@ public class BubbleService extends Service {
         return m.length() > 120 ? m.substring(0, 120) + "…" : m;
     }
 
-    private void shutdown() {
-        cleanup();
-        stopForeground(true);
-        stopSelf();
-    }
+    private void shutdown() { cleanup(); stopForeground(true); stopSelf(); }
 
     private void cleanup() {
         running = false;
         main.removeCallbacksAndMessages(null);
         closeLocalTranslator();
         recording = false;
-        if (micEngine) {
-            micEngine = false;
-            SpeechHostActivity.finishIfRunning();
-        }
+        if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); }
         instance = null;
-        AudioRecord r = record;
-        record = null;
-        if (r != null) {
-            try { r.stop(); } catch (Exception ignored) {}
-        }
-        if (pulse != null) {
-            pulse.cancel();
-            pulse = null;
-        }
-        MediaProjection mp = mediaProjection;
-        mediaProjection = null;
-        if (mp != null) {
-            try { mp.stop(); } catch (Exception ignored) {}
-        }
+        AudioRecord r = record; record = null;
+        if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
+        if (pulse != null) { pulse.cancel(); pulse = null; }
+        MediaProjection mp = mediaProjection; mediaProjection = null;
+        if (mp != null) { try { mp.stop(); } catch (Exception ignored) {} }
         removePanel();
         if (bubble != null && wm != null) {
             try { wm.removeView(bubble); } catch (Exception ignored) {}
