@@ -1,142 +1,165 @@
 package com.linglearn.app.overlay;
 
 import android.content.Context;
-import android.os.Handler;
-import android.os.Looper;
 import android.util.Log;
 
-import com.k2fsa.sherpa.onnx.EndpointConfig;
-import com.k2fsa.sherpa.onnx.FeatureConfig;
-import com.k2fsa.sherpa.onnx.OnlineModelConfig;
-import com.k2fsa.sherpa.onnx.OnlineRecognizer;
-import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig;
-import com.k2fsa.sherpa.onnx.OnlineStream;
-import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
-
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-final class SherpaEngine {
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
-    private static final String TAG = "SherpaEngine";
-    private static final int SAMPLE_RATE = 16000;
+final class SherpaModelManager {
 
-    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static final String TAG = "SherpaModelMgr";
+    private static final String HF_BASE = "https://huggingface.co/";
 
-    private final Object lock = new Object();
-    private OnlineRecognizer recognizer;
-    private OnlineStream stream;
-    private boolean released = false;
-    private boolean failed = false;
-    private String lastPartial = "";
-    private float[] floats = new float[1600];
+    private SherpaModelManager() {}
 
-    private SherpaEngine(OnlineRecognizer r, OnlineStream s) {
-        this.recognizer = r;
-        this.stream = s;
+    interface ProgressCallback {
+        void onProgress(String lang, long done, long total);
+        void onDone(String lang);
+        void onError(String lang, Exception e);
     }
 
-    static boolean isAvailable(Context ctx, String lang) {
-        return SherpaModelManager.getModelDir(ctx, lang) != null;
-    }
-
-    static SherpaEngine create(Context ctx, String lang) {
-        File dir = SherpaModelManager.getModelDir(ctx, lang);
-        if (dir == null) return null;
-        OnlineRecognizer rec = null;
-        try {
-            OnlineTransducerModelConfig tr = new OnlineTransducerModelConfig();
-            tr.setEncoder(new File(dir, SherpaModelManager.encoderFile(lang)).getAbsolutePath());
-            tr.setDecoder(new File(dir, SherpaModelManager.decoderFile(lang)).getAbsolutePath());
-            tr.setJoiner(new File(dir, SherpaModelManager.joinerFile(lang)).getAbsolutePath());
-
-            OnlineModelConfig mc = new OnlineModelConfig();
-            mc.setTransducer(tr);
-            mc.setTokens(new File(dir, SherpaModelManager.tokensFile(lang)).getAbsolutePath());
-            mc.setNumThreads(Math.max(1, Math.min(2, Runtime.getRuntime().availableProcessors() / 2)));
-            mc.setDebug(false);
-            mc.setProvider("cpu");
-
-            FeatureConfig fc = new FeatureConfig();
-            fc.setSampleRate(SAMPLE_RATE);
-            fc.setFeatureDim(80);
-
-            OnlineRecognizerConfig cfg = new OnlineRecognizerConfig();
-            cfg.setFeatConfig(fc);
-            cfg.setModelConfig(mc);
-            cfg.setEndpointConfig(new EndpointConfig());   // پیش‌فرض
-            cfg.setEnableEndpoint(true);
-            cfg.setDecodingMethod("greedy_search");
-
-            rec = new OnlineRecognizer(null, cfg);
-            OnlineStream st = rec.createStream("");
-            Log.i(TAG, "model loaded from " + dir);
-            return new SherpaEngine(rec, st);
-        } catch (Throwable e) {
-            Log.e(TAG, "cannot load model for " + lang, e);
-            if (rec != null) { try { rec.release(); } catch (Throwable ignored) {} }
-            return null;
+    private static final class Spec {
+        final String repo;
+        final String encoder, decoder, joiner, tokens;
+        Spec(String repo, String encoder, String decoder, String joiner, String tokens) {
+            this.repo = repo; this.encoder = encoder; this.decoder = decoder;
+            this.joiner = joiner; this.tokens = tokens;
         }
+        String[] files() { return new String[]{encoder, decoder, joiner, tokens}; }
     }
 
-    void accept(byte[] pcm16k, int len) {
-        if (pcm16k == null || len < 2) return;
-        String partialToSend = null, finalToSend = null;
-        boolean fail = false;
-        synchronized (lock) {
-            if (released || failed) return;
+    private static final Map<String, Spec> SPECS;
+    static {
+        Map<String, Spec> m = new HashMap<>();
+
+        // انگلیسی
+        m.put("en", new Spec(
+                "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
+                "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "decoder-epoch-99-avg-1-chunk-16-left-128.onnx",
+                "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+                "tokens.txt"));
+
+        // چینی + انگلیسی
+        m.put("zh", new Spec(
+                "csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20",
+                "encoder-epoch-99-avg-1.int8.onnx",
+                "decoder-epoch-99-avg-1.onnx",
+                "joiner-epoch-99-avg-1.int8.onnx",
+                "tokens.txt"));
+
+        SPECS = Collections.unmodifiableMap(m);
+    }
+
+    private static final OkHttpClient HTTP = new OkHttpClient();
+    private static final AtomicBoolean DOWNLOADING = new AtomicBoolean(false);
+
+    static String normalize(String lang) {
+        if (lang == null) return null;
+        String l = lang.trim().toLowerCase(Locale.ROOT);
+        int i = l.indexOf('-');
+        if (i < 0) i = l.indexOf('_');
+        if (i > 0) l = l.substring(0, i);
+        return l.isEmpty() ? null : l;
+    }
+
+    static boolean isAvailable(String lang) {
+        String l = normalize(lang);
+        return l != null && SPECS.containsKey(l);
+    }
+
+    private static File dirFor(Context ctx, String l) {
+        return new File(new File(ctx.getFilesDir(), "sherpa"), l);
+    }
+
+    static File getModelDir(Context ctx, String lang) {
+        String l = normalize(lang);
+        Spec s = l == null ? null : SPECS.get(l);
+        if (s == null) return null;
+        File dir = dirFor(ctx, l);
+        for (String f : s.files()) {
+            File x = new File(dir, f);
+            if (!x.isFile() || x.length() == 0) return null;
+        }
+        return dir;
+    }
+
+    static String encoderFile(String lang) { Spec s = SPECS.get(normalize(lang)); return s == null ? null : s.encoder; }
+    static String decoderFile(String lang) { Spec s = SPECS.get(normalize(lang)); return s == null ? null : s.decoder; }
+    static String joinerFile(String lang)  { Spec s = SPECS.get(normalize(lang)); return s == null ? null : s.joiner; }
+    static String tokensFile(String lang)  { Spec s = SPECS.get(normalize(lang)); return s == null ? null : s.tokens; }
+
+    static void downloadModel(final Context ctx, final String lang, final ProgressCallback cb) {
+        final Context app = ctx.getApplicationContext();
+        final String l = normalize(lang);
+        final Spec s = l == null ? null : SPECS.get(l);
+        if (s == null) {
+            if (cb != null) cb.onError(String.valueOf(lang), new IllegalArgumentException("no model for " + lang));
+            return;
+        }
+        if (!DOWNLOADING.compareAndSet(false, true)) {
+            if (cb != null) cb.onError(l, new IllegalStateException("another download is running"));
+            return;
+        }
+        Thread t = new Thread(() -> {
             try {
-                int n = len / 2;
-                if (floats.length < n) floats = new float[n];
-                for (int i = 0; i < n; i++) {
-                    short s = (short) ((pcm16k[2 * i] & 0xff) | (pcm16k[2 * i + 1] << 8));
-                    floats[i] = s / 32768f;
+                File dir = dirFor(app, l);
+                if (!dir.isDirectory() && !dir.mkdirs()) throw new java.io.IOException("cannot create " + dir);
+                long done = 0;
+                for (String name : s.files()) {
+                    File target = new File(dir, name);
+                    if (target.isFile() && target.length() > 0) { done += target.length(); continue; }
+                    File part = new File(dir, name + ".part");
+                    String url = HF_BASE + s.repo + "/resolve/main/" + name;
+                    Request req = new Request.Builder().url(url).build();
+                    try (Response r = HTTP.newCall(req).execute()) {
+                        if (!r.isSuccessful() || r.body() == null) {
+                            throw new java.io.IOException("HTTP " + r.code() + " for " + name);
+                        }
+                        try (InputStream in = r.body().byteStream();
+                             OutputStream out = new FileOutputStream(part)) {
+                            byte[] buf = new byte[64 * 1024];
+                            int n;
+                            while ((n = in.read(buf)) > 0) {
+                                out.write(buf, 0, n);
+                                done += n;
+                                if (cb != null) cb.onProgress(l, done, -1);
+                            }
+                        }
+                    }
+                    if (!part.renameTo(target)) throw new java.io.IOException("rename failed: " + name);
+                    Log.i(TAG, "downloaded " + name + " (" + target.length() + " bytes)");
                 }
-                float[] samples = (floats.length == n) ? floats : java.util.Arrays.copyOf(floats, n);
-                stream.acceptWaveform(samples, SAMPLE_RATE);
-                while (recognizer.isReady(stream)) recognizer.decode(stream);
-
-                String text = normalize(recognizer.getResult(stream).getText());
-                if (recognizer.isEndpoint(stream)) {
-                    if (!text.isEmpty()) finalToSend = text;
-                    recognizer.reset(stream);
-                    lastPartial = "";
-                } else if (!text.isEmpty() && !text.equals(lastPartial)) {
-                    lastPartial = text;
-                    partialToSend = text;
-                }
-            } catch (Throwable e) {
-                Log.e(TAG, "decode failed", e);
-                failed = true;
-                fail = true;
+                if (cb != null) cb.onDone(l);
+            } catch (Exception e) {
+                Log.w(TAG, "download failed for " + l, e);
+                if (cb != null) cb.onError(l, e);
+            } finally {
+                DOWNLOADING.set(false);
             }
-        }
-        if (finalToSend != null) { final String t = finalToSend; MAIN.post(() -> BubbleService.asrFinal(t)); }
-        else if (partialToSend != null) { final String t = partialToSend; MAIN.post(() -> BubbleService.asrPartial(t)); }
-        if (fail) MAIN.post(BubbleService::asrFallback);
+        }, "sherpa-download");
+        t.setDaemon(true);
+        t.start();
     }
 
-    void release() {
-        synchronized (lock) {
-            if (released) return;
-            released = true;
-            try { if (stream != null) stream.release(); } catch (Throwable e) { Log.w(TAG, "stream release", e); }
-            try { if (recognizer != null) recognizer.release(); } catch (Throwable e) { Log.w(TAG, "recognizer release", e); }
-            stream = null;
-            recognizer = null;
-            floats = new float[0];
-            lastPartial = "";
-        }
-    }
-
-    private static String normalize(String t) {
-        if (t == null) return "";
-        t = t.trim();
-        if (t.isEmpty()) return "";
-        if (t.equals(t.toUpperCase(Locale.ROOT)) && !t.equals(t.toLowerCase(Locale.ROOT))) {
-            t = t.toLowerCase(Locale.ROOT).replaceAll("\\bi\\b", "I");
-            t = Character.toUpperCase(t.charAt(0)) + t.substring(1);
-        }
-        return t;
+    static void deleteModel(Context ctx, String lang) {
+        String l = normalize(lang);
+        if (l == null) return;
+        File dir = dirFor(ctx, l);
+        File[] fs = dir.listFiles();
+        if (fs != null) for (File f : fs) { f.delete(); }
+        dir.delete();
     }
 }
