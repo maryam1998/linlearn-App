@@ -42,6 +42,7 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import com.google.mlkit.common.model.DownloadConditions;
@@ -132,6 +133,13 @@ public class BubbleService extends Service {
     private static final int COLOR_GOLD = Color.parseColor("#C9A227");
     private static final int COLOR_REC = Color.parseColor("#E53935");
 
+    // پنل: تنظیمات اندازه
+    private static final int PANEL_MAX_ROWS = 20;
+    private static final int PANEL_DEFAULT_HEIGHT_DP = 180;
+    private static final int PANEL_MIN_WIDTH_DP = 200;
+    private static final int PANEL_MIN_HEIGHT_DP = 80;
+    private static final int RESIZE_HANDLE_DP = 48;
+
     public static volatile boolean running = false;
 
     private static final Map<String, String> LANG_NAMES = new HashMap<>();
@@ -215,11 +223,14 @@ public class BubbleService extends Service {
     private WindowManager.LayoutParams bubbleLp;
     private int bubbleSize;
 
-    private LinearLayout panel;
-    private TextView tvSrc;
-    private TextView tvTr;
+    // ======= پنل به‌روزشده =======
+    private ScrollView panel;
+    private LinearLayout panelList;
     private WindowManager.LayoutParams panelLp;
     private boolean panelShown = false;
+    private int panelWidthPx = 0;
+    private int panelHeightPx = 0;
+    private String lastPartialSrc = "";
     private String shownSrc = "";
     private String shownTr = "";
     private final Runnable hidePanel = this::removePanel;
@@ -443,46 +454,84 @@ public class BubbleService extends Service {
 
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 
+    // ============ پنل جدید با ScrollView ============
     private void ensurePanel() {
         if (panel != null) return;
-        panel = new LinearLayout(this);
-        panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(14), dp(10), dp(14), dp(12));
+
+        panel = new ScrollView(this);
+        panel.setFillViewport(false);
+        panel.setVerticalScrollBarEnabled(true);
+        panel.setScrollbarFadingEnabled(false);
+
+        panelList = new LinearLayout(this);
+        panelList.setOrientation(LinearLayout.VERTICAL);
+        panelList.setPadding(dp(14), dp(10), dp(14), dp(12));
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(Color.parseColor("#EB1C2541"));
         bg.setCornerRadius(dp(16));
         bg.setStroke(dp(1), COLOR_GOLD);
-        panel.setBackground(bg);
+        panelList.setBackground(bg);
 
-        tvSrc = new TextView(this);
-        tvSrc.setTextColor(Color.parseColor("#C8CCD8"));
-        tvSrc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        tvSrc.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
-        tvSrc.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
-
-        tvTr = new TextView(this);
-        tvTr.setTextColor(Color.WHITE);
-        tvTr.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
-        tvTr.setTypeface(Typeface.DEFAULT_BOLD);
-        tvTr.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
-        tvTr.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
-        tvTr.setPadding(0, dp(4), 0, 0);
-
-        panel.addView(tvSrc);
-        panel.addView(tvTr);
+        panel.addView(panelList, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT,
+                ScrollView.LayoutParams.WRAP_CONTENT));
 
         panelLp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
+
+        // هندل تغییر اندازه (گوشه‌ی پایین-راست)
+        panel.setOnTouchListener(new View.OnTouchListener() {
+            float downX, downY;
+            int startW, startH;
+            boolean resizing = false;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                float x = e.getX();
+                float y = e.getY();
+                boolean inResizeArea = x > v.getWidth() - dp(RESIZE_HANDLE_DP)
+                        && y > v.getHeight() - dp(RESIZE_HANDLE_DP);
+
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        if (!inResizeArea) return false;
+                        downX = e.getRawX(); downY = e.getRawY();
+                        startW = panelLp.width; startH = panelLp.height;
+                        resizing = true;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        if (!resizing) return false;
+                        int newW = clamp((int) (startW + (e.getRawX() - downX)),
+                                dp(PANEL_MIN_WIDTH_DP), screenW() - dp(24));
+                        int newH = clamp((int) (startH + (e.getRawY() - downY)),
+                                dp(PANEL_MIN_HEIGHT_DP), screenH() / 2);
+                        panelLp.width = newW;
+                        panelLp.height = newH;
+                        panelWidthPx = newW;
+                        panelHeightPx = newH;
+                        try { wm.updateViewLayout(panel, panelLp); } catch (Exception ignored) {}
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        resizing = false;
+                        return true;
+                }
+                return false;
+            }
+        });
     }
 
     private void computePanelPos() {
-        panelLp.width = screenW() - dp(24);
+        if (panelWidthPx == 0) panelWidthPx = screenW() - dp(24);
+        if (panelHeightPx == 0) panelHeightPx = dp(PANEL_DEFAULT_HEIGHT_DP);
+        panelLp.width = panelWidthPx;
+        panelLp.height = panelHeightPx;
         panelLp.x = dp(12);
         int sh = screenH();
         boolean below = bubbleLp.y + bubbleSize / 2 < sh / 2;
@@ -501,9 +550,12 @@ public class BubbleService extends Service {
         try { wm.updateViewLayout(panel, panelLp); } catch (Exception ignored) {}
     }
 
+    private LinearLayout currentRow = null;
+
     private void showText(String src, String tr) {
         if (wm == null || bubble == null) return;
         ensurePanel();
+
         String newSrc = src == null ? "" : src;
         String newTr = tr == null ? "" : tr;
         String mode = displayMode();
@@ -513,24 +565,72 @@ public class BubbleService extends Service {
             if (!newTr.isEmpty() && !newTr.equals("…")) newSrc = "";
             else if (newTr.equals("…") && !newSrc.isEmpty()) newTr = "";
         }
-        boolean changed = !newSrc.equals(shownSrc) || !newTr.equals(shownTr) || !panelShown;
-        if (changed) {
-            shownSrc = newSrc;
-            shownTr = newTr;
-            boolean hasSrc = !newSrc.isEmpty();
-            tvSrc.setText(newSrc);
-            tvSrc.setVisibility(hasSrc ? View.VISIBLE : View.GONE);
-            boolean hasTr = !newTr.isEmpty();
-            tvTr.setText(newTr);
-            tvTr.setVisibility(hasTr ? View.VISIBLE : View.GONE);
-            tvTr.setPadding(0, hasSrc ? dp(4) : 0, 0, 0);
 
+        boolean isPartialUpdate = !lastPartialSrc.isEmpty()
+                && newSrc.startsWith(lastPartialSrc)
+                && currentRow != null
+                && !lastPartialSrc.equals(newSrc);
+
+        if (isPartialUpdate) {
+            TextView s = currentRow.findViewWithTag("src");
+            TextView t = currentRow.findViewWithTag("tr");
+            if (s != null) s.setText(newSrc);
+            if (t != null) {
+                t.setText(newTr);
+                t.setVisibility(newTr.isEmpty() ? View.GONE : View.VISIBLE);
+            }
+        } else if (!newSrc.isEmpty() || !newTr.isEmpty()) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.VERTICAL);
+            row.setPadding(0, dp(6), 0, dp(6));
+
+            TextView s = new TextView(this);
+            s.setTag("src");
+            s.setText(newSrc);
+            s.setTextColor(Color.parseColor("#C8CCD8"));
+            s.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            s.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+            s.setVisibility(newSrc.isEmpty() ? View.GONE : View.VISIBLE);
+
+            TextView t = new TextView(this);
+            t.setTag("tr");
+            t.setText(newTr);
+            t.setTextColor(Color.WHITE);
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+            t.setTypeface(Typeface.DEFAULT_BOLD);
+            t.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+            t.setPadding(0, dp(2), 0, 0);
+            t.setVisibility(newTr.isEmpty() ? View.GONE : View.VISIBLE);
+
+            row.addView(s);
+            row.addView(t);
+            panelList.addView(row);
+            currentRow = row;
+
+            while (panelList.getChildCount() > PANEL_MAX_ROWS) {
+                panelList.removeViewAt(0);
+            }
+        }
+
+        if (!newSrc.isEmpty() && !isPartialUpdate) lastPartialSrc = newSrc;
+        shownSrc = newSrc;
+        shownTr = newTr;
+
+        if (!panelShown) {
             computePanelPos();
             try {
-                if (!panelShown) { wm.addView(panel, panelLp); panelShown = true; }
-                else wm.updateViewLayout(panel, panelLp);
-            } catch (Exception e) { Log.w(TAG, "panel show failed", e); }
+                wm.addView(panel, panelLp);
+                panelShown = true;
+            } catch (Exception e) {
+                Log.w(TAG, "panel add failed", e);
+                return;
+            }
+        } else {
+            computePanelPos();
+            try { wm.updateViewLayout(panel, panelLp); } catch (Exception ignored) {}
         }
+
+        panel.post(() -> panel.fullScroll(View.FOCUS_DOWN));
 
         main.removeCallbacks(hidePanel);
         long delay = recording ? PANEL_HIDE_MS_RECORDING : PANEL_HIDE_MS;
@@ -544,6 +644,9 @@ public class BubbleService extends Service {
         panelShown = false;
         shownSrc = "";
         shownTr = "";
+        lastPartialSrc = "";
+        currentRow = null;
+        if (panelList != null) panelList.removeAllViews();
     }
 
     private void setRecordingUi(boolean rec) {
@@ -989,15 +1092,14 @@ public class BubbleService extends Service {
         if (t != null) { try { t.close(); } catch (Exception ignored) {} }
     }
 
-    /**
-     * مثل LingoNative: فقط متن اصلی رو نشون بده، ترجمه partial نمی‌کنیم.
-     */
     private void onPartialText(final String text) {
         showText(text, "");
         gotAsrText = true;
     }
 
     private void onFinalText(final String text) {
+        lastPartialSrc = "";
+        currentRow = null;
         final int fseq = ++finalSeq;
         final String ctxPrev = prevFinalText;
         prevFinalText = text;
