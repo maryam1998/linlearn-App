@@ -64,17 +64,7 @@ final class SherpaEngine {
             OnlineRecognizerConfig cfg = new OnlineRecognizerConfig();
             cfg.setFeatConfig(fc);
             cfg.setModelConfig(mc);
-
-            // Endpoint مثل LingoNative: سکوت ۱.۴ ثانیه = پایان جمله
-            EndpointConfig ec = new EndpointConfig();
-            try {
-                ec.setRule1MinTrailingSilence(1.4f);
-                ec.setRule2MinTrailingSilence(0.8f);
-                ec.setRule3MinUtteranceLength(20f);
-            } catch (Throwable t) {
-                Log.w(TAG, "custom endpoint not supported, using defaults", t);
-            }
-            cfg.setEndpointConfig(ec);
+            cfg.setEndpointConfig(new EndpointConfig());   // پیش‌فرض
             cfg.setEnableEndpoint(true);
             cfg.setDecodingMethod("greedy_search");
 
