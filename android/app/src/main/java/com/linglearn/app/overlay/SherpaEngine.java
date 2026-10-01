@@ -16,16 +16,6 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
 import java.io.File;
 import java.util.Locale;
 
-/**
- * Offline streaming speech recognition (Sherpa-ONNX, Zipformer transducer).
- *
- * BubbleService.feedLoop() calls {@link #accept(byte[], int)} with 16 kHz mono PCM16-LE chunks
- * from its capture thread. Results are delivered to BubbleService.asrPartial / asrFinal /
- * asrFallback on the MAIN thread (those methods were written for SpeechHostActivity, which runs there).
- *
- * Thread-safety: accept() runs on the feed thread, release() on the main thread; both take LOCK,
- * and a released engine ignores further audio.
- */
 final class SherpaEngine {
 
     private static final String TAG = "SherpaEngine";
@@ -46,15 +36,10 @@ final class SherpaEngine {
         this.stream = s;
     }
 
-    /** True if a model for this language is already downloaded and can be loaded. */
     static boolean isAvailable(Context ctx, String lang) {
         return SherpaModelManager.getModelDir(ctx, lang) != null;
     }
 
-    /**
-     * Loads the model (takes from a few hundred ms to a couple of seconds: call it OFF the main thread).
-     * Returns null if the language has no downloaded model or loading failed.
-     */
     static SherpaEngine create(Context ctx, String lang) {
         File dir = SherpaModelManager.getModelDir(ctx, lang);
         if (dir == null) return null;
@@ -68,7 +53,7 @@ final class SherpaEngine {
             OnlineModelConfig mc = new OnlineModelConfig();
             mc.setTransducer(tr);
             mc.setTokens(new File(dir, SherpaModelManager.tokensFile(lang)).getAbsolutePath());
-            mc.setNumThreads(Math.max(1, Math.min(2, Runtime.getRuntime().availableProcessors() / 2)));
+            mc.setNumThreads(Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2)));
             mc.setDebug(false);
             mc.setProvider("cpu");
 
@@ -76,26 +61,33 @@ final class SherpaEngine {
             fc.setSampleRate(SAMPLE_RATE);
             fc.setFeatureDim(80);
 
+            // تنظیم دقیق Endpoint — دقیقاً مثل LingoNative
+            // rule1: 2.4s (جمله کامل قطع)
+            // rule2: 1.4s (جمله فعلی بسته بشه) ← مهم‌ترین
+            // rule3: 20s (حداکثر طول جمله)
+            EndpointConfig ec = new EndpointConfig();
+            try { ec.setRule1MinTrailingSilence(2.4f); } catch (Throwable ignored) {}
+            try { ec.setRule2MinTrailingSilence(1.4f); } catch (Throwable ignored) {}
+            try { ec.setRule3MinUtteranceLength(20f); } catch (Throwable ignored) {}
+
             OnlineRecognizerConfig cfg = new OnlineRecognizerConfig();
             cfg.setFeatConfig(fc);
             cfg.setModelConfig(mc);
-            cfg.setEndpointConfig(new EndpointConfig());   // default silence rules
+            cfg.setEndpointConfig(ec);
             cfg.setEnableEndpoint(true);
             cfg.setDecodingMethod("greedy_search");
 
-            // null AssetManager => load from absolute file paths
             rec = new OnlineRecognizer(null, cfg);
             OnlineStream st = rec.createStream("");
             Log.i(TAG, "model loaded from " + dir);
             return new SherpaEngine(rec, st);
-        } catch (Throwable e) {          // UnsatisfiedLinkError / native failures included
+        } catch (Throwable e) {
             Log.e(TAG, "cannot load model for " + lang, e);
             if (rec != null) { try { rec.release(); } catch (Throwable ignored) {} }
             return null;
         }
     }
 
-    /** Feed 16 kHz mono PCM16 little-endian bytes. Never throws. */
     void accept(byte[] pcm16k, int len) {
         if (pcm16k == null || len < 2) return;
         String partialToSend = null, finalToSend = null;
@@ -128,13 +120,11 @@ final class SherpaEngine {
                 fail = true;
             }
         }
-        // callbacks go OUTSIDE the lock, and on the main thread, in order
         if (finalToSend != null) { final String t = finalToSend; MAIN.post(() -> BubbleService.asrFinal(t)); }
         else if (partialToSend != null) { final String t = partialToSend; MAIN.post(() -> BubbleService.asrPartial(t)); }
         if (fail) MAIN.post(BubbleService::asrFallback);
     }
 
-    /** Frees recognizer + stream. Safe to call more than once, from any thread. */
     void release() {
         synchronized (lock) {
             if (released) return;
@@ -148,7 +138,6 @@ final class SherpaEngine {
         }
     }
 
-    /** Some English streaming models emit UPPER CASE; make it readable for display/translation. */
     private static String normalize(String t) {
         if (t == null) return "";
         t = t.trim();
