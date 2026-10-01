@@ -239,11 +239,9 @@ public class BubbleService extends Service {
     private MediaProjection mediaProjection;
     private AudioRecord record;
     private volatile boolean recording = false;
+    private volatile SherpaEngine sherpaEngine;
 
     private static volatile BubbleService instance;
-    private volatile SherpaEngine sherpaEngine;
-    private volatile boolean gotAsrText = false;
-    private volatile int voicedSinceText = 0;
 
     private Translator localTr;
     private String localTrKey = "";
@@ -276,7 +274,6 @@ public class BubbleService extends Service {
             addBubbleIfNeeded();
             prepareLocalTranslator();
 
-            // ✅ دانلود خودکار مدل Sherpa اگه نبود
             final String srcLang = effectiveSource();
             if (srcLang != null && !"auto".equals(srcLang)
                     && SherpaModelManager.isAvailable(srcLang)
@@ -700,17 +697,13 @@ public class BubbleService extends Service {
         if (mediaProjection == null || recording) return;
         prepareLocalTranslator();
         prevFinalText = "";
-        gotAsrText = false; voicedSinceText = 0;
         final String src = effectiveSource();
 
-        // مسیر Sherpa (آفلاین، سریع، پایدار)
         if (src != null && !"auto".equals(src)
                 && SherpaModelManager.isAvailable(src)
                 && SherpaModelManager.getModelDir(this, src) != null) {
             if (startSherpaEngine(src)) return;
         }
-
-        // مسیر سرور (بدون Google — چون Google باعث ANR می‌شد)
         beginCapture();
     }
 
@@ -745,7 +738,7 @@ public class BubbleService extends Service {
         } else {
             if (eng != null) eng.release();
             if (stillActive) {
-                main.post(() -> fallbackToServer(msg("بارگذاری مدل آفلاین ناموفق بود؛ حالت سرور فعال شد",
+                main.post(() -> fallbackToServer(msg("بارگذاری مدل ناموفق بود؛ حالت سرور فعال شد",
                         "Offline model failed to load; using server")));
             }
             stillActive = false;
@@ -848,13 +841,6 @@ public class BubbleService extends Service {
         return outN * 2;
     }
 
-    private static double rms16(short[] s, int n) {
-        if (n <= 0) return 0;
-        long sum = 0;
-        for (int i = 0; i < n; i++) sum += (long) s[i] * s[i];
-        return Math.sqrt(sum / (double) n);
-    }
-
     private void fallbackToServer(String notice) {
         recording = false;
         releaseSherpa();
@@ -954,12 +940,12 @@ public class BubbleService extends Service {
 
     static void asrPartial(String text) {
         BubbleService s = instance;
-        if (s != null) { s.gotAsrText = true; s.onPartialText(text); }
+        if (s != null) s.onPartialText(text);
     }
 
     static void asrFinal(String text) {
         BubbleService s = instance;
-        if (s != null) { s.gotAsrText = true; s.onFinalText(text); }
+        if (s != null) s.onFinalText(text);
     }
 
     static void asrFallback() {
@@ -1002,7 +988,6 @@ public class BubbleService extends Service {
 
     private void onPartialText(final String text) {
         showText(text, "");
-        gotAsrText = true;
     }
 
     private void onFinalText(final String text) {
