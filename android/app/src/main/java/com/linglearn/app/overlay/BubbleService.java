@@ -214,6 +214,7 @@ public class BubbleService extends Service {
 
     private static volatile BubbleService instance;
     private volatile boolean micEngine = false;   // true = Android recognizer fed with SYSTEM audio
+    private volatile SherpaEngine sherpaEngine;   // on-device Sherpa-ONNX recognizer (null = Google/server path)
     private volatile boolean gotAsrText = false;
     private volatile int voicedSinceText = 0;
 
@@ -600,6 +601,10 @@ public class BubbleService extends Service {
         speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
         final String src = effectiveSource();
+        if (src != null && !"auto".equals(src) && SherpaModelManager.isAvailable(src)) {
+            // Sherpa path: feedLoop feeds the OnlineStream (no SpeechHostActivity)
+            if (startSherpaEngine(src)) return;
+        }
         boolean micOk = Build.VERSION.SDK_INT >= 33
                 && src != null && !src.isEmpty() && !"auto".equals(src)
                 && SpeechRecognizer.isRecognitionAvailable(this);
@@ -636,6 +641,64 @@ public class BubbleService extends Service {
             if (rec != null) { record = null; try { rec.stop(); } catch (Exception ignored) {} try { rec.release(); } catch (Exception ignored) {} }
             return false;
         }
+    }
+
+    /**
+     * Sherpa engine: same playback capture + feedLoop as the recognizer engine, but the 16 kHz PCM
+     * goes to SherpaEngine instead of PcmFeed. Returns false (-> Google/server path) if the model
+     * is not downloaded or the capture cannot start.
+     */
+    private boolean startSherpaEngine(final String src) {
+        if (SherpaModelManager.getModelDir(this, src) == null) return false;   // not downloaded yet
+        AudioRecord rec = null;
+        try {
+            rec = buildPlaybackRecord();
+            if (rec == null) return false;
+            record = rec;
+            micEngine = true;          // so feedLoop runs and asr* callbacks are accepted
+            recording = true;
+            setRecordingUi(true);
+            rec.startRecording();
+            final AudioRecord fr = rec;
+            new Thread(() -> runSherpa(fr, src), "bubble-feed").start();
+            showText("", msg("🎙 گوش‌دادن به صدای سیستم (آفلاین)…", "🎙 Listening to system audio (offline)…"));
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "cannot start sherpa engine", e);
+            micEngine = false; recording = false; setRecordingUi(false);
+            if (rec != null) { record = null; try { rec.stop(); } catch (Exception ignored) {} try { rec.release(); } catch (Exception ignored) {} }
+            return false;
+        }
+    }
+
+    /** Feed-thread entry for Sherpa: loads the model off the main thread, then runs feedLoop. */
+    private void runSherpa(final AudioRecord rec, final String src) {
+        SherpaEngine eng = SherpaEngine.create(getApplicationContext(), src);
+        boolean stillActive = recording && micEngine && record == rec;
+        if (eng != null && stillActive) {
+            sherpaEngine = eng;
+            // stop/cleanup may have run between the check and the assignment
+            if (!(recording && micEngine && record == rec)) { releaseSherpa(); stillActive = false; }
+        } else {
+            if (eng != null) eng.release();
+            if (stillActive) {
+                main.post(() -> fallbackToServer(msg("بارگذاری مدل آفلاین ناموفق بود؛ حالت سرور فعال شد",
+                        "Offline model failed to load; using server")));
+            }
+            stillActive = false;
+        }
+        if (stillActive) {
+            feedLoop(rec);   // releases rec in its finally
+        } else {
+            try { rec.stop(); } catch (Exception ignored) {}
+            try { rec.release(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void releaseSherpa() {
+        SherpaEngine e = sherpaEngine;
+        sherpaEngine = null;
+        if (e != null) e.release();
     }
 
     /** Playback-capture AudioRecord at the best native rate (48 kHz, then 44.1 kHz, then 16 kHz). */
@@ -682,7 +745,12 @@ public class BubbleService extends Service {
                 if (n < 0) break;
                 if (n == 0) continue;
                 int outBytes = toPcm16k(in, n, rate, out);
-                PcmFeed.write(out, outBytes);
+                final SherpaEngine se = sherpaEngine;
+                if (se != null) {
+                    se.accept(out, outBytes);
+                } else {
+                    PcmFeed.write(out, outBytes);
+                }
                 if (!gotAsrText) {
                     if (rms16(in, n) > SILENCE_RMS) voicedSinceText += 20;
                     if (voicedSinceText >= ASR_WATCHDOG_VOICED_MS) {
@@ -743,6 +811,7 @@ public class BubbleService extends Service {
         if (!micEngine) return;
         micEngine = false;
         recording = false;
+        releaseSherpa();
         SpeechHostActivity.finishIfRunning();
         PcmFeed.close();
         AudioRecord r = record; record = null;
@@ -816,6 +885,7 @@ public class BubbleService extends Service {
         if (!recording) return;
         recording = false;
         if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); PcmFeed.close(); }
+        releaseSherpa();
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
         setRecordingUi(false);
@@ -1224,6 +1294,7 @@ public class BubbleService extends Service {
         closeLocalTranslator();
         recording = false;
         if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); }
+        releaseSherpa();
         PcmFeed.close();
         instance = null;
         AudioRecord r = record; record = null;
