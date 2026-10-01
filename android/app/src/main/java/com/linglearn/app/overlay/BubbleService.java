@@ -113,16 +113,16 @@ public class BubbleService extends Service {
     private static final int SAMPLE_RATE = 16000;
     private static final int CHUNK_MS = 100;
     private static final int CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS / 1000;
-    private static final int MIN_SEG_MS = 1500;
-    private static final int MAX_SEG_MS = 4000;
-    private static final int SILENCE_CUT_MS = 500;
+    private static final int MIN_SEG_MS = 1200;
+    private static final int MAX_SEG_MS = 3000;
+    private static final int SILENCE_CUT_MS = 350;
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
     private static final int MAX_TEXT_PENDING = 6;
     private static final long PANEL_HIDE_MS = 6000;
     // Live translation of partial speech: at most one local translation per this interval.
-    private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 250;
+    private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 120;
 
     // ---- Network (OkHttp) ----
     private static final int NET_ATTEMPTS = 3;
@@ -132,6 +132,13 @@ public class BubbleService extends Service {
             .writeTimeout(15, TimeUnit.SECONDS)
             .callTimeout(40, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
+            .build();
+    // Live translation must not sit on a dead connection for 40s: fail fast, retry once.
+    private static final OkHttpClient HTTP_FAST = HTTP.newBuilder()
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
+            .callTimeout(12, TimeUnit.SECONDS)
             .build();
 
     private static final String PREFS = "bubble_prefs";
@@ -190,8 +197,10 @@ public class BubbleService extends Service {
     }
 
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final ExecutorService net = Executors.newSingleThreadExecutor();
+    private final ExecutorService net = Executors.newSingleThreadExecutor();      // transcription (fallback engine)
+    private final ExecutorService netTr = Executors.newFixedThreadPool(2);         // translation requests
     private final AtomicInteger pending = new AtomicInteger(0);
+    private final AtomicInteger textPending = new AtomicInteger(0);
 
     private WindowManager wm;
     private TextView bubble;
@@ -226,6 +235,11 @@ public class BubbleService extends Service {
     private String liveTr = "";
     private long lastPartialAt = 0;
     private int partialSeq = 0;
+    private int shownPartialSeq = 0;      // newest partial translation already on screen
+    private boolean partialBusy = false;  // one local translation at a time, always the newest text
+    private String liveTrSrc = "";        // the source text that liveTr is the translation of
+    private int finalSeq = 0;
+    private int shownFinalSeq = 0;
     private boolean partialScheduled = false;
     private final Runnable partialRunnable = () -> {
         partialScheduled = false;
@@ -256,6 +270,7 @@ public class BubbleService extends Service {
         } else {
             running = true;
             addBubbleIfNeeded();
+            prepareLocalTranslator(); // download/load the model now, not when recording starts
         }
         return START_NOT_STICKY;
     }
@@ -625,6 +640,10 @@ public class BubbleService extends Service {
     private void startCapture() {
         if (mediaProjection == null || recording) return;
         prepareLocalTranslator();
+        partialBusy = false;
+        shownPartialSeq = partialSeq;
+        liveTr = "";
+        liveTrSrc = "";
         final String src = sourceLang();
         boolean micOk = Build.VERSION.SDK_INT >= 33
                 && src != null && !src.isEmpty() && !"auto".equals(src)
@@ -815,12 +834,14 @@ public class BubbleService extends Service {
     private void prepareLocalTranslator() {
         String src = TranslateLanguage.fromLanguageTag(sourceLang());
         String tgt = TranslateLanguage.fromLanguageTag(targetLang());
-        localReady = false;
+        final boolean wasReady = localReady;
         if (src == null || tgt == null || src.equals(tgt)) {
             closeLocalTranslator();
             return;
         }
         String key = src + ">" + tgt;
+        if (key.equals(localTrKey) && localTr != null && wasReady) return; // already loaded: stay ready
+        localReady = false;
         if (!key.equals(localTrKey) || localTr == null) {
             closeLocalTranslator();
             localTr = Translation.getClient(new TranslatorOptions.Builder()
@@ -870,44 +891,75 @@ public class BubbleService extends Service {
     private void translatePartialNow() {
         final String src = lastPartialSrc;
         final Translator tr = localTr;
-        if (src.isEmpty() || tr == null || !localReady) return;
+        if (src.isEmpty() || tr == null || !localReady || partialBusy) return;
+        partialBusy = true;
         lastPartialAt = SystemClock.uptimeMillis();
         final int seq = ++partialSeq;
-        tr.translate(src).addOnSuccessListener(out -> {
-            if (seq != partialSeq || !recording) return; // a newer partial/final took over
-            liveTr = out;
-            showText(src, out);
+        tr.translate(src).addOnCompleteListener(task -> {
+            partialBusy = false;
+            // Show every result that is newer than what is on screen. (The old code dropped any
+            // result that was not the very latest, so while the speaker kept talking nothing was
+            // ever shown and the translation only appeared at the next pause.)
+            if (task.isSuccessful() && recording && seq > shownPartialSeq) {
+                shownPartialSeq = seq;
+                liveTr = task.getResult();
+                liveTrSrc = src;
+                String cur = lastPartialSrc.isEmpty() ? src : lastPartialSrc;
+                showText(cur, liveTr);
+            }
+            // The text grew while we were translating: catch up immediately.
+            if (recording && !lastPartialSrc.isEmpty() && !lastPartialSrc.equals(src)) {
+                translatePartialNow();
+            }
         });
     }
 
     /** Final recognised text (either engine): translate locally if possible, else via the Worker. */
     private void onFinalText(final String text) {
-        partialSeq++; // drop in-flight partial translations
+        partialSeq++;                 // in-flight partial translations are now stale
+        shownPartialSeq = partialSeq;
         main.removeCallbacks(partialRunnable);
         partialScheduled = false;
         lastPartialSrc = "";
+        final String keepTr = liveTr;         // keep the last translation visible: no blank gap
+        final String keepSrc = liveTrSrc;
         liveTr = "";
+        liveTrSrc = "";
+        final int fseq = ++finalSeq;
         final Translator tr = localTr;
         if (localReady && tr != null) {
-            showText(text, "");
+            // The partial translation is already of exactly this text: nothing to wait for.
+            if (!keepTr.isEmpty() && text.equals(keepSrc)) {
+                shownFinalSeq = fseq;
+                showText(text, keepTr);
+                return;
+            }
+            showText(text, keepTr);
             tr.translate(text)
-                    .addOnSuccessListener(out -> showText(text, out))
+                    .addOnSuccessListener(out -> {
+                        if (fseq < shownFinalSeq) return; // a newer sentence is already shown
+                        shownFinalSeq = fseq;
+                        showText(text, out);
+                    })
                     .addOnFailureListener(e -> {
                         Log.w(TAG, "local translate failed", e);
-                        remoteTranslate(text);
+                        remoteTranslate(text, fseq);
                     });
             return;
         }
-        remoteTranslate(text);
+        remoteTranslate(text, fseq);
     }
 
-    private void remoteTranslate(final String text) {
+    private void remoteTranslate(final String text, final int fseq) {
         if (!hasInternet()) {
-            showText(text, msg("ترجمه در دسترس نیست (آفلاین)", "No translation (offline)"));
+            if (fseq >= shownFinalSeq) {
+                shownFinalSeq = fseq;
+                showText(text, msg("ترجمه در دسترس نیست (آفلاین)", "No translation (offline)"));
+            }
             return;
         }
         showText(text, "…");
-        submitText(text);
+        submitText(text, fseq);
     }
 
     // ------------------------------------------------------------------
@@ -958,23 +1010,23 @@ public class BubbleService extends Service {
         }
     }
 
-    private void submitText(final String text) {
-        if (pending.get() >= MAX_TEXT_PENDING) {
+    private void submitText(final String text, final int fseq) {
+        if (textPending.get() >= MAX_TEXT_PENDING) {
             Log.w(TAG, "dropping translation (backlog)");
             main.post(() -> showText(text, ""));
             return;
         }
-        pending.incrementAndGet();
+        textPending.incrementAndGet();
         try {
-            net.execute(() -> {
+            netTr.execute(() -> {
                 try {
-                    translateAndShow(text);
+                    translateAndShow(text, fseq);
                 } finally {
-                    pending.decrementAndGet();
+                    textPending.decrementAndGet();
                 }
             });
         } catch (Exception e) {
-            pending.decrementAndGet();
+            textPending.decrementAndGet();
         }
     }
 
@@ -991,7 +1043,7 @@ public class BubbleService extends Service {
         }
     }
 
-    private void translateAndShow(final String text) {
+    private void translateAndShow(final String text, final int fseq) {
         String tr;
         try {
             tr = translate(text);
@@ -1000,7 +1052,11 @@ public class BubbleService extends Service {
             tr = netErrText(e);
         }
         final String shown = tr;
-        main.post(() -> showText(text, shown));
+        main.post(() -> {
+            if (fseq < shownFinalSeq) return; // out-of-order reply for an older sentence
+            shownFinalSeq = fseq;
+            showText(text, shown);
+        });
     }
 
     private String transcribe(byte[] pcm) throws Exception {
@@ -1021,7 +1077,7 @@ public class BubbleService extends Service {
                 + ". Reply with ONLY the translation, no quotes, no explanations.\n\nText: " + text;
         JSONObject body = new JSONObject();
         body.put(GENERATE_PROMPT_KEY, prompt);
-        String resp = postBytes(WORKER_BASE + GENERATE_PATH, "application/json; charset=utf-8",
+        String resp = postBytes(HTTP_FAST, 2, WORKER_BASE + GENERATE_PATH, "application/json; charset=utf-8",
                 body.toString().getBytes(StandardCharsets.UTF_8));
         return extractText(resp);
     }
@@ -1085,10 +1141,15 @@ public class BubbleService extends Service {
 
     // OkHttp (connect 10s / read 15s). Retries dropped connections, timeouts and 5xx/429.
     private static String postBytes(String url, String contentType, byte[] body) throws IOException {
+        return postBytes(HTTP, NET_ATTEMPTS, url, contentType, body);
+    }
+
+    private static String postBytes(OkHttpClient client, int attempts, String url, String contentType,
+                                    byte[] body) throws IOException {
         IOException last = null;
-        for (int attempt = 1; attempt <= NET_ATTEMPTS; attempt++) {
+        for (int attempt = 1; attempt <= attempts; attempt++) {
             try {
-                return postOnce(url, contentType, body);
+                return postOnce(client, url, contentType, body);
             } catch (IOException e) {
                 last = e;
                 if (e instanceof UnknownHostException) throw e; // offline: don't keep retrying
@@ -1097,7 +1158,7 @@ public class BubbleService extends Service {
                     if (code < 500 && code != 429) throw e;
                 }
                 Log.w(TAG, "request attempt " + attempt + " failed: " + e);
-                if (attempt == NET_ATTEMPTS) break;
+                if (attempt == attempts) break;
                 try {
                     Thread.sleep(300L * attempt);
                 } catch (InterruptedException ie) {
@@ -1109,12 +1170,13 @@ public class BubbleService extends Service {
         throw last;
     }
 
-    private static String postOnce(String url, String contentType, byte[] body) throws IOException {
+    private static String postOnce(OkHttpClient client, String url, String contentType, byte[] body)
+            throws IOException {
         Request req = new Request.Builder()
                 .url(url)
                 .post(RequestBody.create(body, MediaType.get(contentType)))
                 .build();
-        try (Response r = HTTP.newCall(req).execute()) {
+        try (Response r = client.newCall(req).execute()) {
             ResponseBody rb = r.body();
             String resp = rb == null ? "" : rb.string();
             if (!r.isSuccessful()) throw new HttpStatusException(r.code(), resp);
@@ -1181,5 +1243,6 @@ public class BubbleService extends Service {
         }
         bubble = null;
         net.shutdownNow();
+        netTr.shutdownNow();
     }
 }
