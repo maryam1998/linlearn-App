@@ -48,8 +48,10 @@ final class TtsEngine {
             OfflineTtsConfig config = new OfflineTtsConfig();
             config.setModel(modelConfig);
 
-            OfflineTts engine = new OfflineTts(config);
-            int sr = engine.getSampleRate();
+            // ✅ اصلاح: null به عنوان AssetManager + getSampleRate(0)
+            OfflineTts engine = new OfflineTts(null, config);
+            int sr = engine.getSampleRate(0);
+            if (sr <= 0) sr = 22050;
             Log.i(TAG, "TTS loaded for " + lang + ", sampleRate=" + sr);
             return new TtsEngine(engine, sr);
         } catch (Throwable e) {
@@ -65,6 +67,7 @@ final class TtsEngine {
         final float sp = (speed <= 0f) ? 1.0f : speed;
         new Thread(() -> {
             try {
+                // ✅ پارامتر دوم: speakerId = 0
                 GeneratedAudio audio = tts.generate(t, 0, sp);
                 if (audio == null || audio.getSamples() == null || audio.getSamples().length == 0) {
                     Log.w(TAG, "Generated audio is empty");
