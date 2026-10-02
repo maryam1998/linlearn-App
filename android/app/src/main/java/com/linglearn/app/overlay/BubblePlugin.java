@@ -14,6 +14,10 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 @CapacitorPlugin(name = "BubblePlugin")
 public class BubblePlugin extends Plugin {
 
+    // موتور TTS مشترک برای استفاده از React
+    private static volatile TtsEngine sharedTts;
+    private static volatile String sharedTtsLang = null;
+
     @PluginMethod
     public void checkPermission(PluginCall call) {
         JSObject ret = new JSObject();
@@ -38,7 +42,6 @@ public class BubblePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    // showBubble({ targetLang?, sourceLang?, translationTone? })
     @PluginMethod
     public void showBubble(PluginCall call) {
         Context ctx = getContext();
@@ -60,7 +63,6 @@ public class BubblePlugin extends Plugin {
         call.resolve();
     }
 
-    // setLanguages({ targetLang?, sourceLang?, translationTone? })
     @PluginMethod
     public void setLanguages(PluginCall call) {
         BubbleService.saveLangs(getContext(), call.getString("targetLang"), call.getString("sourceLang"));
@@ -68,7 +70,6 @@ public class BubblePlugin extends Plugin {
         call.resolve();
     }
 
-    // setDisplayMode({ mode: "both"|"original"|"translation" })
     @PluginMethod
     public void setDisplayMode(PluginCall call) {
         BubbleService.saveDisplayMode(getContext(), call.getString("mode"));
@@ -82,53 +83,60 @@ public class BubblePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    // ✅ بررسی وضعیت مدل Sherpa
-    // checkModelStatus({ lang: "en" })
+    // ============ TTS ============
+
+    // setTtsEnabled({ enabled: true })
     @PluginMethod
-    public void checkModelStatus(PluginCall call) {
+    public void setTtsEnabled(PluginCall call) {
+        Boolean enabled = call.getBoolean("enabled", false);
+        BubbleService.saveTtsEnabled(getContext(), enabled != null && enabled);
+        call.resolve();
+    }
+
+    // checkTtsStatus({ lang: "fa" })
+    @PluginMethod
+    public void checkTtsStatus(PluginCall call) {
         Context ctx = getContext();
         String lang = call.getString("lang", "en");
         JSObject ret = new JSObject();
-        ret.put("supported", SherpaModelManager.isAvailable(lang));
-        ret.put("downloaded", SherpaModelManager.getModelDir(ctx, lang) != null);
+        ret.put("supported", SherpaModelManager.isTtsAvailable(lang));
+        ret.put("downloaded", SherpaModelManager.getTtsModelDir(ctx, lang) != null);
         ret.put("downloading", SherpaModelManager.isDownloading());
         call.resolve(ret);
     }
 
-    // ✅ دانلود مدل (از صفحه تنظیمات صدا زده می‌شه)
-    // downloadModel({ lang: "en" })
+    // downloadTtsModel({ lang: "fa" })
     @PluginMethod
-    public void downloadModel(PluginCall call) {
+    public void downloadTtsModel(PluginCall call) {
         final Context ctx = getContext();
         final String lang = call.getString("lang", "en");
 
-        if (!SherpaModelManager.isAvailable(lang)) {
-            call.reject("Model not supported for language: " + lang);
+        if (!SherpaModelManager.isTtsAvailable(lang)) {
+            call.reject("TTS not supported for language: " + lang);
             return;
         }
-        if (SherpaModelManager.getModelDir(ctx, lang) != null) {
+        if (SherpaModelManager.getTtsModelDir(ctx, lang) != null) {
             JSObject ret = new JSObject();
             ret.put("alreadyDownloaded", true);
             call.resolve(ret);
             return;
         }
 
-        SherpaModelManager.downloadModel(ctx.getApplicationContext(), lang,
+        SherpaModelManager.downloadTtsModel(ctx.getApplicationContext(), lang,
                 new SherpaModelManager.ProgressCallback() {
                     @Override
                     public void onProgress(String l, long done, long total) {
                         JSObject ret = new JSObject();
                         ret.put("lang", l);
                         ret.put("bytes", done);
-                        ret.put("total", total);
-                        notifyListeners("modelDownloadProgress", ret);
+                        notifyListeners("ttsModelDownloadProgress", ret);
                     }
 
                     @Override
                     public void onDone(String l) {
                         JSObject ret = new JSObject();
                         ret.put("lang", l);
-                        notifyListeners("modelDownloadDone", ret);
+                        notifyListeners("ttsModelDownloadDone", ret);
                     }
 
                     @Override
@@ -136,20 +144,77 @@ public class BubblePlugin extends Plugin {
                         JSObject ret = new JSObject();
                         ret.put("lang", l);
                         ret.put("error", e.getMessage() != null ? e.getMessage() : "unknown");
-                        notifyListeners("modelDownloadError", ret);
+                        notifyListeners("ttsModelDownloadError", ret);
                     }
                 });
 
         call.resolve();
     }
 
-    // ✅ حذف مدل (برای آزادسازی فضا)
-    // deleteModel({ lang: "en" })
+    // deleteTtsModel({ lang: "fa" })
     @PluginMethod
-    public void deleteModel(PluginCall call) {
+    public void deleteTtsModel(PluginCall call) {
         Context ctx = getContext();
         String lang = call.getString("lang", "en");
-        SherpaModelManager.deleteModel(ctx, lang);
+        SherpaModelManager.deleteTtsModel(ctx, lang);
+        call.resolve();
+    }
+
+    /**
+     * ✅ متد اصلی: خواندن متن با TTS
+     * speak({ text: "سلام", lang: "fa", speed: 1.0 })
+     */
+    @PluginMethod
+    public void speak(final PluginCall call) {
+        final Context ctx = getContext();
+        final String text = call.getString("text");
+        final String lang = call.getString("lang", "en");
+        Double sp = call.getDouble("speed", 1.0);
+
+        if (text == null || text.trim().isEmpty()) {
+            call.reject("text is empty");
+            return;
+        }
+
+        // بررسی وجود مدل
+        if (SherpaModelManager.getTtsModelDir(ctx, lang) == null) {
+            call.reject("TTS model not downloaded for language: " + lang);
+            return;
+        }
+
+        final float speed = (sp == null || sp <= 0) ? 1.0f : sp.floatValue();
+
+        // اگه موتور با همین زبان لود شده، استفاده کن. وگرنه لود کن.
+        new Thread(() -> {
+            try {
+                TtsEngine engine;
+                synchronized (BubblePlugin.class) {
+                    if (sharedTts == null || !lang.equals(sharedTtsLang)) {
+                        if (sharedTts != null) {
+                            sharedTts.release();
+                            sharedTts = null;
+                        }
+                        sharedTts = TtsEngine.create(ctx.getApplicationContext(), lang);
+                        sharedTtsLang = lang;
+                    }
+                    engine = sharedTts;
+                }
+                if (engine == null) {
+                    call.reject("failed to load TTS engine");
+                    return;
+                }
+                engine.speak(text, speed);
+                call.resolve();
+            } catch (Exception e) {
+                call.reject("TTS error: " + e.getMessage());
+            }
+        }, "tts-speak").start();
+    }
+
+    /** ✅ توقف TTS (اگه بلند شد) */
+    @PluginMethod
+    public void stopSpeaking(PluginCall call) {
+        // AudioTrack خودش تموم می‌شه، ولی اگه خواستی می‌تونی یه متد stop اضافه کنی
         call.resolve();
     }
 }
