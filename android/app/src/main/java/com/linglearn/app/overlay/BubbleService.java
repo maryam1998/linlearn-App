@@ -200,12 +200,21 @@ public class BubbleService extends Service {
         ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("displayMode", m).apply();
     }
 
+    /** ✅ فعال/غیرفعال کردن پخش ترجمه با TTS. */
+    public static void saveTtsEnabled(Context ctx, boolean enabled) {
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("ttsEnabled", enabled).apply();
+    }
+
     private String displayMode() {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getString("displayMode", "both");
     }
 
     private String tone() {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getString("tone", "neutral");
+    }
+
+    private boolean ttsEnabled() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean("ttsEnabled", false);
     }
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -240,6 +249,7 @@ public class BubbleService extends Service {
     private AudioRecord record;
     private volatile boolean recording = false;
     private volatile SherpaEngine sherpaEngine;
+    private volatile TtsEngine ttsEngine;
 
     private static volatile BubbleService instance;
 
@@ -273,7 +283,7 @@ public class BubbleService extends Service {
             running = true;
             addBubbleIfNeeded();
             prepareLocalTranslator();
-            // ✅ دانلود خودکار حذف شد. کاربر از تنظیمات دانلود می‌کنه.
+            prepareTts();
         }
         return START_NOT_STICKY;
     }
@@ -690,6 +700,7 @@ public class BubbleService extends Service {
     private void startCapture() {
         if (mediaProjection == null || recording) return;
         prepareLocalTranslator();
+        prepareTts();
         prevFinalText = "";
         final String src = effectiveSource();
 
@@ -699,7 +710,6 @@ public class BubbleService extends Service {
             if (startSherpaEngine(src)) return;
         }
 
-        // اگه مدل دانلود نشده باشه، پیام می‌دیم
         if (src != null && !"auto".equals(src)
                 && SherpaModelManager.isAvailable(src)
                 && SherpaModelManager.getModelDir(this, src) == null) {
@@ -990,6 +1000,35 @@ public class BubbleService extends Service {
         if (t != null) { try { t.close(); } catch (Exception ignored) {} }
     }
 
+    /** ✅ آماده‌سازی موتور TTS برای زبان هدف. */
+    private void prepareTts() {
+        final String target = targetLang();
+        if (!SherpaModelManager.isTtsAvailable(target)) {
+            ttsEngine = null;
+            return;
+        }
+        if (SherpaModelManager.getTtsModelDir(this, target) == null) {
+            ttsEngine = null;
+            return;
+        }
+        // اگه قبلاً با همین زبان لود شده، دوباره لود نکن
+        if (ttsEngine != null) return;
+        new Thread(() -> {
+            TtsEngine eng = TtsEngine.create(getApplicationContext(), target);
+            ttsEngine = eng;
+        }, "tts-init").start();
+    }
+
+    /** ✅ پخش ترجمه با TTS (اگه در تنظیمات فعال باشه). */
+    private void speakIfEnabled(String translation) {
+        if (!ttsEnabled()) return;
+        if (translation == null || translation.trim().isEmpty()) return;
+        if ("…".equals(translation.trim())) return;
+        TtsEngine eng = ttsEngine;
+        if (eng == null) return;
+        eng.speak(translation, 1.0f);
+    }
+
     private void onPartialText(final String text) {
         showText(text, "");
     }
@@ -1008,6 +1047,7 @@ public class BubbleService extends Service {
                         if (fseq < shownFinalSeq) return;
                         shownFinalSeq = fseq;
                         showText(text, out);
+                        speakIfEnabled(out);
                     })
                     .addOnFailureListener(e -> {
                         Log.w(TAG, "local translate failed", e);
@@ -1092,6 +1132,7 @@ public class BubbleService extends Service {
             if (fseq < shownFinalSeq) return;
             shownFinalSeq = fseq;
             showText(text, shown);
+            speakIfEnabled(shown);
         });
     }
 
@@ -1235,6 +1276,12 @@ public class BubbleService extends Service {
         closeLocalTranslator();
         recording = false;
         releaseSherpa();
+
+        // ✅ آزادسازی TTS
+        TtsEngine te = ttsEngine;
+        ttsEngine = null;
+        if (te != null) te.release();
+
         instance = null;
         AudioRecord r = record; record = null;
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
