@@ -1,6 +1,6 @@
 # ورک‌فلو ساخت APK
-# تغییر اصلی: فایل‌های build شده‌ی Hope داخل خود APK قرار می‌گیرن (پوشه‌ی www)
-# و WebView از حافظه‌ی داخلی لود می‌کنه، نه از GitHub Pages.
+# - فایل‌های build شده‌ی Hope داخل APK قرار می‌گیرن (پوشه‌ی www)
+# - APK نهایی با Keystore اختصاصی امضا می‌شه
 name: Build APK
 
 on:
@@ -16,10 +16,8 @@ jobs:
       - name: Checkout linlearn-App
         uses: actions/checkout@v4
 
-      # ۲) ریپوی وب‌اپ Hope (شاخه‌ی پیش‌فرض = main).
-      # در Hope فایل app.bundle.min.js از قبل build شده و داخل ریپو commit شده،
-      # پس شاخه‌ی gh-pages لازم نیست.
-      # اگه ریپوی Hope خصوصی (private) باشه، باید یه توکن اضافه کنی: token: ${{ secrets.HOPE_TOKEN }}
+      # ۲) ریپوی وب‌اپ Hope
+      # اگه Hope private باشه، توکن لازمه: token: ${{ secrets.HOPE_TOKEN }}
       - name: Checkout Hope web app
         uses: actions/checkout@v4
         with:
@@ -37,8 +35,7 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      # ۳) اگه باندل Hope به هر دلیلی وجود نداشت، همون‌جا با esbuild می‌سازیمش
-      # (همون دستوری که ورک‌فلو خودِ Hope استفاده می‌کنه). در حالت عادی این مرحله رد می‌شه.
+      # ۳) اگه باندل Hope نبود، با esbuild می‌سازیمش
       - name: Build Hope bundle (only if missing)
         run: |
           cd Hope-build
@@ -62,9 +59,7 @@ jobs:
             echo "app.bundle.min.js already exists, skipping build."
           fi
 
-      # ۴) فقط فایل‌هایی که اپ موقع اجرا لازم داره رو کپی می‌کنیم به www.
-      # فایل‌های سورس سنگین (app.jsx، WORDS_AZ.js و ...) داخل باندل هستن و لازم نیست
-      # وارد APK بشن، چون حجم APK رو بی‌دلیل زیاد می‌کنن.
+      # ۴) کپی فایل‌های لازم به www
       - name: Copy Hope build to www
         run: |
           rm -rf www
@@ -76,7 +71,6 @@ jobs:
           cp -r Hope-build/icons            www/
           [ -d Hope-build/dictionaries ] && cp -r Hope-build/dictionaries www/ || true
           [ -d Hope-build/src ]          && cp -r Hope-build/src          www/ || true
-          # اگه فایل اصلی نبود، بیلد همین‌جا متوقف می‌شه تا APK خالی ساخته نشه
           test -f www/index.html || { echo "ERROR: www/index.html missing"; exit 1; }
           test -f www/app.bundle.min.js || { echo "ERROR: www/app.bundle.min.js missing"; exit 1; }
           ls -la www/
@@ -84,11 +78,11 @@ jobs:
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
-      # ۵) این مرحله www رو داخل پروژه‌ی اندروید کپی می‌کنه (assets/public)
+      # ۵) Sync Capacitor
       - name: Sync Capacitor
         run: npx cap sync android
 
-      # ۶) بررسی اینکه فایل‌ها واقعاً داخل پروژه‌ی اندروید رفتن
+      # ۶) بررسی فایل‌های داخل Android project
       - name: Verify web assets inside Android project
         run: |
           ls -la android/app/src/main/assets/public/
@@ -114,14 +108,25 @@ jobs:
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/v1.13.4/sherpa-onnx-1.13.4.aar"
           ls -lh android/app/libs/
 
-      - name: Build Debug APK
+      # ✅ مرحله‌ی جدید: دیکد کردن Keystore از Secrets
+      - name: Decode Keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/app/release-key.jks
+          ls -lh android/app/release-key.jks
+
+      # ✅ Build Release APK (امضاشده)
+      - name: Build Release APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           cd android
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew assembleRelease --stacktrace
 
-      - name: Upload APK
+      - name: Upload Release APK
         uses: actions/upload-artifact@v4
         with:
-          name: LingoLearn-debug-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: LingoLearn-release-apk
+          path: android/app/build/outputs/apk/release/app-release.apk
