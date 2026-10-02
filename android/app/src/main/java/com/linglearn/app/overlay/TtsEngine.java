@@ -21,6 +21,7 @@ final class TtsEngine {
     private final OfflineTts tts;
     private final int sampleRate;
     private volatile boolean released = false;
+    private volatile AudioTrack currentTrack = null;
 
     private TtsEngine(OfflineTts tts, int sampleRate) {
         this.tts = tts;
@@ -77,6 +78,7 @@ final class TtsEngine {
     }
 
     private void playPcm(float[] samples) {
+        if (released) return;
         int minBuf = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
@@ -104,6 +106,7 @@ final class TtsEngine {
             pcm16[i] = (short) (s * 32767);
         }
 
+        currentTrack = track;
         try {
             track.play();
             track.write(pcm16, 0, pcm16.length);
@@ -111,13 +114,28 @@ final class TtsEngine {
         } catch (Throwable e) {
             Log.e(TAG, "playback failed", e);
         } finally {
+            if (currentTrack == track) currentTrack = null;
             try { track.release(); } catch (Throwable ignored) {}
         }
     }
 
+    /** ✅ توقف پخش فعلی */
+    void stop() {
+        AudioTrack t = currentTrack;
+        if (t != null) {
+            try { t.pause(); } catch (Throwable ignored) {}
+            try { t.flush(); } catch (Throwable ignored) {}
+            try { t.stop(); } catch (Throwable ignored) {}
+            try { t.release(); } catch (Throwable ignored) {}
+            currentTrack = null;
+        }
+    }
+
+    /** ✅ آزادسازی کامل */
     void release() {
         if (released) return;
         released = true;
+        stop();
         try { if (tts != null) tts.release(); } catch (Throwable ignored) {}
     }
 }
