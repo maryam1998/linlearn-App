@@ -200,7 +200,6 @@ public class BubbleService extends Service {
         ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("displayMode", m).apply();
     }
 
-    /** ✅ فعال/غیرفعال کردن پخش ترجمه با TTS. */
     public static void saveTtsEnabled(Context ctx, boolean enabled) {
         ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("ttsEnabled", enabled).apply();
     }
@@ -1011,7 +1010,6 @@ public class BubbleService extends Service {
             ttsEngine = null;
             return;
         }
-        // اگه قبلاً با همین زبان لود شده، دوباره لود نکن
         if (ttsEngine != null) return;
         new Thread(() -> {
             TtsEngine eng = TtsEngine.create(getApplicationContext(), target);
@@ -1277,10 +1275,19 @@ public class BubbleService extends Service {
         recording = false;
         releaseSherpa();
 
-        // ✅ آزادسازی TTS
+        // ✅ آزادسازی TTS خود سرویس
         TtsEngine te = ttsEngine;
         ttsEngine = null;
         if (te != null) te.release();
+
+        // ✅ آزادسازی موتور TTS مشترک (استفاده‌شده از React)
+        try {
+            if (BubblePlugin.sharedTts != null) {
+                BubblePlugin.sharedTts.release();
+                BubblePlugin.sharedTts = null;
+                BubblePlugin.sharedTtsLang = null;
+            }
+        } catch (Throwable ignored) {}
 
         instance = null;
         AudioRecord r = record; record = null;
