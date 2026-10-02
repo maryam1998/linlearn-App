@@ -1,3 +1,6 @@
+# ورک‌فلو ساخت APK
+# تغییر اصلی: فایل‌های build شده‌ی Hope داخل خود APK قرار می‌گیرن (پوشه‌ی www)
+# و WebView از حافظه‌ی داخلی لود می‌کنه، نه از GitHub Pages.
 name: Build APK
 
 on:
@@ -9,8 +12,19 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      # ۱) ریپوی خودِ اپ اندروید
+      - name: Checkout linlearn-App
         uses: actions/checkout@v4
+
+      # ۲) ریپوی وب‌اپ Hope (شاخه‌ی پیش‌فرض = main).
+      # در Hope فایل app.bundle.min.js از قبل build شده و داخل ریپو commit شده،
+      # پس شاخه‌ی gh-pages لازم نیست.
+      # اگه ریپوی Hope خصوصی (private) باشه، باید یه توکن اضافه کنی: token: ${{ secrets.HOPE_TOKEN }}
+      - name: Checkout Hope web app
+        uses: actions/checkout@v4
+        with:
+          repository: maryam1998/Hope
+          path: Hope-build
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -23,11 +37,62 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
+      # ۳) اگه باندل Hope به هر دلیلی وجود نداشت، همون‌جا با esbuild می‌سازیمش
+      # (همون دستوری که ورک‌فلو خودِ Hope استفاده می‌کنه). در حالت عادی این مرحله رد می‌شه.
+      - name: Build Hope bundle (only if missing)
+        run: |
+          cd Hope-build
+          if [ ! -f app.bundle.min.js ]; then
+            echo "app.bundle.min.js not found, building with esbuild..."
+            npx --yes esbuild@0.27.7 app.jsx \
+              --bundle --minify --format=esm --target=es2020 \
+              --loader:.js=jsx \
+              --external:react \
+              --external:react-dom \
+              --external:react-dom/client \
+              --external:lucide-react \
+              --external:@supabase/supabase-js \
+              --external:firebase/app \
+              --external:firebase/auth \
+              --external:firebase/firestore \
+              --external:pdfjs-dist \
+              --external:pdf-lib \
+              --outfile=app.bundle.min.js
+          else
+            echo "app.bundle.min.js already exists, skipping build."
+          fi
+
+      # ۴) فقط فایل‌هایی که اپ موقع اجرا لازم داره رو کپی می‌کنیم به www.
+      # فایل‌های سورس سنگین (app.jsx، WORDS_AZ.js و ...) داخل باندل هستن و لازم نیست
+      # وارد APK بشن، چون حجم APK رو بی‌دلیل زیاد می‌کنن.
+      - name: Copy Hope build to www
+        run: |
+          rm -rf www
+          mkdir -p www
+          cp Hope-build/index.html          www/
+          cp Hope-build/app.bundle.min.js   www/
+          cp Hope-build/manifest.json       www/
+          cp Hope-build/sw.js               www/
+          cp -r Hope-build/icons            www/
+          [ -d Hope-build/dictionaries ] && cp -r Hope-build/dictionaries www/ || true
+          [ -d Hope-build/src ]          && cp -r Hope-build/src          www/ || true
+          # اگه فایل اصلی نبود، بیلد همین‌جا متوقف می‌شه تا APK خالی ساخته نشه
+          test -f www/index.html || { echo "ERROR: www/index.html missing"; exit 1; }
+          test -f www/app.bundle.min.js || { echo "ERROR: www/app.bundle.min.js missing"; exit 1; }
+          ls -la www/
+
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
+      # ۵) این مرحله www رو داخل پروژه‌ی اندروید کپی می‌کنه (assets/public)
       - name: Sync Capacitor
         run: npx cap sync android
+
+      # ۶) بررسی اینکه فایل‌ها واقعاً داخل پروژه‌ی اندروید رفتن
+      - name: Verify web assets inside Android project
+        run: |
+          ls -la android/app/src/main/assets/public/
+          test -f android/app/src/main/assets/public/index.html || { echo "ERROR: assets not copied (check webDir)"; exit 1; }
 
       - name: Accept Android SDK licenses
         run: |
