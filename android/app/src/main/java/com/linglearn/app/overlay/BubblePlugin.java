@@ -239,13 +239,15 @@ public class BubblePlugin extends Plugin {
 
     /**
      * ✅ متد اصلی خواندن متن با TTS
-     * speak({ text: "سلام", lang: "fa", speed: 1.0 })
+     * speak({ text: "سلام", lang: "fa", speed: 1.0, id: "..." })
+     * بعد از تمام‌شدنِ پخش، event «ttsSpeakDone» با { lang, text, id } فرستاده می‌شه.
      */
     @PluginMethod
     public void speak(final PluginCall call) {
         final Context ctx = getContext();
         final String text = call.getString("text");
         final String lang = call.getString("lang", "en");
+        final String id = call.getString("id");
         Double sp = call.getDouble("speed", 1.0);
 
         if (text == null || text.trim().isEmpty()) {
@@ -278,8 +280,17 @@ public class BubblePlugin extends Plugin {
                     call.reject("failed to load TTS engine");
                     return;
                 }
-                engine.speak(text, speed);
+                // موفقیتِ شروع رو فوراً برمی‌گردونیم
                 call.resolve();
+
+                // بعد از تمام‌شدنِ پخش یه event می‌فرستیم تا React بفهمه
+                engine.speak(text, speed, () -> {
+                    JSObject ret = new JSObject();
+                    ret.put("lang", lang);
+                    ret.put("text", text);
+                    if (id != null) ret.put("id", id);
+                    notifyListeners("ttsSpeakDone", ret);
+                });
             } catch (Exception e) {
                 call.reject("TTS error: " + e.getMessage());
             }

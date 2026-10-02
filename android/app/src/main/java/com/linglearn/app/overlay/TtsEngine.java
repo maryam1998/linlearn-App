@@ -22,6 +22,8 @@ final class TtsEngine {
     private final int sampleRate;
     private volatile boolean released = false;
     private volatile AudioTrack currentTrack = null;
+    // با هر stop() بالا می‌ره؛ speak هایی که قبل از stop شروع شدن پخش نمی‌شن
+    private volatile int epoch = 0;
 
     private TtsEngine(OfflineTts tts, int sampleRate) {
         this.tts = tts;
@@ -59,26 +61,48 @@ final class TtsEngine {
         }
     }
 
-    void speak(String text, float speed) {
-        if (released || text == null || text.trim().isEmpty()) return;
+    /**
+     * خواندن متن؛ onDone بعد از تمام‌شدنِ پخش (یا شکست/لغو) دقیقاً یک‌بار صدا زده می‌شه.
+     */
+    void speak(String text, float speed, Runnable onDone) {
+        if (released || text == null || text.trim().isEmpty()) {
+            if (onDone != null) onDone.run();
+            return;
+        }
         final String t = text.trim();
         final float sp = (speed <= 0f) ? 1.0f : speed;
+        final int myEpoch = epoch;
         new Thread(() -> {
             try {
                 GeneratedAudio audio = tts.generate(t, 0, sp);
-                if (audio == null || audio.getSamples() == null || audio.getSamples().length == 0) {
-                    Log.w(TAG, "Generated audio is empty");
+                // اگه وسطِ تولیدِ صدا stop() صدا زده شده بود، دیگه پخش نکن
+                if (released || myEpoch != epoch) {
+                    if (onDone != null) onDone.run();
                     return;
                 }
-                playPcm(audio.getSamples());
+                if (audio == null || audio.getSamples() == null || audio.getSamples().length == 0) {
+                    Log.w(TAG, "Generated audio is empty");
+                    if (onDone != null) onDone.run();
+                    return;
+                }
+                playPcm(audio.getSamples(), onDone);
             } catch (Throwable e) {
                 Log.e(TAG, "TTS generate failed", e);
+                if (onDone != null) onDone.run();
             }
         }, "tts-speak").start();
     }
 
-    private void playPcm(float[] samples) {
-        if (released) return;
+    // نسخه‌ی قدیمی (سازگاری با کدهای قبلی مثل BubbleService)
+    void speak(String text, float speed) {
+        speak(text, speed, null);
+    }
+
+    private void playPcm(float[] samples, Runnable onDone) {
+        if (released) {
+            if (onDone != null) onDone.run();
+            return;
+        }
         int minBuf = AudioTrack.getMinBufferSize(
                 sampleRate,
                 AudioFormat.CHANNEL_OUT_MONO,
@@ -116,10 +140,12 @@ final class TtsEngine {
         } finally {
             if (currentTrack == track) currentTrack = null;
             try { track.release(); } catch (Throwable ignored) {}
+            if (onDone != null) onDone.run();
         }
     }
 
     void stop() {
+        epoch++;
         AudioTrack t = currentTrack;
         if (t != null) {
             try { t.pause(); } catch (Throwable ignored) {}
