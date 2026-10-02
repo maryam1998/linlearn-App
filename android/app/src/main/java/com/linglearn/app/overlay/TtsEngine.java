@@ -48,10 +48,9 @@ final class TtsEngine {
             OfflineTtsConfig config = new OfflineTtsConfig();
             config.setModel(modelConfig);
 
-            // ✅ اصلاح: null به عنوان AssetManager + getSampleRate(0)
             OfflineTts engine = new OfflineTts(null, config);
-            int sr = engine.getSampleRate(0);
-            if (sr <= 0) sr = 22050;
+            // ✅ نرخ نمونه‌برداری استاندارد Piper/VITS medium
+            int sr = 22050;
             Log.i(TAG, "TTS loaded for " + lang + ", sampleRate=" + sr);
             return new TtsEngine(engine, sr);
         } catch (Throwable e) {
@@ -60,14 +59,12 @@ final class TtsEngine {
         }
     }
 
-    /** تبدیل متن به گفتار و پخش. speed = 1.0 برای سرعت عادی. */
     void speak(String text, float speed) {
         if (released || text == null || text.trim().isEmpty()) return;
         final String t = text.trim();
         final float sp = (speed <= 0f) ? 1.0f : speed;
         new Thread(() -> {
             try {
-                // ✅ پارامتر دوم: speakerId = 0
                 GeneratedAudio audio = tts.generate(t, 0, sp);
                 if (audio == null || audio.getSamples() == null || audio.getSamples().length == 0) {
                     Log.w(TAG, "Generated audio is empty");
@@ -122,7 +119,6 @@ final class TtsEngine {
         }
     }
 
-    /** ✅ توقف پخش فعلی */
     void stop() {
         AudioTrack t = currentTrack;
         if (t != null) {
@@ -134,7 +130,6 @@ final class TtsEngine {
         }
     }
 
-    /** ✅ آزادسازی کامل */
     void release() {
         if (released) return;
         released = true;
