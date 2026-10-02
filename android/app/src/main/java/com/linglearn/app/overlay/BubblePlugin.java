@@ -14,9 +14,9 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 @CapacitorPlugin(name = "BubblePlugin")
 public class BubblePlugin extends Plugin {
 
-    // موتور TTS مشترک برای استفاده از React
-    private static volatile TtsEngine sharedTts;
-    private static volatile String sharedTtsLang = null;
+    // ✅ موتور TTS مشترک (بدون private تا BubbleService هم بتونه استفاده کنه)
+    static volatile TtsEngine sharedTts;
+    static volatile String sharedTtsLang = null;
 
     @PluginMethod
     public void checkPermission(PluginCall call) {
@@ -42,6 +42,7 @@ public class BubblePlugin extends Plugin {
         call.resolve(ret);
     }
 
+    // showBubble({ targetLang?, sourceLang?, translationTone? })
     @PluginMethod
     public void showBubble(PluginCall call) {
         Context ctx = getContext();
@@ -63,6 +64,7 @@ public class BubblePlugin extends Plugin {
         call.resolve();
     }
 
+    // setLanguages({ targetLang?, sourceLang?, translationTone? })
     @PluginMethod
     public void setLanguages(PluginCall call) {
         BubbleService.saveLangs(getContext(), call.getString("targetLang"), call.getString("sourceLang"));
@@ -70,6 +72,7 @@ public class BubblePlugin extends Plugin {
         call.resolve();
     }
 
+    // setDisplayMode({ mode: "both"|"original"|"translation" })
     @PluginMethod
     public void setDisplayMode(PluginCall call) {
         BubbleService.saveDisplayMode(getContext(), call.getString("mode"));
@@ -83,7 +86,81 @@ public class BubblePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    // ============ TTS ============
+    // ================================================================
+    // ============ STT: مدل‌های تشخیص گفتار (Zipformer) ==============
+    // ================================================================
+
+    // checkModelStatus({ lang: "en" })
+    @PluginMethod
+    public void checkModelStatus(PluginCall call) {
+        Context ctx = getContext();
+        String lang = call.getString("lang", "en");
+        JSObject ret = new JSObject();
+        ret.put("supported", SherpaModelManager.isAvailable(lang));
+        ret.put("downloaded", SherpaModelManager.getModelDir(ctx, lang) != null);
+        ret.put("downloading", SherpaModelManager.isDownloading());
+        call.resolve(ret);
+    }
+
+    // downloadModel({ lang: "en" })
+    @PluginMethod
+    public void downloadModel(PluginCall call) {
+        final Context ctx = getContext();
+        final String lang = call.getString("lang", "en");
+
+        if (!SherpaModelManager.isAvailable(lang)) {
+            call.reject("STT not supported for language: " + lang);
+            return;
+        }
+        if (SherpaModelManager.getModelDir(ctx, lang) != null) {
+            JSObject ret = new JSObject();
+            ret.put("alreadyDownloaded", true);
+            call.resolve(ret);
+            return;
+        }
+
+        SherpaModelManager.downloadModel(ctx.getApplicationContext(), lang,
+                new SherpaModelManager.ProgressCallback() {
+                    @Override
+                    public void onProgress(String l, long done, long total) {
+                        JSObject ret = new JSObject();
+                        ret.put("lang", l);
+                        ret.put("bytes", done);
+                        ret.put("total", total);
+                        notifyListeners("modelDownloadProgress", ret);
+                    }
+
+                    @Override
+                    public void onDone(String l) {
+                        JSObject ret = new JSObject();
+                        ret.put("lang", l);
+                        notifyListeners("modelDownloadDone", ret);
+                    }
+
+                    @Override
+                    public void onError(String l, Exception e) {
+                        JSObject ret = new JSObject();
+                        ret.put("lang", l);
+                        ret.put("error", e.getMessage() != null ? e.getMessage() : "unknown");
+                        notifyListeners("modelDownloadError", ret);
+                    }
+                });
+
+        call.resolve();
+    }
+
+    // deleteModel({ lang: "en" })
+    @PluginMethod
+    public void deleteModel(PluginCall call) {
+        Context ctx = getContext();
+        String lang = call.getString("lang", "en");
+        SherpaModelManager.deleteModel(ctx, lang);
+        call.resolve();
+    }
+
+    // ================================================================
+    // ============ TTS: تبدیل متن به گفتار (Piper/VITS) ==============
+    // ================================================================
 
     // setTtsEnabled({ enabled: true })
     @PluginMethod
@@ -161,7 +238,7 @@ public class BubblePlugin extends Plugin {
     }
 
     /**
-     * ✅ متد اصلی: خواندن متن با TTS
+     * ✅ متد اصلی خواندن متن با TTS
      * speak({ text: "سلام", lang: "fa", speed: 1.0 })
      */
     @PluginMethod
@@ -176,7 +253,6 @@ public class BubblePlugin extends Plugin {
             return;
         }
 
-        // بررسی وجود مدل
         if (SherpaModelManager.getTtsModelDir(ctx, lang) == null) {
             call.reject("TTS model not downloaded for language: " + lang);
             return;
@@ -184,7 +260,6 @@ public class BubblePlugin extends Plugin {
 
         final float speed = (sp == null || sp <= 0) ? 1.0f : sp.floatValue();
 
-        // اگه موتور با همین زبان لود شده، استفاده کن. وگرنه لود کن.
         new Thread(() -> {
             try {
                 TtsEngine engine;
@@ -211,10 +286,26 @@ public class BubblePlugin extends Plugin {
         }, "tts-speak").start();
     }
 
-    /** ✅ توقف TTS (اگه بلند شد) */
+    /** ✅ توقف TTS */
     @PluginMethod
     public void stopSpeaking(PluginCall call) {
-        // AudioTrack خودش تموم می‌شه، ولی اگه خواستی می‌تونی یه متد stop اضافه کنی
+        TtsEngine engine = sharedTts;
+        if (engine != null) {
+            engine.stop();
+        }
+        call.resolve();
+    }
+
+    /** ✅ آزادسازی موتور (اختیاری) */
+    @PluginMethod
+    public void releaseTts(PluginCall call) {
+        synchronized (BubblePlugin.class) {
+            if (sharedTts != null) {
+                sharedTts.release();
+                sharedTts = null;
+                sharedTtsLang = null;
+            }
+        }
         call.resolve();
     }
 }
