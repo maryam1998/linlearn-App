@@ -72,6 +72,27 @@ final class SherpaModelManager {
                 "decoder-epoch-99-avg-1.onnx",
                 "joiner-epoch-99-avg-1.int8.onnx",
                 "tokens.txt"));
+        // کره‌ای: Zipformer جریانی رسمی k2-fsa (encoder/joiner به‌صورت int8؛ decoder فول)
+        m.put("ko", new Spec(
+                "k2-fsa/sherpa-onnx-streaming-zipformer-korean-2024-06-16",
+                "encoder-epoch-99-avg-1.int8.onnx",
+                "decoder-epoch-99-avg-1.onnx",
+                "joiner-epoch-99-avg-1.int8.onnx",
+                "tokens.txt"));
+        // روسی: Zipformer کوچکِ جریانیِ Vosk (فایل‌ها fp32 هستن، حدود ۹۵ مگ)
+        m.put("ru", new Spec(
+                "csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-2025-08-16",
+                "encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"));
+        // فرانسوی / آلمانی / اسپانیایی: مدل‌های جریانی Kroko (Zipformer2)
+        m.put("fr", new Spec(
+                "csukuangfj/sherpa-onnx-streaming-zipformer-fr-kroko-2025-08-06",
+                "encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"));
+        m.put("de", new Spec(
+                "csukuangfj/sherpa-onnx-streaming-zipformer-de-kroko-2025-08-06",
+                "encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"));
+        m.put("es", new Spec(
+                "csukuangfj/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06",
+                "encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"));
         SPECS = Collections.unmodifiableMap(m);
     }
 
