@@ -28,6 +28,7 @@ import java.util.List;
  */
 public class ModelDownloadService extends Service {
 
+    static final String ACTION_STOP = "com.linglearn.app.STOP_MODEL_DOWNLOAD";
     private static final String CHANNEL_ID = "model_download";
     private static final int NOTIF_ID = 4711;
     private static final int DONE_NOTIF_ID = 4712;
@@ -61,6 +62,11 @@ public class ModelDownloadService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && ACTION_STOP.equals(intent.getAction())) {
+            // دکمه‌ی «توقف» توی نوتیفیکیشن: همه‌ی دانلودها متوقف می‌شن (سرویس خودش بعدش خاموش می‌شه)
+            SherpaModelManager.cancelAllTtsDownloads();
+            return START_NOT_STICKY;
+        }
         createChannel();
         Notification n = buildNotification(Math.max(1, SherpaModelManager.getTtsDownloadingLangs().size()), 0);
         try {
@@ -95,11 +101,12 @@ public class ModelDownloadService extends Service {
             if (SherpaModelManager.getTtsModelDir(this, l) == null) { all = false; break; }
         }
         try { stopForeground(true); } catch (Throwable ignored) {}
+        if (!all) { stopSelf(); return; }
         try {
             NotificationCompat.Builder b = new NotificationCompat.Builder(this, CHANNEL_ID)
                     .setSmallIcon(android.R.drawable.stat_sys_download_done)
                     .setContentTitle("LingoLearn")
-                    .setContentText(all ? "دانلود صداها تمام شد" : "دانلود تمام شد؛ اگر صدایی ناقص مانده، دوباره دانلود کنید")
+                    .setContentText("دانلود صداها تمام شد")
                     .setAutoCancel(true)
                     .setContentIntent(openAppIntent());
             NotificationManagerCompat.from(this).notify(DONE_NOTIF_ID, b.build());
@@ -116,7 +123,15 @@ public class ModelDownloadService extends Service {
                 .setOnlyAlertOnce(true)
                 .setProgress(0, 0, true)
                 .setContentIntent(openAppIntent())
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "توقف", stopIntent())
                 .build();
+    }
+
+    private PendingIntent stopIntent() {
+        Intent i = new Intent(this, ModelDownloadService.class).setAction(ACTION_STOP);
+        int f = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= 23) f |= PendingIntent.FLAG_IMMUTABLE;
+        return PendingIntent.getService(this, 1, i, f);
     }
 
     private PendingIntent openAppIntent() {

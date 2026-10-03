@@ -16,7 +16,15 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -124,13 +132,44 @@ final class SherpaModelManager {
         TTS_SPECS = Collections.unmodifiableMap(m);
     }
 
-    private static final OkHttpClient HTTP = new OkHttpClient();
+    private static final OkHttpClient HTTP = new OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(25, TimeUnit.SECONDS)
+            .build();
     private static final AtomicBoolean DOWNLOADING = new AtomicBoolean(false);
     private static volatile boolean DOWNLOADING_STATE = false;
     // دانلودِ TTS برای هر زبان مستقله؛ چند زبان می‌تونن هم‌زمان دانلود بشن
     private static final Set<String> TTS_ACTIVE = ConcurrentHashMap.newKeySet();
     // espeak-ng-data بینِ همه‌ی زبان‌ها مشترکه؛ فقط یک نخ دانلودش می‌کنه، بقیه صبر می‌کنن
-    private static final Object ESPEAK_LOCK = new Object();
+    private static final ReentrantLock ESPEAK_LOCK = new ReentrantLock();
+    // زبان‌هایی که کاربر «توقف» رو زده؛ فایل .part نگه داشته می‌شه تا دفعه‌ی بعد ادامه پیدا کنه
+    private static final Set<String> TTS_CANCEL = ConcurrentHashMap.newKeySet();
+
+    /** پرتاب می‌شه وقتی کاربر دانلود رو متوقف کرده. */
+    static final class DownloadCancelled extends java.io.IOException {
+        DownloadCancelled() { super("cancelled"); }
+    }
+
+    static void cancelTtsDownload(String lang) {
+        String l = normalize(lang);
+        if (l != null && TTS_ACTIVE.contains(l)) TTS_CANCEL.add(l);
+    }
+
+    static void cancelAllTtsDownloads() {
+        TTS_CANCEL.addAll(TTS_ACTIVE);
+    }
+
+    private static void checkCancel(String l) throws DownloadCancelled {
+        if (l != null && TTS_CANCEL.contains(l)) throw new DownloadCancelled();
+    }
+
+    /** حجمِ بخشِ دانلودشده‌ی ناتمامِ مدلِ یه زبان (برای دکمه‌ی «ادامه»). */
+    static long getTtsPartialBytes(Context ctx, String lang) {
+        String l = normalize(lang);
+        if (l == null) return 0;
+        File part = new File(ttsDirFor(ctx, l), "model.onnx.part");
+        return part.isFile() ? part.length() : 0;
+    }
     // آخرین مقدارِ پیشرفتِ هر زبان (بایت) — برای نوتیفیکیشنِ سرویسِ دانلود
     private static final Map<String, Long> TTS_BYTES = new ConcurrentHashMap<>();
 
@@ -301,6 +340,7 @@ final class SherpaModelManager {
             // همین زبان همین الان در حال دانلوده؛ دوباره شروعش نمی‌کنیم
             return;
         }
+        TTS_CANCEL.remove(l);
         Thread t = new Thread(() -> {
             try {
                 Exception last = null;
@@ -316,19 +356,27 @@ final class SherpaModelManager {
                         });
                         last = null;
                         break;
+                    } catch (DownloadCancelled dc) {
+                        last = dc;
+                        break;
                     } catch (Exception e) {
                         last = e;
                         Log.w(TAG, "TTS download attempt " + attempt + " failed for " + l, e);
+                        if (TTS_CANCEL.contains(l)) { last = new DownloadCancelled(); break; }
                         try { Thread.sleep(1500L * attempt); } catch (InterruptedException ie) { break; }
                     }
                 }
                 if (last != null) {
-                    if (cb != null) cb.onError(l, last);
+                    if (cb != null) {
+                        if (last instanceof DownloadCancelled) cb.onError(l, last);
+                        else cb.onError(l, new Exception(last.getClass().getSimpleName() + ": " + last.getMessage(), last));
+                    }
                 } else {
                     if (cb != null) cb.onDone(l);
                 }
             } finally {
                 TTS_BYTES.remove(l);
+                TTS_CANCEL.remove(l);
                 TTS_ACTIVE.remove(l);
             }
         }, "sherpa-tts-download-" + l);
@@ -337,26 +385,36 @@ final class SherpaModelManager {
     }
 
     private static void downloadTtsOnce(Context app, String l, TtsSpec s, ProgressCallback cb) throws Exception {
-        // ۱. espeak-ng-data مشترک (فقط یک بار؛ بقیه‌ی زبان‌ها همین‌جا صبر می‌کنن تا تموم شه)
-        synchronized (ESPEAK_LOCK) {
-            if (!isEspeakReady(app)) {
-                downloadEspeakData(app, s.repo, cb, l);
-            }
-        }
-
         File dir = ttsDirFor(app, l);
         if (!dir.isDirectory() && !dir.mkdirs()) throw new java.io.IOException("cannot create " + dir);
 
-        // ۲. tokens.txt
+        // ۱. tokens.txt (کوچیکه)
+        checkCancel(l);
         File tokensTarget = new File(dir, "tokens.txt");
         if (!tokensTarget.isFile() || tokensTarget.length() == 0) {
             downloadFile(HF_BASE + s.repo + "/resolve/main/" + s.tokensFile, tokensTarget, cb, l);
         }
 
-        // ۳. model.onnx (بزرگ‌ترین فایل)
+        // ۲. model.onnx (بزرگ‌ترین فایل؛ از همین‌جا پیشرفت دیده می‌شه و از نقطه‌ی توقف ادامه پیدا می‌کنه)
+        checkCancel(l);
         File modelTarget = new File(dir, "model.onnx");
         if (!modelTarget.isFile() || modelTarget.length() == 0) {
             downloadFile(HF_BASE + s.repo + "/resolve/main/" + s.modelFile, modelTarget, cb, l);
+        }
+
+        // ۳. espeak-ng-data مشترک (فقط یک بار؛ زبان‌های دیگه همین‌جا صبر می‌کنن، ولی با امکانِ توقف)
+        if (!isEspeakReady(app)) {
+            while (!ESPEAK_LOCK.tryLock(500, TimeUnit.MILLISECONDS)) {
+                checkCancel(l);
+                if (isEspeakReady(app)) break;
+            }
+            if (ESPEAK_LOCK.isHeldByCurrentThread()) {
+                try {
+                    if (!isEspeakReady(app)) downloadEspeakData(app, s.repo, cb, l);
+                } finally {
+                    ESPEAK_LOCK.unlock();
+                }
+            }
         }
     }
 
@@ -375,6 +433,7 @@ final class SherpaModelManager {
         String next = HF_BASE + "api/models/" + repo + "/tree/main/espeak-ng-data?recursive=true";
         int guard = 0;
         while (next != null && guard++ < 20) {
+            checkCancel(l);
             Request req = new Request.Builder().url(next).build();
             try (Response r = HTTP.newCall(req).execute()) {
                 if (!r.isSuccessful() || r.body() == null) {
@@ -391,32 +450,69 @@ final class SherpaModelManager {
                         sizes.add(o.optLong("size", 0));
                     }
                 }
-                next = parseNextLink(r.header("Link"));
+                next = fixHost(parseNextLink(r.header("Link")));
             }
         }
         if (paths.isEmpty()) throw new java.io.IOException("espeak-ng-data list is empty");
 
-        long done = 0;
-        for (int i = 0; i < paths.size(); i++) {
-            String p = paths.get(i);
-            String rel = p.substring(prefix.length());
-            File target = new File(root, rel);
-            File parent = target.getParentFile();
-            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
-                throw new java.io.IOException("cannot create " + parent);
+        // فایل‌ها رو چندتا چندتا هم‌زمان می‌گیریم (صدها فایل کوچیکه؛ یکی‌یکی خیلی کند بود)
+        final AtomicLong done = new AtomicLong(0);
+        final long totalBytes = sumSizes(sizes);
+        ExecutorService ex = Executors.newFixedThreadPool(6);
+        try {
+            List<Future<Void>> futures = new ArrayList<>();
+            for (int i = 0; i < paths.size(); i++) {
+                final String p = paths.get(i);
+                final String rel = p.substring(prefix.length());
+                final File target = new File(root, rel);
+                final long expected = sizes.get(i);
+                File parent = target.getParentFile();
+                if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+                    throw new java.io.IOException("cannot create " + parent);
+                }
+                if (target.isFile() && (expected <= 0 || target.length() == expected)) {
+                    done.addAndGet(target.length());
+                    continue;
+                }
+                final String url = HF_BASE + repo + "/resolve/main/" + p;
+                futures.add(ex.submit(new Callable<Void>() {
+                    @Override public Void call() throws Exception {
+                        checkCancel(l);
+                        downloadFile(url, target, null, l);
+                        long now = done.addAndGet(target.length());
+                        if (cb != null) cb.onProgress(l, now, totalBytes);
+                        return null;
+                    }
+                }));
             }
-            long expected = sizes.get(i);
-            if (target.isFile() && (expected <= 0 || target.length() == expected)) {
-                done += target.length();
-                if (cb != null) cb.onProgress(l, done, -1);
-                continue;
+            for (Future<Void> f : futures) {
+                try {
+                    f.get();
+                } catch (ExecutionException ee) {
+                    Throwable c = ee.getCause();
+                    if (c instanceof Exception) throw (Exception) c;
+                    throw ee;
+                }
             }
-            downloadFile(HF_BASE + repo + "/resolve/main/" + p, target, null, l);
-            done += target.length();
-            if (cb != null) cb.onProgress(l, done, -1);
+        } finally {
+            ex.shutdownNow();
         }
         File marker = espeakMarker(app);
         if (!marker.exists() && !marker.createNewFile()) throw new java.io.IOException("cannot create marker");
+    }
+
+    private static long sumSizes(List<Long> sizes) {
+        long t = 0;
+        for (Long v : sizes) if (v != null) t += v;
+        return t;
+    }
+
+    /** لینکِ صفحه‌ی بعدیِ API ممکنه به huggingface.co اشاره کنه؛ همون مسیر رو روی آینه‌ی خودمون می‌خونیم. */
+    private static String fixHost(String url) {
+        if (url == null) return null;
+        int i = url.indexOf("/api/");
+        if (i < 0) return url;
+        return HF_BASE + url.substring(i + 1);
     }
 
     /** از هدرِ Link مقدارِ rel="next" رو درمیاره (یا null). */
@@ -432,25 +528,46 @@ final class SherpaModelManager {
         return null;
     }
 
+    /** دانلودِ فایل با امکانِ ادامه از نقطه‌ی توقف (Range) و توقفِ کاربر. */
     private static void downloadFile(String url, File target, ProgressCallback cb, String l) throws Exception {
         File part = new File(target.getParentFile(), target.getName() + ".part");
-        Request req = new Request.Builder().url(url).build();
-        try (Response r = HTTP.newCall(req).execute()) {
+        long existing = part.isFile() ? part.length() : 0;
+        Request.Builder rb = new Request.Builder().url(url);
+        if (existing > 0) rb.header("Range", "bytes=" + existing + "-");
+        try (Response r = HTTP.newCall(rb.build()).execute()) {
+            if (r.code() == 416) {
+                // بخشِ قبلی با فایلِ سرور نمی‌خونه؛ از اول می‌گیریم
+                part.delete();
+                downloadFile(url, target, cb, l);
+                return;
+            }
             if (!r.isSuccessful() || r.body() == null) {
                 throw new java.io.IOException("HTTP " + r.code() + " for " + target.getName());
             }
-            long done = 0;
+            boolean resumed = r.code() == 206 && existing > 0;
+            long base = resumed ? existing : 0;
+            long len = r.body().contentLength();
+            long total = len > 0 ? base + len : -1;
+            long done = base;
+            long lastEmit = 0;
             try (InputStream in = r.body().byteStream();
-                 OutputStream out = new FileOutputStream(part)) {
+                 OutputStream out = new FileOutputStream(part, resumed)) {
                 byte[] buf = new byte[64 * 1024];
                 int n;
                 while ((n = in.read(buf)) > 0) {
+                    checkCancel(l);
                     out.write(buf, 0, n);
                     done += n;
-                    if (cb != null) cb.onProgress(l, done, -1);
+                    if (cb != null) {
+                        long now = System.currentTimeMillis();
+                        if (now - lastEmit > 300) { lastEmit = now; cb.onProgress(l, done, total); }
+                    }
                 }
             }
+            if (cb != null) cb.onProgress(l, done, total);
+            if (total > 0 && part.length() != total) throw new java.io.IOException("incomplete download");
         }
+        if (target.exists()) target.delete();
         if (!part.renameTo(target)) throw new java.io.IOException("rename failed: " + target.getName());
     }
 

@@ -316,6 +316,7 @@ public class BubblePlugin extends Plugin {
             JSObject o = new JSObject();
             o.put("lang", l);
             o.put("downloaded", SherpaModelManager.getTtsModelDir(ctx, l) != null);
+            o.put("partialBytes", SherpaModelManager.getTtsPartialBytes(ctx, l));
             arr.put(o);
         }
         JSObject ret = new JSObject();
@@ -354,6 +355,7 @@ public class BubblePlugin extends Plugin {
                         JSObject ret = new JSObject();
                         ret.put("lang", l);
                         ret.put("bytes", done);
+                        ret.put("total", total);
                         notifyListeners("ttsModelDownloadProgress", ret);
                     }
 
@@ -368,11 +370,29 @@ public class BubblePlugin extends Plugin {
                     public void onError(String l, Exception e) {
                         JSObject ret = new JSObject();
                         ret.put("lang", l);
+                        if (e instanceof SherpaModelManager.DownloadCancelled) {
+                            notifyListeners("ttsModelDownloadCancelled", ret);
+                            return;
+                        }
                         ret.put("error", e.getMessage() != null ? e.getMessage() : "unknown");
                         notifyListeners("ttsModelDownloadError", ret);
                     }
                 });
 
+        call.resolve();
+    }
+
+    // cancelTtsDownload({ lang }) — توقفِ دانلودِ یه زبان (بخشِ دانلودشده می‌مونه و بعداً ادامه پیدا می‌کنه)
+    @PluginMethod
+    public void cancelTtsDownload(PluginCall call) {
+        SherpaModelManager.cancelTtsDownload(call.getString("lang", ""));
+        call.resolve();
+    }
+
+    // cancelAllTtsDownloads() — توقفِ همه‌ی دانلودها
+    @PluginMethod
+    public void cancelAllTtsDownloads(PluginCall call) {
+        SherpaModelManager.cancelAllTtsDownloads();
         call.resolve();
     }
 
