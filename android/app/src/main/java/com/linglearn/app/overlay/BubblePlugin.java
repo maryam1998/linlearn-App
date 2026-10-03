@@ -191,6 +191,56 @@ public class BubblePlugin extends Plugin {
     }
 
     // ================================================================
+    // ============ 📺 زیرنویس زنده‌ی یوتیوب (MediaSession) ===========
+    // ================================================================
+
+    // ytCheckAccess() → { granted }  — آیا «دسترسی به اعلان‌ها» برای این اپ روشنه؟
+    @PluginMethod
+    public void ytCheckAccess(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("granted", YtMedia.hasAccess(getContext()));
+        call.resolve(ret);
+    }
+
+    // ytRequestAccess() — صفحه‌ی تنظیماتِ «دسترسی به اعلان‌ها» رو باز می‌کنه
+    @PluginMethod
+    public void ytRequestAccess(PluginCall call) {
+        YtMedia.openAccessSettings(getContext());
+        JSObject ret = new JSObject();
+        ret.put("granted", YtMedia.hasAccess(getContext()));
+        call.resolve(ret);
+    }
+
+    // ytSetEnabled({ enabled, offsetMs? }) — حالت یوتیوبِ حباب رو روشن/خاموش می‌کنه.
+    // اگه حباب هنوز بالا نیومده (showBubble تازه صدا زده شده)، درخواست نگه داشته می‌شه.
+    @PluginMethod
+    public void ytSetEnabled(PluginCall call) {
+        Boolean enabled = call.getBoolean("enabled", true);
+        Double off = call.getDouble("offsetMs", 0.0);
+        BubbleService.setYoutubeEnabled(getContext(), enabled == null || enabled,
+                off == null ? 0L : off.longValue());
+        call.resolve();
+    }
+
+    // ytIsActive() → { active }
+    @PluginMethod
+    public void ytIsActive(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("active", BubbleService.youtubeActive());
+        call.resolve(ret);
+    }
+
+    // ytSeek({ ms }) — جلو/عقب بردنِ ویدیوی یوتیوب (از همان MediaController)
+    @PluginMethod
+    public void ytSeek(PluginCall call) {
+        Double ms = call.getDouble("ms");
+        if (ms == null) { call.reject("ms is required"); return; }
+        JSObject ret = new JSObject();
+        ret.put("ok", YtMedia.seek(ms.longValue()));
+        call.resolve(ret);
+    }
+
+    // ================================================================
     // ============ STT: مدل‌های تشخیص گفتار (Zipformer) ==============
     // ================================================================
 

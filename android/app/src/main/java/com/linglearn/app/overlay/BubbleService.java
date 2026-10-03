@@ -203,6 +203,7 @@ public class BubbleService extends Service {
         final BubbleService s = instance;
         if (s == null) return;
         s.main.post(() -> {
+            if (s.yt != null) s.yt.onSettingsChanged();
             s.prepareLocalTranslator();
             s.refreshHeader();
             for (Entry e : new ArrayList<>(s.history)) s.renderEntry(e);
@@ -234,6 +235,26 @@ public class BubbleService extends Service {
         return getSharedPreferences(PREFS, MODE_PRIVATE).getString("tone", "neutral");
     }
 
+    // ════════════════════════════════════════════════════════════════════════════
+    //  📺 حالت یوتیوب: زیرنویسِ ویدیوی در حالِ پخش (جدا از STT؛ منطقش در YtSubtitles/YtMedia)
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /** اگه showBubble هنوز سرویس رو بالا نیاورده، درخواستِ روشن‌شدن همین‌جا نگه داشته می‌شه. */
+    private static volatile boolean pendingYt = false;
+
+    /** از BubblePlugin.ytSetEnabled: حالتِ یوتیوب رو روشن/خاموش می‌کنه. offsetMs = جابه‌جایی زمانِ زیرنویس. */
+    static void setYoutubeEnabled(Context ctx, boolean on, long offsetMs) {
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putLong("ytOffsetMs", offsetMs).apply();
+        final BubbleService s = instance;
+        if (s == null) { pendingYt = on; return; }
+        s.main.post(() -> { if (on) s.startYoutube(true); else s.stopYoutube(true); });
+    }
+
+    static boolean youtubeActive() {
+        BubbleService s = instance;
+        return s != null && s.yt != null && s.yt.isActive();
+    }
+
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService net = Executors.newSingleThreadExecutor();
     private final ExecutorService netTr = Executors.newFixedThreadPool(3);
@@ -257,6 +278,9 @@ public class BubbleService extends Service {
     private boolean userHidden = false;   // user closed the panel with the X: do not pop it up again until tapped
     private final ArrayList<Entry> history = new ArrayList<>();   // every sentence heard in this session (main thread only)
     private Entry live;                   // sentence currently being spoken (partial result)
+    private YtSubtitles yt;               // 📺 حالت یوتیوب (null = خاموش)
+    private TextView tvYt;                // دکمه‌ی ▶ در هدرِ پنل
+    private final HashMap<Integer, Entry> ytEntries = new HashMap<>();   // شماره‌ی خطِ زیرنویس -> ردیفِ روی پنل
     private int reqCounter = 0;           // monotonically increasing translation request id
     private final Runnable hidePanel = this::removePanel;
 
@@ -320,6 +344,7 @@ public class BubbleService extends Service {
             running = true;
             addBubbleIfNeeded();
             prepareLocalTranslator();
+            if (pendingYt) { pendingYt = false; main.post(() -> startYoutube(true)); }
         }
         return START_NOT_STICKY;
     }
@@ -597,6 +622,9 @@ public class BubbleService extends Service {
         tvHeader.setTypeface(Typeface.DEFAULT_BOLD);
         tvHeader.setSingleLine(true);
         header.addView(tvHeader, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        tvYt = headerButton("\u25B6", v -> toggleYoutube());
+        header.addView(tvYt);
+        updateYtButton();
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
         header.addView(headerButton("\u2715", v -> { userHidden = true; removePanel(); }));
         panel.addView(header, new LinearLayout.LayoutParams(
@@ -646,7 +674,9 @@ public class BubbleService extends Service {
 
     private void refreshHeader() {
         if (tvHeader == null) return;
-        StringBuilder sb = new StringBuilder(msg("\uD83C\uDF99 ترجمه‌ی زنده", "\uD83C\uDF99 Live translation"));
+        StringBuilder sb = (yt != null && yt.isActive())
+                ? new StringBuilder(msg("\u25B6 زیرنویس یوتیوب", "\u25B6 YouTube subtitles"))
+                : new StringBuilder(msg("\uD83C\uDF99 ترجمه‌ی زنده", "\uD83C\uDF99 Live translation"));
         List<String> ts = activeTargets();
         for (int i = 0; i < ts.size(); i++) {
             sb.append(i == 0 ? "  \u00B7  " : " / ").append(ts.get(i).toUpperCase(Locale.ROOT));
@@ -998,6 +1028,97 @@ public class BubbleService extends Service {
         }
         return translate(text, ctxPrev, tgt);
     }
+
+    // ───────── 📺 حالت یوتیوب: روشن/خاموش و اتصال به پنل ─────────
+
+    private void toggleYoutube() {
+        if (yt != null && yt.isActive()) stopYoutube(true);
+        else startYoutube(true);
+    }
+
+    private void updateYtButton() {
+        if (tvYt == null) return;
+        boolean on = yt != null && yt.isActive();
+        tvYt.setTextColor(on ? COLOR_GOLD : Color.WHITE);
+        tvYt.setAlpha(on ? 1f : 0.6f);
+    }
+
+    private void startYoutube(boolean openSettingsIfNeeded) {
+        if (wm == null || bubble == null) return;
+        if (yt != null && yt.isActive()) return;
+        userHidden = false;
+        if (!YtMedia.hasAccess(this)) {
+            showNotice(msg("برای زیرنویس یوتیوب، «دسترسی به اعلان‌ها» را برای این برنامه روشن کن و دوباره ▶ را بزن",
+                    "For YouTube subtitles, turn on “Notification access” for this app, then tap ▶ again"));
+            if (openSettingsIfNeeded) YtMedia.openAccessSettings(this);
+            return;
+        }
+        if (recording) stopRecording();     // دو منبعِ هم‌زمان روی یک پنل نباشه
+        YtSubtitles engine = new YtSubtitles(this, ytHost, WORKER_BASE, HTTP_FAST);
+        engine.setOffsetMs(getSharedPreferences(PREFS, MODE_PRIVATE).getLong("ytOffsetMs", 0L));
+        if (!engine.start()) {
+            engine.stop();
+            showNotice(msg("دسترسی به اعلان‌ها هنوز فعال نیست", "Notification access is not enabled yet"));
+            if (openSettingsIfNeeded) YtMedia.openAccessSettings(this);
+            return;
+        }
+        yt = engine;
+        ytEntries.clear();
+        refreshHeader();
+        updateYtButton();
+        showNotice(msg("زیرنویس یوتیوب روشن شد؛ ویدیو را پخش کن", "YouTube subtitles on — play a video"));
+    }
+
+    private void stopYoutube(boolean notify) {
+        YtSubtitles engine = yt;
+        yt = null;
+        ytEntries.clear();
+        if (engine != null) { try { engine.stop(); } catch (Throwable ignored) {} }
+        if (engine == null) return;
+        refreshHeader();
+        updateYtButton();
+        if (notify) showNotice(msg("زیرنویس یوتیوب خاموش شد", "YouTube subtitles off"));
+    }
+
+    private final YtSubtitles.Host ytHost = new YtSubtitles.Host() {
+        @Override public List<String> targets() { return activeTargets(); }
+        @Override public String requestedSource() { return effectiveSource(); }
+        @Override public String tone() { return BubbleService.this.tone(); }
+        @Override public String langName(String code) {
+            String n = LANG_NAMES.get(code);
+            return n != null ? n : code;
+        }
+        @Override public boolean fa() { return isFa(); }
+
+        @Override public void notice(String m) {
+            if (m == null || m.isEmpty()) { clearStatus(); return; }
+            showNotice(m);
+        }
+
+        @Override public void show(int idx, String src, Map<String, String> tr, boolean reset) {
+            if (wm == null || bubble == null) return;
+            if (reset) { clearHistory(); ytEntries.clear(); }
+            clearStatus();
+            Entry e = newEntry();
+            e.src = src;
+            for (Map.Entry<String, String> x : tr.entrySet()) {
+                e.tr.put(x.getKey(), x.getValue());
+                e.trSrc.put(x.getKey(), src);
+            }
+            ytEntries.put(idx, e);
+            for (java.util.Iterator<Integer> it = ytEntries.keySet().iterator(); it.hasNext(); ) {
+                if (it.next() < idx - 80) it.remove();
+            }
+            renderEntry(e);
+            afterChange();
+        }
+
+        @Override public void update(int idx, String lang, String text) {
+            Entry e = ytEntries.get(idx);
+            if (e == null) return;
+            setTranslation(e, lang, text, e.src);
+        }
+    };
 
     private void setRecordingUi(boolean rec) {
         if (bubbleBg == null) return;
@@ -1646,6 +1767,8 @@ public class BubbleService extends Service {
 
     private void cleanup() {
         running = false;
+        pendingYt = false;
+        stopYoutube(false);
         main.removeCallbacksAndMessages(null);
         closeLocalTranslator();
         recording = false;
