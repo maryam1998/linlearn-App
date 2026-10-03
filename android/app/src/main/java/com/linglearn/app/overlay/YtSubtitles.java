@@ -111,6 +111,8 @@ final class YtSubtitles {
     private int shownIdx = -1;
     private int tickCount = 0;
     private volatile long offsetMs = 0;
+    private final java.util.TreeSet<Integer> shown = new java.util.TreeSet<>();   // خط‌هایی که واقعاً روی پنل نمایش داده شدند (برای ذخیره)
+    private String curVideoId = "";
 
     YtSubtitles(Context ctx, Host host, String workerBase, OkHttpClient httpFast) {
         this.app = ctx.getApplicationContext();
@@ -129,6 +131,44 @@ final class YtSubtitles {
     boolean isActive() { return active; }
 
     void setOffsetMs(long ms) { offsetMs = ms; }
+
+    /**
+     * 💾 عکسِ فوریِ جلسه برای ذخیره در «داستان‌های ذخیره‌شده»: همه‌ی خط‌هایی که تا الان نمایش داده شده‌اند
+     * (به ترتیبِ زمان) + ترجمه‌هایی که تا الان رسیده + لینکِ ویدیو. null = هنوز چیزی برای ذخیره نیست.
+     * فقط روی main thread صدا بزن.
+     */
+    JSONObject snapshot() throws Exception {
+        if (cues.isEmpty() || shown.isEmpty() || curVideoId.isEmpty()) return null;
+        List<String> ls = langs();
+        JSONArray lines = new JSONArray();
+        for (int idx : shown) {
+            if (idx < 0 || idx >= cues.size()) continue;
+            Cue c = cues.get(idx);
+            JSONObject tr = new JSONObject();
+            for (String lang : ls) {
+                String[] a = trs.get(lang);
+                if (a != null && idx < a.length && a[idx] != null && !a[idx].trim().isEmpty()) tr.put(lang, a[idx]);
+            }
+            lines.put(new JSONObject().put("t", c.startMs / 1000.0).put("s", c.text).put("tr", tr));
+        }
+        if (lines.length() == 0) return null;
+        long now = System.currentTimeMillis();
+        java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+        fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        String iso = fmt.format(new java.util.Date(now));
+        YtMedia.State s = last;
+        return new JSONObject()
+                .put("key", curVideoId)
+                .put("videoId", curVideoId)
+                .put("url", "https://youtu.be/" + curVideoId)
+                .put("title", curTitle)
+                .put("channel", s == null || s.channel == null ? "" : s.channel)
+                .put("lang", trackLang)
+                .put("targets", new JSONArray(ls))
+                .put("rev", now)
+                .put("savedAt", iso)
+                .put("lines", lines);
+    }
 
     /** false = «دسترسی به اعلان‌ها» داده نشده. */
     boolean start() {
@@ -226,11 +266,14 @@ final class YtSubtitles {
         trs.clear(); done.clear(); fails.clear(); quickAsked.clear();
         chunkBusy = false;
         shownIdx = -1;
+        shown.clear();
+        curVideoId = "";
     }
 
     private void loadCaptions(final String videoId, final String title) {
         resetVideo();
         curTitle = title == null ? "" : title;
+        curVideoId = videoId;
         final int g = gen;
         String want = host.requestedSource();
         if (want == null || want.isEmpty() || "auto".equals(want)) want = "en";
@@ -314,6 +357,7 @@ final class YtSubtitles {
         if (idx >= 0 && idx != shownIdx) {
             boolean reset = shownIdx < 0 || idx < shownIdx || idx - shownIdx > 3;   // seek یا شروع
             shownIdx = idx;
+            shown.add(idx);
             Cue c = cues.get(idx);
             HashMap<String, String> tr = new HashMap<>();
             for (String lang : langs()) {

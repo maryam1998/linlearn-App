@@ -230,6 +230,23 @@ public class BubblePlugin extends Plugin {
         call.resolve(ret);
     }
 
+    // ytSavedList() → { items: [...] } — زیرنویس‌های ذخیره‌شده از حباب که هنوز وارد اپ نشده‌اند
+    @PluginMethod
+    public void ytSavedList(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("items", YtSaved.list(getContext()));
+        call.resolve(ret);
+    }
+
+    // ytSavedAck({ items: [{ key, rev }] }) — بعد از واردشدن به اپ، از صف پاک می‌شوند
+    @PluginMethod
+    public void ytSavedAck(PluginCall call) {
+        try {
+            YtSaved.ack(getContext(), call.getArray("items"));
+        } catch (Exception ignored) {}
+        call.resolve();
+    }
+
     // ytSeek({ ms }) — جلو/عقب بردنِ ویدیوی یوتیوب (از همان MediaController)
     @PluginMethod
     public void ytSeek(PluginCall call) {

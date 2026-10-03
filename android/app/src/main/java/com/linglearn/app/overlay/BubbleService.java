@@ -280,6 +280,9 @@ public class BubbleService extends Service {
     private Entry live;                   // sentence currently being spoken (partial result)
     private YtSubtitles yt;               // 📺 حالت یوتیوب (null = خاموش)
     private TextView tvYt;                // دکمه‌ی ▶ در هدرِ پنل
+    private TextView tvSave;              // دکمه‌ی 💾 (هم حالت یوتیوب، هم ترجمه‌ی زنده)
+    private String liveKey = null;        // شناسه‌ی جلسه‌ی ترجمه‌ی زنده برای ذخیره (با پاک کردنِ تاریخچه ریست می‌شود)
+    private long liveStartMs = 0;
     private final HashMap<Integer, Entry> ytEntries = new HashMap<>();   // شماره‌ی خطِ زیرنویس -> ردیفِ روی پنل
     private int reqCounter = 0;           // monotonically increasing translation request id
     private final Runnable hidePanel = this::removePanel;
@@ -561,6 +564,7 @@ public class BubbleService extends Service {
     /** One recognised sentence and its translations (one per target language). */
     private static final class Entry {
         String src = "";
+        final long createdAt = System.currentTimeMillis();
         final HashMap<String, String> tr = new HashMap<>();        // lang -> shown text ("…" = pending)
         final HashMap<String, String> trSrc = new HashMap<>();     // lang -> source text that translation was made from
         final HashMap<String, Integer> applied = new HashMap<>();  // lang -> id of the newest request applied (drops stale answers)
@@ -624,6 +628,8 @@ public class BubbleService extends Service {
         header.addView(tvHeader, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         tvYt = headerButton("\u25B6", v -> toggleYoutube());
         header.addView(tvYt);
+        tvSave = headerButton("\uD83D\uDCBE", v -> saveCurrent());
+        header.addView(tvSave);
         updateYtButton();
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
         header.addView(headerButton("\u2715", v -> { userHidden = true; removePanel(); }));
@@ -754,6 +760,7 @@ public class BubbleService extends Service {
 
     private void clearHistory() {
         history.clear();
+        liveKey = null;
         live = null;
         if (listBox != null) listBox.removeAllViews();
         lastFinalText = "";
@@ -1041,6 +1048,77 @@ public class BubbleService extends Service {
         boolean on = yt != null && yt.isActive();
         tvYt.setTextColor(on ? COLOR_GOLD : Color.WHITE);
         tvYt.setAlpha(on ? 1f : 0.6f);
+        if (tvSave != null) tvSave.setVisibility(View.VISIBLE);
+    }
+
+    private void saveCurrent() {
+        if (yt != null && yt.isActive()) saveYoutube();
+        else saveLive();
+    }
+
+    /** 💾 ترجمه‌ی زنده (صوتِ پخش‌شده از هر پلیر/برنامه): همه‌ی جمله‌های تاریخچه + ترجمه‌ها → «داستان‌های ذخیره‌شده». */
+    private void saveLive() {
+        try {
+            final String offFa = "ترجمه در دسترس نیست (آفلاین)", offEn = "No translation (offline)";
+            final List<String> ts = activeTargets();
+            if (history.isEmpty()) { showNotice(msg("هنوز چیزی برای ذخیره نیست", "Nothing to save yet")); return; }
+            if (liveKey == null) {
+                liveStartMs = history.get(0).createdAt;
+                liveKey = "live-" + liveStartMs;
+            }
+            JSONArray lines = new JSONArray();
+            for (Entry e : new ArrayList<>(history)) {
+                if (e == live || e.src == null || e.src.trim().isEmpty()) continue;   // جمله‌ی نیمه‌کاره/خالی
+                JSONObject tr = new JSONObject();
+                for (String t : ts) {
+                    String v = e.tr.get(t);
+                    if (v == null || v.trim().isEmpty() || v.equals("…") || v.equals(offFa) || v.equals(offEn)) continue;
+                    tr.put(t, v);
+                }
+                lines.put(new JSONObject().put("t", Math.max(0, e.createdAt - liveStartMs) / 1000.0)
+                        .put("s", e.src.trim()).put("tr", tr));
+            }
+            if (lines.length() == 0) { showNotice(msg("هنوز چیزی برای ذخیره نیست", "Nothing to save yet")); return; }
+            long now = System.currentTimeMillis();
+            java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+            fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+            String src = effectiveSource();
+            JSONObject item = new JSONObject()
+                    .put("key", liveKey)
+                    .put("live", true)
+                    .put("title", msg("ترجمه‌ی زنده", "Live translation"))
+                    .put("lang", src == null || "auto".equals(src) ? "en" : src)
+                    .put("targets", new JSONArray(ts))
+                    .put("rev", now)
+                    .put("savedAt", fmt.format(new java.util.Date(now)))
+                    .put("lines", lines);
+            boolean ok = YtSaved.add(this, item);
+            showNotice(ok
+                    ? msg("ذخیره شد ✓ (" + lines.length() + " خط) — در «داستان‌های ذخیره‌شده» اپ", "Saved ✓ (" + lines.length() + " lines) — see Saved stories in the app")
+                    : msg("ذخیره نشد", "Save failed"));
+        } catch (Throwable t) {
+            showNotice(msg("ذخیره نشد", "Save failed"));
+        }
+    }
+
+    /** 💾 زیرنویس + ترجمه‌ی نمایش‌داده‌شده + لینکِ ویدیو → «داستان‌های ذخیره‌شده»ی اپ. */
+    private void saveYoutube() {
+        YtSubtitles engine = yt;
+        if (engine == null || !engine.isActive()) return;
+        try {
+            JSONObject snap = engine.snapshot();
+            if (snap == null) {
+                showNotice(msg("هنوز زیرنویسی برای ذخیره نیست", "Nothing to save yet"));
+                return;
+            }
+            int n = snap.getJSONArray("lines").length();
+            boolean ok = YtSaved.add(this, snap);
+            showNotice(ok
+                    ? msg("ذخیره شد ✓ (" + n + " خط) — در «داستان‌های ذخیره‌شده» اپ", "Saved ✓ (" + n + " lines) — see Saved stories in the app")
+                    : msg("ذخیره نشد", "Save failed"));
+        } catch (Throwable t) {
+            showNotice(msg("ذخیره نشد", "Save failed"));
+        }
     }
 
     private void startYoutube(boolean openSettingsIfNeeded) {
