@@ -172,6 +172,7 @@ public class BubblePlugin extends Plugin {
             return;
         }
         BubbleService.saveLangs(ctx, call.getString("targetLang"), call.getString("sourceLang"));
+        BubbleService.saveTargets(ctx, targetsCsv(call));
         BubbleService.saveTone(ctx, call.getString("translationTone"));
         Intent i = new Intent(ctx, BubbleService.class).setAction(BubbleService.ACTION_SHOW);
         ctx.startForegroundService(i);
@@ -185,18 +186,36 @@ public class BubblePlugin extends Plugin {
         call.resolve();
     }
 
-    // setLanguages({ targetLang?, sourceLang?, translationTone? })
+    // setLanguages({ targetLang?, targetLangs?: string[], sourceLang?, translationTone? })
+    //   targetLang  = UI language (messages), targetLangs = every translation language the user picked
     @PluginMethod
     public void setLanguages(PluginCall call) {
         BubbleService.saveLangs(getContext(), call.getString("targetLang"), call.getString("sourceLang"));
+        BubbleService.saveTargets(getContext(), targetsCsv(call));
         BubbleService.saveTone(getContext(), call.getString("translationTone"));
+        BubbleService.settingsChanged();
         call.resolve();
+    }
+
+    /** "fa,fr,ar" from the optional targetLangs array (null when the caller did not send one). */
+    private static String targetsCsv(PluginCall call) {
+        JSArray arr = call.getArray("targetLangs");
+        if (arr == null) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < arr.length(); i++) {
+            String s = arr.optString(i, "").trim();
+            if (s.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(',');
+            sb.append(s);
+        }
+        return sb.toString();
     }
 
     // setDisplayMode({ mode: "both"|"original"|"translation" })
     @PluginMethod
     public void setDisplayMode(PluginCall call) {
         BubbleService.saveDisplayMode(getContext(), call.getString("mode"));
+        BubbleService.settingsChanged();
         call.resolve();
     }
 
