@@ -4,31 +4,87 @@ import android.content.Context;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioTrack;
+import android.os.Build;
+import android.os.Process;
+import android.os.SystemClock;
 import android.util.Log;
 
-import com.k2fsa.sherpa.onnx.GeneratedAudio;
 import com.k2fsa.sherpa.onnx.OfflineTts;
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig;
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig;
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
+/**
+ * موتور TTS (Piper/VITS) — نسخه‌ی سریع:
+ *  - پخشِ استریم: همین‌که اولین تکه‌ی صدا ساخته شد پخش شروع می‌شه (منتظرِ ساختنِ کلِ جمله نمی‌مونه)
+ *  - AudioTrack هم‌زمان با تولیدِ صدا ساخته می‌شه (نه بعد از اون)
+ *  - prefetch: جمله‌ی بعدی پیش‌پیش، موقعِ پخشِ جمله‌ی فعلی ساخته و کش می‌شه
+ *  - کشِ صدا: تکرارِ یه جمله (یا A-B) فوری و بدونِ محاسبه‌ی دوباره پخش می‌شه
+ *  - warmUp: اولین inference (که کنده) قبل از اولین تپ انجام می‌شه
+ */
 final class TtsEngine {
 
     private static final String TAG = "TtsEngine";
+    private static final int CACHE_MAX = 8;
+    private static final short[] END = new short[0];
+
+    /** نتیجه‌ی پخش: ok=false یعنی شکستِ واقعی (برای fallback)؛ لغو شدن ok=true حساب می‌شه. */
+    interface DoneCallback { void onDone(boolean ok); }
+
+    private interface Sink { boolean accept(float[] samples); } // false → توقفِ تولید
 
     private final OfflineTts tts;
     private final int sampleRate;
-    private volatile boolean released = false;
-    private volatile AudioTrack currentTrack = null;
-    // با هر stop() بالا می‌ره؛ speak هایی که قبل از stop شروع شدن پخش نمی‌شن
-    private volatile int epoch = 0;
+    private final String lang;
 
-    private TtsEngine(OfflineTts tts, int sampleRate) {
+    private volatile boolean released = false;
+    private volatile long lastUsed = SystemClock.uptimeMillis();
+    private volatile AudioTrack currentTrack = null;
+    private volatile String inflightPrefetchKey = null;
+    private final AtomicBoolean warmed = new AtomicBoolean(false);
+    // با هر stop()/speak ی جدید بالا می‌ره؛ پخش‌های قدیمی خودشون رو متوقف می‌کنن
+    private final AtomicInteger epoch = new AtomicInteger(0);
+    // با هر speak ی غیرِ هم‌کلید بالا می‌ره؛ prefetch های در صف/در حالِ اجرا کنسل می‌شن
+    private final AtomicInteger pfAbort = new AtomicInteger(0);
+
+    private final LinkedHashMap<String, float[]> cache =
+            new LinkedHashMap<String, float[]>(16, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, float[]> e) {
+                    return size() > CACHE_MAX;
+                }
+            };
+
+    // تولیدِ صدا فقط روی یک thread (OfflineTts thread-safe نیست)
+    private final ExecutorService genExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(() -> {
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO); } catch (Throwable ignored) {}
+            r.run();
+        }, "tts-gen");
+        t.setDaemon(true);
+        return t;
+    });
+
+    private TtsEngine(OfflineTts tts, int sampleRate, String lang) {
         this.tts = tts;
         this.sampleRate = sampleRate;
+        this.lang = lang;
     }
+
+    String lang() { return lang; }
+    boolean isReleased() { return released; }
+    long lastUsed() { return lastUsed; }
+    void touch() { lastUsed = SystemClock.uptimeMillis(); }
 
     static TtsEngine create(Context ctx, String lang) {
         File dir = SherpaModelManager.getTtsModelDir(ctx, lang);
@@ -37,80 +93,230 @@ final class TtsEngine {
             return null;
         }
         try {
+            long t0 = SystemClock.uptimeMillis();
             OfflineTtsVitsModelConfig vitsConfig = new OfflineTtsVitsModelConfig();
             vitsConfig.setModel(new File(dir, "model.onnx").getAbsolutePath());
             vitsConfig.setTokens(new File(dir, "tokens.txt").getAbsolutePath());
-            vitsConfig.setDataDir(new File(dir, "espeak-ng-data").getAbsolutePath());
+            // espeak-ng-dataِ مشترکِ همه‌ی مدل‌ها (یک بار دانلود می‌شه)
+            vitsConfig.setDataDir(SherpaModelManager.getEspeakDataDir(ctx).getAbsolutePath());
+
+            int cores = Runtime.getRuntime().availableProcessors();
+            int threads = Math.max(2, Math.min(4, cores / 2));
 
             OfflineTtsModelConfig modelConfig = new OfflineTtsModelConfig();
             modelConfig.setVits(vitsConfig);
-            modelConfig.setNumThreads(2);
+            modelConfig.setNumThreads(threads);
             modelConfig.setDebug(false);
 
             OfflineTtsConfig config = new OfflineTtsConfig();
             config.setModel(modelConfig);
 
             OfflineTts engine = new OfflineTts(null, config);
-            // ✅ نرخ نمونه‌برداری استاندارد Piper/VITS medium
-            int sr = 22050;
-            Log.i(TAG, "TTS loaded for " + lang + ", sampleRate=" + sr);
-            return new TtsEngine(engine, sr);
+            // نرخ نمونه‌برداری رو از خودِ مدل بخون (مدل‌های Piper همه ۲۲۰۵۰ نیستن)
+            int sr = engine.sampleRate();
+            if (sr <= 0) sr = 22050;
+            Log.i(TAG, "TTS loaded for " + lang + ", sampleRate=" + sr + ", threads=" + threads
+                    + ", loadMs=" + (SystemClock.uptimeMillis() - t0));
+            return new TtsEngine(engine, sr, lang);
         } catch (Throwable e) {
             Log.e(TAG, "Failed to load TTS for " + lang, e);
             return null;
         }
     }
 
+    /** یک inference کوچیکِ بی‌صدا تا اولین تپِ واقعی کند نباشه. یک‌بار اجرا می‌شه. */
+    void warmUp() {
+        if (released || !warmed.compareAndSet(false, true)) return;
+        final String w;
+        switch (lang == null ? "" : lang) {
+            case "fa": w = "سلام"; break;
+            case "ar": w = "مرحبا"; break;
+            case "ru": w = "привет"; break;
+            case "zh": w = "你好"; break;
+            case "hi": w = "नमस्ते"; break;
+            default:   w = "Hello."; break;
+        }
+        try {
+            genExec.execute(() -> {
+                if (released) return;
+                try {
+                    long t0 = SystemClock.uptimeMillis();
+                    tts.generate(w, 0, 1.0f);
+                    Log.i(TAG, "warmUp " + lang + " ms=" + (SystemClock.uptimeMillis() - t0));
+                } catch (Throwable e) {
+                    Log.w(TAG, "warmUp failed", e);
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    // ================= کش =================
+    private static String keyOf(String t, float sp) { return sp + "|" + t; }
+
+    private float[] cacheGet(String key) {
+        synchronized (cache) { return cache.get(key); }
+    }
+    private boolean cacheHas(String key) {
+        synchronized (cache) { return cache.containsKey(key); }
+    }
+    private void cachePut(String key, float[] v) {
+        if (v == null || v.length == 0) return;
+        synchronized (cache) { cache.put(key, v); }
+    }
+
+    private static short[] toPcm16(float[] samples) {
+        short[] pcm = new short[samples.length];
+        for (int i = 0; i < samples.length; i++) {
+            float s = samples[i];
+            if (s > 1f) s = 1f; else if (s < -1f) s = -1f;
+            pcm[i] = (short) (s * 32767);
+        }
+        return pcm;
+    }
+
+    /** تولیدِ استریم؛ sink برای هر تکه صدا زده می‌شه. اگه sink false بده، null برمی‌گرده (لغو). */
+    private float[] synth(String t, float sp, final Sink sink) {
+        final ArrayList<float[]> parts = new ArrayList<>();
+        final boolean[] aborted = {false};
+        tts.generateWithCallback(t, 0, sp, samples -> {
+            if (samples == null || samples.length == 0) return 1;
+            float[] copy = samples.clone();
+            parts.add(copy);
+            if (!sink.accept(copy)) {
+                aborted[0] = true;
+                return 0;
+            }
+            return 1;
+        });
+        if (aborted[0]) return null;
+        int total = 0;
+        for (float[] p : parts) total += p.length;
+        float[] merged = new float[total];
+        int off = 0;
+        for (float[] p : parts) {
+            System.arraycopy(p, 0, merged, off, p.length);
+            off += p.length;
+        }
+        return merged;
+    }
+
+    // ================= prefetch =================
+    /** صدای این متن رو پیش‌پیش می‌سازه و کش می‌کنه (برای جمله‌ی بعدی). */
+    void prefetch(String text, float speed) {
+        if (released || text == null || text.trim().isEmpty()) return;
+        final String t = text.trim();
+        final float sp = (speed <= 0f) ? 1.0f : speed;
+        final String key = keyOf(t, sp);
+        if (cacheHas(key)) return;
+        final int g = pfAbort.get();
+        try {
+            genExec.execute(() -> {
+                if (released || pfAbort.get() != g || cacheHas(key)) return;
+                inflightPrefetchKey = key;
+                try {
+                    float[] audio = synth(t, sp, s -> !released && pfAbort.get() == g);
+                    if (audio != null) cachePut(key, audio);
+                } catch (Throwable e) {
+                    Log.w(TAG, "prefetch failed", e);
+                } finally {
+                    inflightPrefetchKey = null;
+                }
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    // ================= پخش =================
     /**
-     * خواندن متن؛ onDone بعد از تمام‌شدنِ پخش (یا شکست/لغو) دقیقاً یک‌بار صدا زده می‌شه.
+     * خواندن متن؛ cb دقیقاً یک‌بار، بعد از تمام‌شدنِ واقعیِ پخش (یا شکست/لغو) صدا زده می‌شه.
      */
-    void speak(String text, float speed, Runnable onDone) {
-        if (released || text == null || text.trim().isEmpty()) {
-            if (onDone != null) onDone.run();
+    void speakAsync(String text, float speed, final DoneCallback cb) {
+        if (text == null || text.trim().isEmpty()) {
+            if (cb != null) cb.onDone(true);
+            return;
+        }
+        if (released) {
+            if (cb != null) cb.onDone(false);
             return;
         }
         final String t = text.trim();
         final float sp = (speed <= 0f) ? 1.0f : speed;
-        final int myEpoch = epoch;
-        new Thread(() -> {
-            try {
-                GeneratedAudio audio = tts.generate(t, 0, sp);
-                // اگه وسطِ تولیدِ صدا stop() صدا زده شده بود، دیگه پخش نکن
-                if (released || myEpoch != epoch) {
-                    if (onDone != null) onDone.run();
-                    return;
-                }
-                if (audio == null || audio.getSamples() == null || audio.getSamples().length == 0) {
-                    Log.w(TAG, "Generated audio is empty");
-                    if (onDone != null) onDone.run();
-                    return;
-                }
-                playPcm(audio.getSamples(), onDone);
-            } catch (Throwable e) {
-                Log.e(TAG, "TTS generate failed", e);
-                if (onDone != null) onDone.run();
-            }
-        }, "tts-speak").start();
+        final String key = keyOf(t, sp);
+        touch();
+
+        // اگه prefetchِ در حالِ اجرا مالِ همین متن نیست، کنسلش کن تا این پخش معطل نشه
+        if (!key.equals(inflightPrefetchKey)) pfAbort.incrementAndGet();
+        haltPlayback();
+        final int myEpoch = epoch.get();
+
+        final LinkedBlockingQueue<short[]> q = new LinkedBlockingQueue<>();
+        final AtomicBoolean genFailed = new AtomicBoolean(false);
+        final AtomicBoolean gotAudio = new AtomicBoolean(false);
+        final AtomicBoolean fired = new AtomicBoolean(false);
+        final DoneCallback once = ok -> {
+            if (fired.compareAndSet(false, true) && cb != null) cb.onDone(ok);
+        };
+
+        // پلیر اول شروع می‌شه: ساختنِ AudioTrack هم‌زمان با تولیدِ صدا انجام می‌شه
+        Thread player = new Thread(() -> runPlayer(q, myEpoch, genFailed, gotAudio, once), "tts-play");
+        player.setDaemon(true);
+        player.start();
+
+        try {
+            genExec.execute(() -> runGenerate(t, sp, key, myEpoch, q, genFailed, gotAudio));
+        } catch (Throwable e) {
+            genFailed.set(true);
+            q.add(END);
+        }
     }
 
     // نسخه‌ی قدیمی (سازگاری با کدهای قبلی مثل BubbleService)
-    void speak(String text, float speed) {
-        speak(text, speed, null);
+    void speak(String text, float speed, final Runnable onDone) {
+        speakAsync(text, speed, ok -> { if (onDone != null) onDone.run(); });
     }
 
-    private void playPcm(float[] samples, Runnable onDone) {
-        if (released) {
-            if (onDone != null) onDone.run();
-            return;
+    void speak(String text, float speed) {
+        speakAsync(text, speed, null);
+    }
+
+    private void runGenerate(String t, float sp, String key, final int myEpoch,
+                             final LinkedBlockingQueue<short[]> q,
+                             AtomicBoolean genFailed, final AtomicBoolean gotAudio) {
+        try {
+            if (released || epoch.get() != myEpoch) return;
+            float[] cached = cacheGet(key);
+            if (cached != null) {
+                if (cached.length > 0) {
+                    gotAudio.set(true);
+                    q.add(toPcm16(cached));
+                }
+                return;
+            }
+            long t0 = SystemClock.uptimeMillis();
+            final boolean[] first = {true};
+            float[] audio = synth(t, sp, s -> {
+                if (released || epoch.get() != myEpoch) return false;
+                if (first[0]) {
+                    first[0] = false;
+                    Log.i(TAG, "first audio after ms=" + (SystemClock.uptimeMillis() - t0));
+                }
+                gotAudio.set(true);
+                q.add(toPcm16(s));
+                return true;
+            });
+            if (audio != null) cachePut(key, audio);
+        } catch (Throwable e) {
+            Log.e(TAG, "TTS generate failed", e);
+            genFailed.set(true);
+        } finally {
+            q.add(END);
         }
+    }
+
+    private AudioTrack buildTrack() {
         int minBuf = AudioTrack.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT);
-
-        int bufSize = Math.max(minBuf, samples.length * 2);
-
-        AudioTrack track = new AudioTrack.Builder()
+                sampleRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        int bufSize = Math.max(minBuf, sampleRate * 2); // حدود ۱ ثانیه
+        AudioTrack.Builder b = new AudioTrack.Builder()
                 .setAudioAttributes(new AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
@@ -121,45 +327,100 @@ final class TtsEngine {
                         .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                         .build())
                 .setBufferSizeInBytes(bufSize)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build();
-
-        short[] pcm16 = new short[samples.length];
-        for (int i = 0; i < samples.length; i++) {
-            float s = Math.max(-1f, Math.min(1f, samples[i]));
-            pcm16[i] = (short) (s * 32767);
+                .setTransferMode(AudioTrack.MODE_STREAM);
+        if (Build.VERSION.SDK_INT >= 26) {
+            b.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY);
         }
+        return b.build();
+    }
 
-        currentTrack = track;
+    private void runPlayer(LinkedBlockingQueue<short[]> q, int myEpoch,
+                           AtomicBoolean genFailed, AtomicBoolean gotAudio, DoneCallback once) {
+        try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO); } catch (Throwable ignored) {}
+        AudioTrack track = null;
+        boolean ok = true;
+        boolean cancelled = false;
+        boolean started = false;
+        long frames = 0;
         try {
-            track.play();
-            track.write(pcm16, 0, pcm16.length);
-            track.stop();
+            track = buildTrack();
+            if (epoch.get() != myEpoch || released) {
+                cancelled = true;
+            } else {
+                currentTrack = track;
+            }
+            loop:
+            while (!cancelled) {
+                if (epoch.get() != myEpoch || released) { cancelled = true; break; }
+                short[] c = q.poll(40, TimeUnit.MILLISECONDS);
+                if (c == null) continue;
+                if (c == END) break;
+                if (!started) {
+                    track.play();
+                    started = true;
+                }
+                int off = 0;
+                while (off < c.length) {
+                    if (epoch.get() != myEpoch || released) { cancelled = true; break loop; }
+                    int n = track.write(c, off, c.length - off);
+                    if (n < 0) { ok = false; break loop; }
+                    off += n;
+                }
+                frames += c.length;
+            }
+            // صبر تا آخرین نمونه واقعاً پخش بشه (تا onDone زودتر از پایانِ صدا نیاد)
+            if (!cancelled && ok && started) {
+                long deadline = SystemClock.uptimeMillis() + (frames * 1000L / sampleRate) + 1500;
+                while (SystemClock.uptimeMillis() < deadline) {
+                    if (epoch.get() != myEpoch || released) { cancelled = true; break; }
+                    long head = track.getPlaybackHeadPosition() & 0xFFFFFFFFL;
+                    if (head >= frames) break;
+                    Thread.sleep(15);
+                }
+            }
+            if (!cancelled && ok && !gotAudio.get()) {
+                Log.w(TAG, "Generated audio is empty");
+                ok = false;
+            }
         } catch (Throwable e) {
             Log.e(TAG, "playback failed", e);
+            ok = false;
         } finally {
-            if (currentTrack == track) currentTrack = null;
-            try { track.release(); } catch (Throwable ignored) {}
-            if (onDone != null) onDone.run();
+            if (track != null) {
+                if (currentTrack == track) currentTrack = null;
+                try { track.pause(); } catch (Throwable ignored) {}
+                try { track.flush(); } catch (Throwable ignored) {}
+                try { track.stop(); } catch (Throwable ignored) {}
+                try { track.release(); } catch (Throwable ignored) {}
+            }
+            once.onDone(cancelled || ok);
         }
     }
 
-    void stop() {
-        epoch++;
+    /** پخشِ فعلی رو فوراً قطع می‌کنه (آزادسازیِ track رو خودِ thread پلیر انجام می‌ده). */
+    private void haltPlayback() {
+        epoch.incrementAndGet();
         AudioTrack t = currentTrack;
         if (t != null) {
             try { t.pause(); } catch (Throwable ignored) {}
             try { t.flush(); } catch (Throwable ignored) {}
-            try { t.stop(); } catch (Throwable ignored) {}
-            try { t.release(); } catch (Throwable ignored) {}
-            currentTrack = null;
         }
+    }
+
+    void stop() {
+        haltPlayback();
     }
 
     void release() {
         if (released) return;
         released = true;
-        stop();
-        try { if (tts != null) tts.release(); } catch (Throwable ignored) {}
+        haltPlayback();
+        try {
+            // release رو بعد از تولیدِ در حالِ اجرا انجام بده (وگرنه کرشِ native)
+            genExec.execute(() -> { try { tts.release(); } catch (Throwable ignored) {} });
+        } catch (Throwable e) {
+            try { tts.release(); } catch (Throwable ignored) {}
+        }
+        genExec.shutdown();
     }
 }
