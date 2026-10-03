@@ -19,15 +19,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 @CapacitorPlugin(name = "BubblePlugin")
 public class BubblePlugin extends Plugin {
 
-    // ✅ موتور TTS مشترک (بدون private تا BubbleService هم بتونه استفاده کنه)
-    // = موتورِ آخرین زبانی که واقعاً خونده شده
-    static volatile TtsEngine sharedTts;
-    static volatile String sharedTtsLang = null;
-
-    // چند موتور هم‌زمان توی حافظه (برای اینکه عوض‌کردنِ زبان، لودِ دوباره‌ی چندثانیه‌ای نداشته باشه)
-    private static final int MAX_ENGINES = 2;
-    private static final ConcurrentHashMap<String, TtsEngine> ENGINES = new ConcurrentHashMap<>();
-    // با هر speak/stop بالا می‌ره؛ speak ی که قبل از stop شروع شده ولی هنوز لود می‌شه، دیگه پخش نمی‌شه
+    // ✅ موتور Piper توی پردازه‌ی جدا (TtsService) اجرا می‌شه؛ این کلاس فقط پیام می‌فرسته.
+    // اگه کدِ native کرش کنه فقط اون پردازه می‌میره و اپ بسته نمی‌شه.
+    // با هر speak/stop بالا می‌ره؛ speakSystem ی که قبل از stop شروع شده، دیگه پخش نشه
     private static final AtomicInteger SPEAK_SEQ = new AtomicInteger(0);
     private static final String TTS_PREFS = "tts_engine";
 
@@ -41,40 +35,6 @@ public class BubblePlugin extends Plugin {
             SharedPreferences sp = ctx.getSharedPreferences(TTS_PREFS, Context.MODE_PRIVATE);
             if (!lang.equals(sp.getString("last_lang", null))) sp.edit().putString("last_lang", lang).apply();
         } catch (Throwable ignored) {}
-    }
-
-    /**
-     * موتورِ این زبان رو برمی‌گردونه (اگه لود نیست، لودش می‌کنه).
-     * forSpeak=true: موتور «آخرین‌استفاده‌شده» (sharedTts) می‌شه و در صورتِ پر بودنِ حافظه، قدیمی‌ترین موتور آزاد می‌شه.
-     * forSpeak=false (preload): اگه جا نیست، چیزی رو آزاد نمی‌کنه و null می‌ده.
-     */
-    static TtsEngine obtainEngine(Context app, String lang, boolean forSpeak) {
-        synchronized (BubblePlugin.class) {
-            TtsEngine e = ENGINES.get(lang);
-            if (e != null && e.isReleased()) { ENGINES.remove(lang); e = null; }
-            if (e == null) {
-                if (!forSpeak && ENGINES.size() >= MAX_ENGINES) return null;
-                e = TtsEngine.create(app, lang);
-                if (e == null) return null;
-                ENGINES.put(lang, e);
-                while (ENGINES.size() > MAX_ENGINES) {
-                    TtsEngine victim = null;
-                    for (TtsEngine x : ENGINES.values()) {
-                        if (x == e || x == sharedTts) continue;
-                        if (victim == null || x.lastUsed() < victim.lastUsed()) victim = x;
-                    }
-                    if (victim == null) break;
-                    ENGINES.remove(victim.lang());
-                    victim.release();
-                }
-            }
-            if (forSpeak) {
-                e.touch();
-                sharedTts = e;
-                sharedTtsLang = lang;
-            }
-            return e;
-        }
     }
 
     private void emitSpeakDone(String lang, String text, String id, boolean ok) {
@@ -110,6 +70,10 @@ public class BubblePlugin extends Plugin {
     @Override
     public void load() {
         super.load();
+        try {
+            TtsClient.init(getContext(), (lang, text, id, ok) ->
+                    emitSpeakDone(lang, text, id.isEmpty() ? null : id, ok));
+        } catch (Throwable ignored) {}
         try {
             if (getActivity() != null) dispatchAuthIntent(getActivity().getIntent());
         } catch (Throwable ignored) {}
@@ -380,6 +344,7 @@ public class BubblePlugin extends Plugin {
 
                     @Override
                     public void onDone(String l) {
+                        TtsClient.resetCrash(l);
                         JSObject ret = new JSObject();
                         ret.put("lang", l);
                         notifyListeners("ttsModelDownloadDone", ret);
@@ -421,14 +386,10 @@ public class BubblePlugin extends Plugin {
         Context ctx = getContext();
         String lang = call.getString("lang", "en");
         // اگه همین زبان الان توی حافظه لوده، اول آزادش کن (وگرنه فایلِ مدل درگیره)
-        synchronized (BubblePlugin.class) {
-            String n = SherpaModelManager.normalize(lang);
-            TtsEngine e = n == null ? null : ENGINES.remove(n);
-            if (e != null) e.release();
-            if (n != null && n.equals(sharedTtsLang)) {
-                sharedTts = null;
-                sharedTtsLang = null;
-            }
+        String n = SherpaModelManager.normalize(lang);
+        if (n != null) {
+            TtsClient.releaseLang(n);
+            TtsClient.resetCrash(n);
         }
         SherpaModelManager.deleteTtsModel(ctx, lang);
         call.resolve();
@@ -462,29 +423,16 @@ public class BubblePlugin extends Plugin {
         }
 
         final float speed = (sp == null || sp <= 0) ? 1.0f : sp.floatValue();
-        final int mySeq = SPEAK_SEQ.incrementAndGet();
+        rememberTtsLang(ctx, lang);
 
-        new Thread(() -> {
-            try {
-                TtsEngine engine = obtainEngine(ctx, lang, true);
-                if (engine == null) {
-                    call.reject("failed to load TTS engine");
-                    return;
-                }
-                // موفقیتِ شروع رو فوراً برمی‌گردونیم
-                call.resolve();
-
-                // وسطِ لود، stop() یا speak ی جدید اومده → این یکی دیگه پخش نشه
-                if (mySeq != SPEAK_SEQ.get()) {
-                    emitSpeakDone(lang, text, id, true);
-                    return;
-                }
-                rememberTtsLang(ctx, lang);
-                engine.speakAsync(text, speed, ok -> emitSpeakDone(lang, text, id, ok));
-            } catch (Exception e) {
-                call.reject("TTS error: " + e.getMessage());
-            }
-        }, "tts-speak").start();
+        // Piper برای این زبان بعد از کرشِ پشتِ‌هم غیرفعال شده → همین الان شکست (JS می‌ره سراغ fallback)
+        if (TtsClient.isBlocked(lang)) {
+            call.resolve();
+            TtsClient.failFast(lang, text, id == null ? "" : id);
+            return;
+        }
+        call.resolve();
+        TtsClient.speak(lang, text, speed, id);
     }
 
     /**
@@ -503,13 +451,8 @@ public class BubblePlugin extends Plugin {
             }
         }
         if (l == null || SherpaModelManager.getTtsModelDir(ctx, l) == null) return;
-        final String lang = l;
-        new Thread(() -> {
-            try {
-                TtsEngine e = obtainEngine(ctx, lang, false);
-                if (e != null) e.warmUp();
-            } catch (Throwable ignored) {}
-        }, "tts-preload").start();
+        if (TtsClient.isBlocked(l)) return;
+        TtsClient.preload(l);
     }
 
     /**
@@ -523,9 +466,8 @@ public class BubblePlugin extends Plugin {
         Double sp = call.getDouble("speed", 1.0);
         call.resolve();
         if (text == null || text.trim().isEmpty() || lang == null) return;
-        TtsEngine e = ENGINES.get(lang);
-        if (e == null || e.isReleased()) return;
-        e.prefetch(text, (sp == null || sp <= 0) ? 1.0f : sp.floatValue());
+        if (TtsClient.isBlocked(lang)) return;
+        TtsClient.prefetch(lang, text, (sp == null || sp <= 0) ? 1.0f : sp.floatValue());
     }
 
     // ---------------- TTS خودِ گوشی (android.speech.tts) ----------------
@@ -581,28 +523,14 @@ public class BubblePlugin extends Plugin {
         SPEAK_SEQ.incrementAndGet();
         SystemTts st = systemTts;
         if (st != null) st.stop();
-        for (TtsEngine e : ENGINES.values()) {
-            try { e.stop(); } catch (Throwable ignored) {}
-        }
-        TtsEngine shared = sharedTts;
-        if (shared != null) shared.stop();
+        TtsClient.stop();
         call.resolve();
     }
 
     /** ✅ آزادسازیِ موتورها (اختیاری) */
     @PluginMethod
     public void releaseTts(PluginCall call) {
-        synchronized (BubblePlugin.class) {
-            for (TtsEngine e : ENGINES.values()) {
-                try { e.release(); } catch (Throwable ignored) {}
-            }
-            ENGINES.clear();
-            if (sharedTts != null) {
-                sharedTts.release();
-                sharedTts = null;
-                sharedTtsLang = null;
-            }
-        }
+        TtsClient.releaseAll();
         call.resolve();
     }
 }

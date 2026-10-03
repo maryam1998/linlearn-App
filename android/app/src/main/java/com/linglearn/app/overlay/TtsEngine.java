@@ -68,7 +68,7 @@ final class TtsEngine {
     // تولیدِ صدا فقط روی یک thread (OfflineTts thread-safe نیست)
     private final ExecutorService genExec = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(() -> {
-            try { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO); } catch (Throwable ignored) {}
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO); } catch (Throwable ignored) {}
             r.run();
         }, "tts-gen");
         t.setDaemon(true);
@@ -86,14 +86,67 @@ final class TtsEngine {
     long lastUsed() { return lastUsed; }
     void touch() { lastUsed = SystemClock.uptimeMillis(); }
 
+    /**
+     * قبل از لودِ native فایل‌ها رو بررسی می‌کنه (فایلِ خراب/ناقص باعثِ exit() یا abort ی native می‌شه).
+     * اگه مشکلی باشه متنِ خطا رو برمی‌گردونه و فایلِ خراب رو پاک می‌کنه تا دوباره دانلود بشه.
+     */
+    private static String validateFiles(Context ctx, File dir, String lang) {
+        File model = new File(dir, "model.onnx");
+        if (model.length() < 2_000_000L) {
+            model.delete();
+            return "model.onnx too small (corrupt download)";
+        }
+        try (java.io.FileInputStream in = new java.io.FileInputStream(model)) {
+            int b = in.read();
+            // HTML / JSON / متن (مثلاً صفحه‌ی خطای آینه یا pointer ی git-lfs) → مدل نیست
+            if (b == '<' || b == '{' || b == 'v' || b == ' ' || b == '\n' || b == '\r') {
+                model.delete();
+                return "model.onnx is not an ONNX file";
+            }
+        } catch (Throwable e) {
+            return "cannot read model.onnx";
+        }
+        File es = SherpaModelManager.getEspeakDataDir(ctx);
+        String[] need = {"phontab", "phonindex", "phondata", "intonations", lang + "_dict"};
+        for (String n : need) {
+            File f = new File(es, n);
+            if (!f.isFile() || f.length() == 0) {
+                SherpaModelManager.invalidateEspeak(ctx);
+                return "espeak-ng-data incomplete: " + n;
+            }
+        }
+        return null;
+    }
+
+    /** آخرین خطای لود (برای گزارش به کاربر)؛ فقط توی پردازه‌ی TTS معنی داره. */
+    static volatile String lastCreateError = null;
+
     static TtsEngine create(Context ctx, String lang) {
+        lastCreateError = null;
         File dir = SherpaModelManager.getTtsModelDir(ctx, lang);
         if (dir == null) {
             Log.w(TAG, "TTS model not found for " + lang);
+            lastCreateError = "model not found";
             return null;
         }
+        String bad = validateFiles(ctx, dir, lang);
+        if (bad != null) {
+            Log.e(TAG, "invalid TTS files for " + lang + ": " + bad);
+            lastCreateError = bad;
+            return null;
+        }
+        int oldPrio = Process.THREAD_PRIORITY_DEFAULT;
+        boolean prioChanged = false;
         try {
             long t0 = SystemClock.uptimeMillis();
+            TtsCrumb.mark("create:" + lang);
+            // threadهای ONNX Runtime اولویتِ threadی رو که می‌سازتشون به ارث می‌برن
+            try {
+                oldPrio = Process.getThreadPriority(Process.myTid());
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+                prioChanged = true;
+            } catch (Throwable ignored) {}
+
             OfflineTtsVitsModelConfig vitsConfig = new OfflineTtsVitsModelConfig();
             vitsConfig.setModel(new File(dir, "model.onnx").getAbsolutePath());
             vitsConfig.setTokens(new File(dir, "tokens.txt").getAbsolutePath());
@@ -117,10 +170,17 @@ final class TtsEngine {
             if (sr <= 0) sr = 22050;
             Log.i(TAG, "TTS loaded for " + lang + ", sampleRate=" + sr + ", threads=" + threads
                     + ", loadMs=" + (SystemClock.uptimeMillis() - t0));
+            TtsCrumb.mark("idle");
             return new TtsEngine(engine, sr, lang);
         } catch (Throwable e) {
             Log.e(TAG, "Failed to load TTS for " + lang, e);
+            lastCreateError = String.valueOf(e);
+            TtsCrumb.mark("idle");
             return null;
+        } finally {
+            if (prioChanged) {
+                try { Process.setThreadPriority(oldPrio); } catch (Throwable ignored) {}
+            }
         }
     }
 
@@ -141,7 +201,9 @@ final class TtsEngine {
                 if (released) return;
                 try {
                     long t0 = SystemClock.uptimeMillis();
+                    TtsCrumb.mark("warm:" + lang);
                     tts.generate(w, 0, 1.0f);
+                    TtsCrumb.mark("idle");
                     Log.i(TAG, "warmUp " + lang + " ms=" + (SystemClock.uptimeMillis() - t0));
                 } catch (Throwable e) {
                     Log.w(TAG, "warmUp failed", e);
@@ -214,7 +276,9 @@ final class TtsEngine {
                 if (released || pfAbort.get() != g || cacheHas(key)) return;
                 inflightPrefetchKey = key;
                 try {
+                    TtsCrumb.mark("prefetch:" + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
                     float[] audio = synth(t, sp, s -> !released && pfAbort.get() == g);
+                    TtsCrumb.mark("idle");
                     if (audio != null) cachePut(key, audio);
                 } catch (Throwable e) {
                     Log.w(TAG, "prefetch failed", e);
@@ -293,6 +357,7 @@ final class TtsEngine {
             }
             long t0 = SystemClock.uptimeMillis();
             final boolean[] first = {true};
+            TtsCrumb.mark("gen:" + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
             float[] audio = synth(t, sp, s -> {
                 if (released || epoch.get() != myEpoch) return false;
                 if (first[0]) {
@@ -303,9 +368,11 @@ final class TtsEngine {
                 q.add(toPcm16(s));
                 return true;
             });
+            TtsCrumb.mark("idle");
             if (audio != null) cachePut(key, audio);
         } catch (Throwable e) {
             Log.e(TAG, "TTS generate failed", e);
+            TtsCrumb.mark("idle");
             genFailed.set(true);
         } finally {
             q.add(END);

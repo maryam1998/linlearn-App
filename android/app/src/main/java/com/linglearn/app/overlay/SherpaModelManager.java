@@ -258,6 +258,11 @@ final class SherpaModelManager {
         return espeakMarker(ctx).isFile() && getEspeakDataDir(ctx).isDirectory();
     }
 
+    /** espeak-ng-data ناقص/خراب بود: marker رو پاک کن تا دانلودِ بعدی فایل‌های کم‌وکسر رو دوباره بگیره. */
+    static void invalidateEspeak(Context ctx) {
+        try { espeakMarker(ctx).delete(); } catch (Throwable ignored) {}
+    }
+
     static File getTtsModelDir(Context ctx, String lang) {
         String l = normalize(lang);
         TtsSpec s = l == null ? null : TTS_SPECS.get(l);
@@ -544,6 +549,12 @@ final class SherpaModelManager {
             if (!r.isSuccessful() || r.body() == null) {
                 throw new java.io.IOException("HTTP " + r.code() + " for " + target.getName());
             }
+            // صفحه‌ی خطای آینه (HTML) به‌جای فایل → خرابِ بی‌صدا؛ همین‌جا ردش کن
+            String ctype = r.header("Content-Type");
+            if (ctype != null && ctype.toLowerCase(Locale.ROOT).startsWith("text/html")) {
+                part.delete();
+                throw new java.io.IOException("server returned HTML instead of " + target.getName());
+            }
             boolean resumed = r.code() == 206 && existing > 0;
             long base = resumed ? existing : 0;
             long len = r.body().contentLength();
@@ -566,6 +577,10 @@ final class SherpaModelManager {
             }
             if (cb != null) cb.onProgress(l, done, total);
             if (total > 0 && part.length() != total) throw new java.io.IOException("incomplete download");
+            if (target.getName().endsWith(".onnx") && part.length() < 2_000_000L) {
+                part.delete();
+                throw new java.io.IOException("model file too small: " + part.length());
+            }
         }
         if (target.exists()) target.delete();
         if (!part.renameTo(target)) throw new java.io.IOException("rename failed: " + target.getName());
