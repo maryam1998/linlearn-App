@@ -234,7 +234,10 @@ public class BubblePlugin extends Plugin {
     @PluginMethod
     public void setTtsEnabled(PluginCall call) {
         Boolean enabled = call.getBoolean("enabled", false);
-        BubbleService.saveTtsEnabled(getContext(), enabled != null && enabled);
+        try {
+            getContext().getSharedPreferences("bubble_prefs", Context.MODE_PRIVATE)
+                    .edit().putBoolean("ttsEnabled", enabled != null && enabled).apply();
+        } catch (Throwable ignored) {}
         call.resolve();
     }
 

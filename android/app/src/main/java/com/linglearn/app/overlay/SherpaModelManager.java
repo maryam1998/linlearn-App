@@ -7,11 +7,17 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -75,7 +81,7 @@ final class SherpaModelManager {
 
     private static final Map<String, TtsSpec> TTS_SPECS;
     static {
-        Map<String, TtsSpec> m = new HashMap<>();
+        Map<String, TtsSpec> m = new LinkedHashMap<>();
 
         m.put("en", new TtsSpec(
                 "csukuangfj/vits-piper-en_US-ryan-medium",
@@ -119,6 +125,7 @@ final class SherpaModelManager {
     private static final OkHttpClient HTTP = new OkHttpClient();
     private static final AtomicBoolean DOWNLOADING = new AtomicBoolean(false);
     private static volatile boolean DOWNLOADING_STATE = false;
+    private static volatile String TTS_DOWNLOADING_LANG = null;
 
     // ============ متدهای مشترک ============
     static String normalize(String lang) {
@@ -169,6 +176,29 @@ final class SherpaModelManager {
         return new File(new File(ctx.getFilesDir(), "tts"), l);
     }
 
+    /** زبان‌هایی که مدل TTS آفلاین دارن (به ترتیب تعریف). */
+    static List<String> ttsLanguages() {
+        return new ArrayList<>(TTS_SPECS.keySet());
+    }
+
+    /** زبانی که الان مدل TTS‌اش در حال دانلوده (یا null). */
+    static String getTtsDownloadingLang() {
+        return DOWNLOADING_STATE ? TTS_DOWNLOADING_LANG : null;
+    }
+
+    /** espeak-ng-data مشترکِ همه‌ی مدل‌های Piper (یک بار دانلود می‌شه). */
+    static File getEspeakDataDir(Context ctx) {
+        return new File(new File(ctx.getFilesDir(), "tts"), "espeak-ng-data");
+    }
+
+    private static File espeakMarker(Context ctx) {
+        return new File(new File(ctx.getFilesDir(), "tts"), "espeak-ng-data.ok");
+    }
+
+    private static boolean isEspeakReady(Context ctx) {
+        return espeakMarker(ctx).isFile() && getEspeakDataDir(ctx).isDirectory();
+    }
+
     static File getTtsModelDir(Context ctx, String lang) {
         String l = normalize(lang);
         TtsSpec s = l == null ? null : TTS_SPECS.get(l);
@@ -176,10 +206,9 @@ final class SherpaModelManager {
         File dir = ttsDirFor(ctx, l);
         File model = new File(dir, "model.onnx");
         File tokens = new File(dir, "tokens.txt");
-        File dataDir = new File(dir, "espeak-ng-data");
         if (!model.isFile() || model.length() == 0) return null;
         if (!tokens.isFile() || tokens.length() == 0) return null;
-        if (!dataDir.isDirectory()) return null;
+        if (!isEspeakReady(ctx)) return null;
         return dir;
     }
 
@@ -251,6 +280,7 @@ final class SherpaModelManager {
             if (cb != null) cb.onError(l, new IllegalStateException("another download is running"));
             return;
         }
+        TTS_DOWNLOADING_LANG = l;
         DOWNLOADING_STATE = true;
         Thread t = new Thread(() -> {
             try {
@@ -273,15 +303,9 @@ final class SherpaModelManager {
                             tokensTarget, cb, l);
                 }
 
-                // ۳. دانلود espeak-ng-data (به صورت tar.bz2 یا یه فایل zip)
-                // ⚠️ این بخش بستگی به ساختار مخزن داره. بعضی مخازن پوشه‌ی آماده دارن،
-                // بعضی دیگه فایل tar.bz2. این کد فرض می‌کنه پوشه‌ی espeak-ng-data مستقیم هست.
-                File dataDir = new File(dir, "espeak-ng-data");
-                if (!dataDir.isDirectory()) {
-                    // اگه مخزن پوشه‌ی espeak-ng-data رو جدا داره، باید همه‌ی فایل‌های
-                    // داخلش رو دانلود کنی. این کار پیچیده‌ست و نیاز به لیست کردن مخزن داره.
-                    // راه ساده‌تر: خودت یه بار دانلود کن و کنار APK بذار.
-                    Log.w(TAG, "espeak-ng-data not found for " + l + " - model may not work");
+                // ۳. دانلود espeak-ng-data مشترک (فقط یک بار برای همه‌ی زبان‌ها)
+                if (!isEspeakReady(app)) {
+                    downloadEspeakData(app, s.repo, cb, l);
                 }
 
                 if (cb != null) cb.onDone(l);
@@ -289,12 +313,85 @@ final class SherpaModelManager {
                 Log.w(TAG, "TTS download failed for " + l, e);
                 if (cb != null) cb.onError(l, e);
             } finally {
+                TTS_DOWNLOADING_LANG = null;
                 DOWNLOADING.set(false);
                 DOWNLOADING_STATE = false;
             }
         }, "sherpa-tts-download");
         t.setDaemon(true);
         t.start();
+    }
+
+    /**
+     * پوشه‌ی espeak-ng-data رو از HuggingFace (لیستِ فایل‌ها با API) دانلود می‌کنه.
+     * فقط وقتی کامل شد فایلِ marker ساخته می‌شه.
+     */
+    private static void downloadEspeakData(Context app, String repo, ProgressCallback cb, String l) throws Exception {
+        final String prefix = "espeak-ng-data/";
+        File root = getEspeakDataDir(app);
+        if (!root.isDirectory() && !root.mkdirs()) throw new java.io.IOException("cannot create " + root);
+
+        // لیست فایل‌ها (با صفحه‌بندی)
+        List<String> paths = new ArrayList<>();
+        List<Long> sizes = new ArrayList<>();
+        String next = HF_BASE + "api/models/" + repo + "/tree/main/espeak-ng-data?recursive=true";
+        int guard = 0;
+        while (next != null && guard++ < 20) {
+            Request req = new Request.Builder().url(next).build();
+            try (Response r = HTTP.newCall(req).execute()) {
+                if (!r.isSuccessful() || r.body() == null) {
+                    throw new java.io.IOException("HTTP " + r.code() + " listing espeak-ng-data");
+                }
+                String body = r.body().string();
+                JSONArray arr = new JSONArray(body);
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject o = arr.getJSONObject(i);
+                    if (!"file".equals(o.optString("type"))) continue;
+                    String p = o.optString("path");
+                    if (p.startsWith(prefix)) {
+                        paths.add(p);
+                        sizes.add(o.optLong("size", 0));
+                    }
+                }
+                next = parseNextLink(r.header("Link"));
+            }
+        }
+        if (paths.isEmpty()) throw new java.io.IOException("espeak-ng-data list is empty");
+
+        long done = 0;
+        for (int i = 0; i < paths.size(); i++) {
+            String p = paths.get(i);
+            String rel = p.substring(prefix.length());
+            File target = new File(root, rel);
+            File parent = target.getParentFile();
+            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+                throw new java.io.IOException("cannot create " + parent);
+            }
+            long expected = sizes.get(i);
+            if (target.isFile() && (expected <= 0 || target.length() == expected)) {
+                done += target.length();
+                if (cb != null) cb.onProgress(l, done, -1);
+                continue;
+            }
+            downloadFile(HF_BASE + repo + "/resolve/main/" + p, target, null, l);
+            done += target.length();
+            if (cb != null) cb.onProgress(l, done, -1);
+        }
+        File marker = espeakMarker(app);
+        if (!marker.exists() && !marker.createNewFile()) throw new java.io.IOException("cannot create marker");
+    }
+
+    /** از هدرِ Link مقدارِ rel="next" رو درمیاره (یا null). */
+    private static String parseNextLink(String link) {
+        if (link == null) return null;
+        for (String part : link.split(",")) {
+            if (part.contains("rel=\"next\"")) {
+                int a = part.indexOf('<');
+                int b = part.indexOf('>');
+                if (a >= 0 && b > a) return part.substring(a + 1, b).trim();
+            }
+        }
+        return null;
     }
 
     private static void downloadFile(String url, File target, ProgressCallback cb, String l) throws Exception {
