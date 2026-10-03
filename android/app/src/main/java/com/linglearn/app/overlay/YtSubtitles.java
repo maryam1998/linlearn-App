@@ -70,6 +70,8 @@ final class YtSubtitles {
         void show(int idx, String src, Map<String, String> tr, boolean reset);
         /** ترجمه‌ی خطِ idx به lang رسید (ممکنه هنوز نمایش داده نشده باشه؛ Host خودش چک می‌کنه). */
         void update(int idx, String lang, String text);
+        /** ویدیوی دیگری شروع شد: تاریخچه‌ی ویدیوی قبلی باید پاک شود. */
+        void videoChanged();
     }
 
     static final class Cue {
@@ -114,6 +116,7 @@ final class YtSubtitles {
     private volatile long offsetMs = 0;
     private final java.util.TreeSet<Integer> shown = new java.util.TreeSet<>();   // خط‌هایی که واقعاً روی پنل نمایش داده شدند (برای ذخیره)
     private String curVideoId = "";
+    private String histVideoId = "";   // ویدیوی آخرینِ تاریخچه‌ی روی پنل (با resetVideo پاک نمی‌شود)
 
     YtSubtitles(Context ctx, Host host, String workerBase, OkHttpClient httpFast) {
         this.app = ctx.getApplicationContext();
@@ -272,7 +275,10 @@ final class YtSubtitles {
     }
 
     private void loadCaptions(final String videoId, final String title) {
+        final boolean other = !videoId.equals(histVideoId);
+        histVideoId = videoId;
         resetVideo();
+        if (other) host.videoChanged();
         curTitle = title == null ? "" : title;
         curVideoId = videoId;
         final int g = gen;

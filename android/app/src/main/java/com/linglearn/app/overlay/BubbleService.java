@@ -124,7 +124,7 @@ public class BubbleService extends Service {
     // ✅ تغییر ۵: از 80 به 400 (بار CPU سبک‌تر)
     private static final long PARTIAL_TRANSLATE_INTERVAL_MS = 400;
     private static final long REMOTE_PARTIAL_INTERVAL_MS = 900;
-    private static final int MAX_HISTORY = 40;
+    private static final int MAX_HISTORY = 400;
 
     private static final int NET_ATTEMPTS = 3;
     private static final OkHttpClient HTTP = new OkHttpClient.Builder()
@@ -576,6 +576,7 @@ public class BubbleService extends Service {
         LinearLayout srcRow;            // [🔊][متنِ اصلی]
         TextView tvSrc;
         String srcLang = "en";          // زبانِ واقعیِ متنِ اصلیِ این جمله (برای 🔊 و کادرِ لغت)
+        int ytIdx = -1;                 // شماره‌ی خطِ زیرنویسِ یوتیوب (برای چیدنِ مرتب بعد از seek)
         final HashMap<String, LinearLayout> rowBox = new HashMap<>();
         final HashMap<String, TextView> rowText = new HashMap<>();
     }
@@ -1197,8 +1198,32 @@ public class BubbleService extends Service {
             if (old == live) break;
             history.remove(0);
             listBox.removeView(old.box);
+            ytEntries.values().remove(old);
         }
         return e;
+    }
+
+    /** بعد از seek به عقب، خطِ تازه سرِ جای درستِ خودش (به ترتیبِ زمانِ زیرنویس) می‌نشیند. */
+    private void placeByCueIndex(Entry e) {
+        int pos = 0;
+        for (int i = 0; i < history.size(); i++) {
+            Entry h = history.get(i);
+            if (h == e) continue;
+            if (h.ytIdx < 0 || h.ytIdx < e.ytIdx) pos = i + 1;
+        }
+        int cur = history.indexOf(e);
+        if (cur == pos || (cur == history.size() - 1 && pos >= history.size() - 1)) return;
+        history.remove(e);
+        listBox.removeView(e.box);
+        if (pos > history.size()) pos = history.size();
+        history.add(pos, e);
+        listBox.addView(e.box, pos, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+    }
+
+    private void scrollToEntry(final Entry e) {
+        if (scroll == null || e == null || e.box == null) return;
+        scroll.post(() -> scroll.smoothScrollTo(0, Math.max(0, e.box.getTop() - dp(4))));
     }
 
     private void makeRow(Entry e, String lang) {
@@ -1578,20 +1603,41 @@ public class BubbleService extends Service {
 
         @Override public void show(int idx, String src, Map<String, String> tr, boolean reset) {
             if (wm == null || bubble == null) return;
-            if (reset) { clearHistory(); ytEntries.clear(); }
             clearStatus();
-            Entry e = newEntry();
+            // ✅ تاریخچه با seek/شروع پاک نمی‌شود؛ فقط با 🗑 یا عوض‌شدنِ ویدیو.
+            Entry e = ytEntries.get(idx);
+            if (e != null && history.contains(e)) {
+                for (Map.Entry<String, String> x : tr.entrySet()) {
+                    String cur = e.tr.get(x.getKey());
+                    boolean haveGood = cur != null && !cur.isEmpty() && !cur.equals("…");
+                    if (!x.getValue().equals("…") || !haveGood) {
+                        e.tr.put(x.getKey(), x.getValue());
+                        e.trSrc.put(x.getKey(), src);
+                    }
+                }
+                renderEntry(e);
+                afterChange();
+                if (reset) scrollToEntry(e);
+                return;
+            }
+            e = newEntry();
+            e.ytIdx = idx;
             e.src = src;
             for (Map.Entry<String, String> x : tr.entrySet()) {
                 e.tr.put(x.getKey(), x.getValue());
                 e.trSrc.put(x.getKey(), src);
             }
             ytEntries.put(idx, e);
-            for (java.util.Iterator<Integer> it = ytEntries.keySet().iterator(); it.hasNext(); ) {
-                if (it.next() < idx - 80) it.remove();
-            }
+            placeByCueIndex(e);
             renderEntry(e);
             afterChange();
+            if (reset) scrollToEntry(e);
+        }
+
+        @Override public void videoChanged() {
+            if (wm == null || bubble == null) return;
+            clearHistory();
+            ytEntries.clear();
         }
 
         @Override public void update(int idx, String lang, String text) {
