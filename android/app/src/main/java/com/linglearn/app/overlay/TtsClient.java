@@ -2,6 +2,8 @@ package com.linglearn.app.overlay;
 
 import android.app.ActivityManager;
 import android.app.ApplicationExitInfo;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -42,6 +44,20 @@ final class TtsClient {
     private static final ConcurrentHashMap<String, String[]> PENDING = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, Integer> CRASHES = new ConcurrentHashMap<>();
 
+    // زبان‌هایی که مسیرِ callback کرش کرده → generate() ی ساده
+    private static final java.util.Set<String> PLAIN = ConcurrentHashMap.newKeySet();
+    private static final String PREFS = "tts_engine";
+
+    static boolean isPlain(String lang) { return lang != null && PLAIN.contains(lang); }
+
+    private static void persistPlain(String lang) {
+        try {
+            Context c = app;
+            if (c != null) c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    .edit().putBoolean("plain_" + lang, true).apply();
+        } catch (Throwable ignored) {}
+    }
+
     private static Context app;
     private static Listener listener;
     private static Messenger service;
@@ -59,6 +75,13 @@ final class TtsClient {
             }
         }
         TtsCrumb.init(ctx);
+        try {
+            android.content.SharedPreferences sp = ctx.getApplicationContext()
+                    .getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+            for (String lg : SherpaModelManager.ttsLanguages()) {
+                if (sp.getBoolean("plain_" + lg, false)) PLAIN.add(lg);
+            }
+        } catch (Throwable ignored) {}
     }
 
     // ================= API =================
@@ -79,6 +102,7 @@ final class TtsClient {
         b.putString("text", text);
         b.putFloat("speed", speed);
         b.putString("id", id == null ? "" : id);
+        b.putBoolean("plain", isPlain(lang));
         send(TtsService.MSG_SPEAK, b);
     }
 
@@ -89,6 +113,7 @@ final class TtsClient {
         b.putString("lang", lang);
         b.putString("text", text);
         b.putFloat("speed", speed);
+        b.putBoolean("plain", isPlain(lang));
         send(TtsService.MSG_PREFETCH, b);
     }
 
@@ -183,8 +208,14 @@ final class TtsClient {
         if (crashed) {
             String[] parts = stage.split(":");
             boolean langStage = stage.startsWith("create:") || stage.startsWith("warm:")
-                    || stage.startsWith("gen:") || stage.startsWith("prefetch:");
+                    || stage.startsWith("gen:") || stage.startsWith("genp:")
+                    || stage.startsWith("prefetch:") || stage.startsWith("prefetchp:");
             if (langStage && parts.length >= 2) crashLang = parts[1];
+            // مسیرِ callback کرش کرد → دفعه‌ی بعد generate() ی ساده
+            if (crashLang != null && (stage.startsWith("gen:") || stage.startsWith("prefetch:"))) {
+                PLAIN.add(crashLang);
+                persistPlain(crashLang);
+            }
             if (crashLang != null) {
                 Integer n = CRASHES.get(crashLang);
                 CRASHES.put(crashLang, n == null ? 1 : n + 1);
@@ -211,13 +242,61 @@ final class TtsClient {
     private static void showCrashToast(String stage, String lang) {
         Context c = app;
         if (c == null) return;
-        StringBuilder sb = new StringBuilder("Piper TTS crashed @ ").append(stage);
-        sb.append(exitInfo());
+        String info = exitInfo();
+        StringBuilder sb = new StringBuilder("Piper TTS crashed @ ").append(stage).append(info);
         if (lang != null && isBlocked(lang)) {
             sb.append(" | Piper off for '").append(lang).append("' until app restart");
+        } else if (lang != null && isPlain(lang)) {
+            sb.append(" | retry in safe mode");
         }
-        Log.e(TAG, sb.toString());
-        try { Toast.makeText(c, sb.toString(), Toast.LENGTH_LONG).show(); } catch (Throwable ignored) {}
+        final String full = sb.toString() + lastTrace;
+        Log.e(TAG, full);
+        try {
+            ClipboardManager cm = (ClipboardManager) c.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("piper-crash", full));
+        } catch (Throwable ignored) {}
+        String shortMsg = sb.toString();
+        if (shortMsg.length() > 120) shortMsg = shortMsg.substring(0, 120) + "…";
+        try { Toast.makeText(c, shortMsg + "\n(full details copied — paste it to Claude)", Toast.LENGTH_LONG).show(); } catch (Throwable ignored) {}
+    }
+
+    private static volatile String lastTrace = "";
+
+    /** از tombstone (protobuf) فقط رشته‌های خوانا و مفید رو بیرون می‌کشه. */
+    private static String traceStrings(ApplicationExitInfo i) {
+        try {
+            java.io.InputStream in = i.getTraceInputStream();
+            if (in == null) return "";
+            java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n, total = 0;
+            while ((n = in.read(buf)) > 0 && total < 400_000) { bo.write(buf, 0, n); total += n; }
+            in.close();
+            byte[] d = bo.toByteArray();
+            StringBuilder out = new StringBuilder();
+            StringBuilder cur = new StringBuilder();
+            java.util.LinkedHashSet<String> keep = new java.util.LinkedHashSet<>();
+            for (int k = 0; k <= d.length; k++) {
+                int ch = k < d.length ? (d[k] & 0xff) : 0;
+                if (ch >= 32 && ch < 127) { cur.append((char) ch); continue; }
+                if (cur.length() >= 6) {
+                    String x = cur.toString();
+                    String lx = x.toLowerCase(java.util.Locale.ROOT);
+                    if (lx.contains("abort") || lx.contains("signal") || lx.contains("sherpa")
+                            || lx.contains("onnx") || lx.contains("espeak") || lx.contains("fault")
+                            || lx.contains("libc.so") || lx.contains("jni") || lx.contains("assert")
+                            || lx.contains("terminate") || lx.contains("what()")) {
+                        keep.add(x.length() > 160 ? x.substring(0, 160) : x);
+                    }
+                }
+                cur.setLength(0);
+                if (keep.size() >= 40) break;
+            }
+            for (String x : keep) out.append("\n").append(x);
+            return out.toString();
+        } catch (Throwable t) {
+            return "";
+        }
     }
 
     private static String exitInfo() {
@@ -241,6 +320,8 @@ final class TtsClient {
                     default: r = "reason" + i.getReason();
                 }
                 String d = i.getDescription();
+                lastTrace = i.getReason() == ApplicationExitInfo.REASON_CRASH_NATIVE
+                        ? "\n--- trace ---" + traceStrings(i) : "";
                 return " | " + r + " status=" + i.getStatus() + (d == null ? "" : " " + d);
             }
         } catch (Throwable ignored) {}

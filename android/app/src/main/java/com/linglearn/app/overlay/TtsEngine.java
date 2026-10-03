@@ -44,6 +44,41 @@ final class TtsEngine {
 
     private interface Sink { boolean accept(float[] samples); } // false → توقفِ تولید
 
+    // true → به‌جای generateWithCallback از generate() ی ساده استفاده می‌شه (اگه مسیرِ callback کرش می‌کرد)
+    volatile boolean plain = false;
+
+    /** متن رو برای espeak-ng تمیز می‌کنه (علائمِ عربی/فارسی، نیم‌فاصله، ارقام، کاراکترهای کنترلی). */
+    static String sanitize(String lang, String t) {
+        if (t == null) return "";
+        StringBuilder sb = new StringBuilder(t.length());
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            switch (c) {
+                case '\u060C': sb.append(','); break;          // ،
+                case '\u061B': sb.append(';'); break;          // ؛
+                case '\u061F': sb.append('?'); break;          // ؟
+                case '\u066B': sb.append('.'); break;
+                case '\u066C': sb.append(','); break;
+                case '\u200C': case '\u200D': case '\u200E': case '\u200F':
+                case '\u202A': case '\u202B': case '\u202C': case '\u202D': case '\u202E':
+                case '\u2066': case '\u2067': case '\u2068': case '\u2069':
+                case '\uFEFF': case '\u0640':
+                    sb.append(c == '\u0640' ? "" : " "); break;
+                case '\u201C': case '\u201D': case '\u00AB': case '\u00BB': sb.append('"'); break;
+                case '\u2018': case '\u2019': sb.append('\''); break;
+                case '\u2026': sb.append("..."); break;
+                default:
+                    if (c >= '\u06F0' && c <= '\u06F9') sb.append((char) ('0' + (c - '\u06F0')));
+                    else if (c >= '\u0660' && c <= '\u0669') sb.append((char) ('0' + (c - '\u0660')));
+                    else if (c < 32 && c != '\n' && c != '\t') sb.append(' ');
+                    else if (c >= '\u064B' && c <= '\u065F') { /* اعراب */ }
+                    else sb.append(c);
+            }
+        }
+        String r = sb.toString().replaceAll("\\s+", " ").trim();
+        return r;
+    }
+
     private final OfflineTts tts;
     private final int sampleRate;
     private final String lang;
@@ -238,6 +273,13 @@ final class TtsEngine {
 
     /** تولیدِ استریم؛ sink برای هر تکه صدا زده می‌شه. اگه sink false بده، null برمی‌گرده (لغو). */
     private float[] synth(String t, float sp, final Sink sink) {
+        if (plain) {
+            com.k2fsa.sherpa.onnx.GeneratedAudio ga = tts.generate(t, 0, sp);
+            float[] all = ga == null ? null : ga.getSamples();
+            if (all == null || all.length == 0) return new float[0];
+            if (!sink.accept(all)) return null;
+            return all;
+        }
         final ArrayList<float[]> parts = new ArrayList<>();
         final boolean[] aborted = {false};
         tts.generateWithCallback(t, 0, sp, samples -> {
@@ -266,7 +308,8 @@ final class TtsEngine {
     /** صدای این متن رو پیش‌پیش می‌سازه و کش می‌کنه (برای جمله‌ی بعدی). */
     void prefetch(String text, float speed) {
         if (released || text == null || text.trim().isEmpty()) return;
-        final String t = text.trim();
+        final String t = sanitize(lang, text);
+        if (t.isEmpty()) return;
         final float sp = (speed <= 0f) ? 1.0f : speed;
         final String key = keyOf(t, sp);
         if (cacheHas(key)) return;
@@ -276,7 +319,7 @@ final class TtsEngine {
                 if (released || pfAbort.get() != g || cacheHas(key)) return;
                 inflightPrefetchKey = key;
                 try {
-                    TtsCrumb.mark("prefetch:" + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
+                    TtsCrumb.mark((plain ? "prefetchp:" : "prefetch:") + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
                     float[] audio = synth(t, sp, s -> !released && pfAbort.get() == g);
                     TtsCrumb.mark("idle");
                     if (audio != null) cachePut(key, audio);
@@ -302,7 +345,11 @@ final class TtsEngine {
             if (cb != null) cb.onDone(false);
             return;
         }
-        final String t = text.trim();
+        final String t = sanitize(lang, text);
+        if (t.isEmpty()) {
+            if (cb != null) cb.onDone(true);
+            return;
+        }
         final float sp = (speed <= 0f) ? 1.0f : speed;
         final String key = keyOf(t, sp);
         touch();
@@ -357,7 +404,7 @@ final class TtsEngine {
             }
             long t0 = SystemClock.uptimeMillis();
             final boolean[] first = {true};
-            TtsCrumb.mark("gen:" + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
+            TtsCrumb.mark((plain ? "genp:" : "gen:") + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
             float[] audio = synth(t, sp, s -> {
                 if (released || epoch.get() != myEpoch) return false;
                 if (first[0]) {

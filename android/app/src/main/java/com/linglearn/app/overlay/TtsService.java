@@ -97,9 +97,10 @@ public class TtsService extends Service {
                     final String lang = b.getString("lang", "en");
                     final String id = b.getString("id", "");
                     final float speed = b.getFloat("speed", 1.0f);
+                    final boolean plain = b.getBoolean("plain", false);
                     final int mySeq = speakSeq.incrementAndGet();
                     try {
-                        loader.execute(() -> doSpeak(text, lang, speed, id, mySeq));
+                        loader.execute(() -> doSpeak(text, lang, speed, id, mySeq, plain));
                     } catch (Throwable t) {
                         replyDone(lang, id, false, String.valueOf(t));
                     }
@@ -116,7 +117,10 @@ public class TtsService extends Service {
                     String lang = b.getString("lang", "en");
                     float speed = b.getFloat("speed", 1.0f);
                     TtsEngine e = engines.get(lang);
-                    if (e != null && !e.isReleased()) e.prefetch(text, speed);
+                    if (e != null && !e.isReleased()) {
+                        e.plain = b.getBoolean("plain", false);
+                        e.prefetch(text, speed);
+                    }
                     return true;
                 }
                 case MSG_PRELOAD: {
@@ -156,7 +160,7 @@ public class TtsService extends Service {
         }
     }
 
-    private void doSpeak(String text, String lang, float speed, String id, int mySeq) {
+    private void doSpeak(String text, String lang, float speed, String id, int mySeq, boolean plain) {
         try {
             TtsEngine engine = obtainEngine(lang, true);
             if (engine == null) {
@@ -164,6 +168,7 @@ public class TtsService extends Service {
                 replyDone(lang, id, false, err == null ? "failed to load TTS engine" : err);
                 return;
             }
+            engine.plain = plain;
             // وسطِ لود، stop() یا speak ی جدید اومده → این یکی دیگه پخش نشه
             if (mySeq != speakSeq.get()) {
                 replyDone(lang, id, true, null);
