@@ -66,6 +66,12 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- موتور Piper توی پردازه‌ی جدا: کرشِ native اپ رو نمی‌بنده -->
+        <service
+            android:name=".overlay.TtsService"
+            android:exported="false"
+            android:process=":tts" />
+
         <service
             android:name=".overlay.BubbleService"
             android:exported="false"
