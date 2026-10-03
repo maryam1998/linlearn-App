@@ -32,6 +32,9 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.speech.SpeechRecognizer;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.BackgroundColorSpan;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
@@ -570,7 +573,9 @@ public class BubbleService extends Service {
         final HashMap<String, Integer> applied = new HashMap<>();  // lang -> id of the newest request applied (drops stale answers)
         LinearLayout box;
         LinearLayout rowsBox;
+        LinearLayout srcRow;            // [🔊][متنِ اصلی]
         TextView tvSrc;
+        String srcLang = "en";          // زبانِ واقعیِ متنِ اصلیِ این جمله (برای 🔊 و کادرِ لغت)
         final HashMap<String, LinearLayout> rowBox = new HashMap<>();
         final HashMap<String, TextView> rowText = new HashMap<>();
     }
@@ -635,6 +640,9 @@ public class BubbleService extends Service {
         header.addView(headerButton("\u2715", v -> { userHidden = true; removePanel(); }));
         panel.addView(header, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        buildWordCard();
+        panel.addView(wordCard);   // LayoutParams (با margin) داخلِ buildWordCard ست شده
 
         scroll = new HistoryScroll(this);
         scroll.maxHeightPx = Math.max(dp(170), (int) (screenH() * 0.42f));
@@ -731,6 +739,7 @@ public class BubbleService extends Service {
     }
 
     private void removePanel() {
+        stopPanelSpeech();
         main.removeCallbacks(hidePanel);
         if (panelShown && panel != null && wm != null) {
             try { wm.removeView(panel); } catch (Exception ignored) {}
@@ -759,6 +768,8 @@ public class BubbleService extends Service {
     }
 
     private void clearHistory() {
+        stopPanelSpeech();
+        closeWordCard();
         history.clear();
         liveKey = null;
         live = null;
@@ -768,6 +779,381 @@ public class BubbleService extends Service {
         lastPartialSrc = "";
         refreshLayout();
     }
+
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  🔊 خواندنِ جمله  +  👆 انتخابِ لغت/محدوده → کادرِ «افزودن به داستان / گرامر / لایتنر»
+    // ════════════════════════════════════════════════════════════════════════════
+
+    /** Supplier ساده (java.util.function روی API 23 نیست). */
+    private interface Txt { String get(); }
+
+    private TextView speakingBtn;                 // دکمه‌ای که الان در حالِ خواندن است
+    private int speakToken = 0;
+    private volatile boolean panelSpeaking = false;
+    private volatile long panelQuietUntil = 0;
+
+    /** وقتی خودِ پنل دارد می‌خواند، صدای آن نباید دوباره به متنِ زنده تبدیل شود. */
+    private boolean asrMuted() {
+        return panelSpeaking || SystemClock.uptimeMillis() < panelQuietUntil;
+    }
+
+    private String currentSrcLang() {
+        if (yt != null && yt.isActive()) {
+            String t = yt.trackLang();
+            if (t != null && !t.isEmpty()) return t;
+        }
+        String s = effectiveSource();
+        return (s == null || "auto".equals(s)) ? "en" : s;
+    }
+
+    private TextView speakerButton(final Txt text,
+                                   final Txt lang) {
+        final TextView b = new TextView(this);
+        b.setText("\uD83D\uDD0A");
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        b.setTextColor(Color.WHITE);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(4), dp(3), dp(4), dp(3));
+        b.setOnClickListener(v -> toggleSpeak(b, text.get(), lang.get()));
+        return b;
+    }
+
+    private void setSpeaking(TextView b) {
+        TextView old = speakingBtn;
+        speakingBtn = b;
+        if (old != null && old != b) { old.setText("\uD83D\uDD0A"); old.setTextColor(Color.WHITE); }
+        if (b != null) { b.setText("\u23F9"); b.setTextColor(COLOR_GOLD); }
+    }
+
+    private void toggleSpeak(final TextView b, String text, String lang) {
+        if (text == null || text.trim().isEmpty() || text.equals("…")) return;
+        if (speakingBtn == b) { stopPanelSpeech(); return; }
+        setSpeaking(b);
+        final int my = ++speakToken;
+        panelSpeaking = true;
+        PanelTts.speak(this, text, lang, 1.0f, ok -> {
+            if (my != speakToken) return;               // پخشِ تازه‌تری شروع شده
+            panelSpeaking = false;
+            panelQuietUntil = SystemClock.uptimeMillis() + 1200;
+            if (speakingBtn == b) setSpeaking(null);
+        });
+    }
+
+    private void stopPanelSpeech() {
+        if (speakingBtn == null && !panelSpeaking) return;
+        speakToken++;
+        PanelTts.stop(this);
+        panelSpeaking = false;
+        panelQuietUntil = SystemClock.uptimeMillis() + 800;
+        TextView b = speakingBtn;
+        speakingBtn = null;
+        if (b != null) { b.setText("\uD83D\uDD0A"); b.setTextColor(Color.WHITE); }
+    }
+
+    // ───────── انتخابِ لغت (تپ) یا محدوده (لانگ‌پرس + کشیدن) ─────────
+
+    private static boolean isWordChar(char c) {
+        return Character.isLetterOrDigit(c) || c == '\'' || c == '\u2019' || c == '-' || c == '\u200C';
+    }
+
+    /** [start,end) لغتی که offset داخل/کنار آن است؛ null اگر روی فاصله/نشانه‌گذاری بود. */
+    private static int[] wordBounds(CharSequence t, int off) {
+        int n = t.length();
+        if (n == 0) return null;
+        if (off >= n) off = n - 1;
+        if (off < 0) off = 0;
+        if (!isWordChar(t.charAt(off))) {
+            if (off > 0 && isWordChar(t.charAt(off - 1))) off--;
+            else return null;
+        }
+        int a = off, b = off + 1;
+        while (a > 0 && isWordChar(t.charAt(a - 1))) a--;
+        while (b < n && isWordChar(t.charAt(b))) b++;
+        while (a < b && (t.charAt(a) == '\'' || t.charAt(a) == '\u2019' || t.charAt(a) == '-')) a++;
+        while (b > a && (t.charAt(b - 1) == '\'' || t.charAt(b - 1) == '\u2019' || t.charAt(b - 1) == '-')) b--;
+        return a < b ? new int[]{a, b} : null;
+    }
+
+    private void highlight(TextView tv, int a, int b) {
+        String plain = tv.getText().toString();
+        SpannableString ss = new SpannableString(plain);
+        if (a >= 0 && b > a && b <= plain.length()) {
+            ss.setSpan(new BackgroundColorSpan(Color.parseColor("#66C9A227")), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
+        tv.setText(ss);
+    }
+
+    private void clearHighlight(TextView tv) {
+        if (tv == null) return;
+        CharSequence c = tv.getText();
+        if (c instanceof Spanned) tv.setText(c.toString());
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private void attachSelect(final TextView tv, final Txt langOf) {
+        final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
+        final int[] st = new int[]{0, 0, 0};          // anchorOffset, curOffset, mode(0 idle / 1 pending / 2 selecting)
+        final float[] down = new float[2];
+        final Runnable longPress = () -> {
+            if (st[2] != 1) return;
+            st[2] = 2;
+            tv.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            if (tv.getParent() != null) tv.getParent().requestDisallowInterceptTouchEvent(true);
+            int[] w = wordBounds(tv.getText(), st[0]);
+            if (w != null) highlight(tv, w[0], w[1]);
+        };
+        tv.setOnTouchListener((v, ev) -> {
+            CharSequence txt = tv.getText();
+            if (txt == null || txt.length() == 0) return false;
+            int off = tv.getOffsetForPosition(ev.getX(), ev.getY());
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    down[0] = ev.getX(); down[1] = ev.getY();
+                    st[0] = off; st[1] = off; st[2] = 1;
+                    main.postDelayed(longPress, ViewConfiguration.getLongPressTimeout());
+                    return true;
+                case MotionEvent.ACTION_MOVE:
+                    if (st[2] == 1 && (Math.abs(ev.getX() - down[0]) > slop || Math.abs(ev.getY() - down[1]) > slop)) {
+                        st[2] = 0;                                   // کشیدنِ معمولی → اسکرولِ لیست
+                        main.removeCallbacks(longPress);
+                        return true;
+                    }
+                    if (st[2] == 2) {
+                        st[1] = off;
+                        int[] a = wordBounds(txt, st[0]), c = wordBounds(txt, st[1]);
+                        if (a != null && c != null) highlight(tv, Math.min(a[0], c[0]), Math.max(a[1], c[1]));
+                    }
+                    return true;
+                case MotionEvent.ACTION_UP: {
+                    main.removeCallbacks(longPress);
+                    int mode = st[2];
+                    st[2] = 0;
+                    String full = txt.toString();
+                    int a0 = -1, b0 = -1;
+                    if (mode == 1) {
+                        int[] w = wordBounds(full, st[0]);
+                        if (w != null) { a0 = w[0]; b0 = w[1]; }
+                    } else if (mode == 2) {
+                        int[] a = wordBounds(full, st[0]), c = wordBounds(full, st[1]);
+                        if (a != null && c != null) { a0 = Math.min(a[0], c[0]); b0 = Math.max(a[1], c[1]); }
+                        else if (a != null) { a0 = a[0]; b0 = a[1]; }
+                    }
+                    if (a0 >= 0 && b0 > a0) {
+                        highlight(tv, a0, b0);
+                        openWordCard(full.substring(a0, b0).trim(), langOf.get(), full, tv);
+                    } else {
+                        clearHighlight(tv);
+                    }
+                    return true;
+                }
+                case MotionEvent.ACTION_CANCEL:
+                    main.removeCallbacks(longPress);
+                    if (st[2] == 2) clearHighlight(tv);
+                    st[2] = 0;
+                    return true;
+            }
+            return false;
+        });
+    }
+
+    // ───────── کادرِ لغت: معنی + سه دکمه‌ی اپ ─────────
+
+    private LinearLayout wordCard;
+    private TextView cardTerm, cardMeaningTv, cardBtnStory, cardBtnGrammar, cardBtnLeitner;
+    private TextView cardSrcTv;                       // متنی که هایلایت دارد
+    private String cardWord, cardLang, cardSentence, cardMeaning = "", cardMeaningLang;
+    private boolean cardStoryDone, cardGrammarDone, cardLeitnerDone;
+    private int cardSeq = 0;
+
+    private TextView cardAction(String label, View.OnClickListener l) {
+        TextView b = new TextView(this);
+        b.setText(label);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setTextColor(Color.WHITE);
+        b.setPadding(dp(10), dp(6), dp(10), dp(6));
+        b.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+        b.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
+        b.setOnClickListener(l);
+        styleCardAction(b, false);
+        return b;
+    }
+
+    private void styleCardAction(TextView b, boolean done) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Color.parseColor("#14FFFFFF"));
+        g.setCornerRadius(dp(8));
+        g.setStroke(dp(1), done ? COLOR_GOLD : Color.parseColor("#40FFFFFF"));
+        b.setBackground(g);
+        b.setTextColor(done ? COLOR_GOLD : Color.WHITE);
+    }
+
+    private void buildWordCard() {
+        wordCard = new LinearLayout(this);
+        wordCard.setOrientation(LinearLayout.VERTICAL);
+        wordCard.setPadding(dp(10), dp(8), dp(10), dp(10));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.parseColor("#26335F"));
+        bg.setCornerRadius(dp(12));
+        bg.setStroke(dp(1), COLOR_GOLD);
+        wordCard.setBackground(bg);
+        wordCard.setVisibility(View.GONE);
+        LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        wlp.topMargin = dp(6);
+        wlp.bottomMargin = dp(4);
+        wordCard.setLayoutParams(wlp);
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        cardTerm = new TextView(this);
+        cardTerm.setTextColor(Color.WHITE);
+        cardTerm.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        cardTerm.setTypeface(Typeface.DEFAULT_BOLD);
+        cardTerm.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+        cardTerm.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
+        top.addView(cardTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        top.addView(speakerButton(() -> cardWord, () -> cardLang));
+        top.addView(headerButton("\u2715", v -> closeWordCard()));
+        wordCard.addView(top);
+
+        cardMeaningTv = new TextView(this);
+        cardMeaningTv.setTextColor(Color.parseColor("#E8EAF2"));
+        cardMeaningTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        cardMeaningTv.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+        cardMeaningTv.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
+        cardMeaningTv.setPadding(0, dp(2), 0, dp(6));
+        wordCard.addView(cardMeaningTv);
+
+        cardBtnStory = cardAction("", v -> onCardStory());
+        cardBtnGrammar = cardAction("", v -> onCardGrammar());
+        cardBtnLeitner = cardAction("", v -> onCardLeitner());
+        for (TextView b : new TextView[]{cardBtnStory, cardBtnGrammar, cardBtnLeitner}) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = dp(5);
+            wordCard.addView(b, lp);
+        }
+    }
+
+    private void refreshCardButtons() {
+        cardBtnStory.setText(cardStoryDone
+                ? msg("\uD83D\uDD16 ذخیره شد برای داستان بعدی", "\uD83D\uDD16 Saved for next story")
+                : msg("\uD83D\uDD16 ذخیره برای داستان بعدی", "\uD83D\uDD16 Save for next story"));
+        cardBtnGrammar.setText(cardGrammarDone
+                ? msg("\uD83E\uDDE9 ذخیره شد در گرامر", "\uD83E\uDDE9 Saved to grammar")
+                : msg("\uD83E\uDDE9 افزودن به یادگیری گرامر", "\uD83E\uDDE9 Add to grammar learning"));
+        cardBtnLeitner.setText(cardLeitnerDone
+                ? msg("\uD83D\uDD01 به جعبه‌ی لایتنر اضافه شد", "\uD83D\uDD01 Added to Leitner box")
+                : msg("\uD83D\uDD01 افزودن به جعبه‌ی لایتنر", "\uD83D\uDD01 Add to Leitner box"));
+        styleCardAction(cardBtnStory, cardStoryDone);
+        styleCardAction(cardBtnGrammar, cardGrammarDone);
+        styleCardAction(cardBtnLeitner, cardLeitnerDone);
+    }
+
+    private void setScrollCompact(boolean compact) {
+        if (scroll == null) return;
+        scroll.maxHeightPx = compact
+                ? Math.max(dp(90), (int) (screenH() * 0.22f))
+                : Math.max(dp(170), (int) (screenH() * 0.42f));
+        scroll.requestLayout();
+    }
+
+    private void closeWordCard() {
+        cardSeq++;
+        if (cardSrcTv != null) { clearHighlight(cardSrcTv); cardSrcTv = null; }
+        if (wordCard == null || wordCard.getVisibility() == View.GONE) return;
+        wordCard.setVisibility(View.GONE);
+        setScrollCompact(false);
+        refreshLayout();
+    }
+
+    private void openWordCard(final String word, final String lang, final String sentence, final TextView srcTv) {
+        if (word == null || word.isEmpty() || wm == null || bubble == null) return;
+        ensurePanel();
+        if (cardSrcTv != null && cardSrcTv != srcTv) clearHighlight(cardSrcTv);
+        cardSrcTv = srcTv;
+        final int my = ++cardSeq;
+        cardWord = word;
+        cardLang = (lang == null || lang.isEmpty() || "auto".equals(lang)) ? "en" : lang;
+        cardSentence = sentence == null ? word : sentence;
+        cardMeaning = "";
+        cardStoryDone = cardGrammarDone = cardLeitnerDone = false;
+        final String nativeL = targetLang();
+        String other = currentSrcLang();
+        cardMeaningLang = cardLang.equals(nativeL) ? (other.equals(cardLang) ? "en" : other) : nativeL;
+
+        cardTerm.setText(word);
+        cardMeaningTv.setText("…");
+        refreshCardButtons();
+        wordCard.setVisibility(View.VISIBLE);
+        setScrollCompact(true);
+        if (!userHidden) showPanel(); else refreshLayout();
+
+        final String from = cardLang, to = cardMeaningLang;
+        if (hasInternet()) {
+            try {
+                netTr.execute(() -> {
+                    String out;
+                    try { out = FreeTranslator.translate(HTTP_FAST, word, from, to); }
+                    catch (Exception ex) { out = ""; }
+                    final String res = out == null ? "" : out.trim();
+                    main.post(() -> onCardMeaning(my, res));
+                });
+            } catch (Exception ex) { onCardMeaning(my, ""); }
+        } else {
+            final Translator tr = localTr;
+            if (localReady && tr != null && from.equals(effectiveSource()) && to.equals(primaryTarget())) {
+                tr.translate(word)
+                        .addOnSuccessListener(o -> onCardMeaning(my, o == null ? "" : o.trim()))
+                        .addOnFailureListener(x -> onCardMeaning(my, ""));
+            } else {
+                onCardMeaning(my, "");
+            }
+        }
+    }
+
+    private void onCardMeaning(int token, String meaning) {
+        if (token != cardSeq || cardMeaningTv == null) return;
+        if (meaning == null || meaning.isEmpty()) {
+            cardMeaningTv.setText(msg("ترجمه در دسترس نیست — ذخیره بدون معنی هم کار می‌کند",
+                    "No translation — saving still works"));
+            return;
+        }
+        cardMeaning = meaning;
+        cardMeaningTv.setText(meaning);
+        // اگر قبل از رسیدنِ معنی دکمه‌ای زده شده بود، همان ردیف با معنی به‌روز می‌شود (گرامر یک‌بار ثبت می‌شود)
+        if (cardStoryDone) queueWord("story");
+        if (cardLeitnerDone) queueWord("leitner");
+        refreshLayout();
+    }
+
+    private void queueWord(String action) {
+        if (cardWord == null || cardWord.isEmpty()) return;
+        try {
+            String lc = cardLang == null ? "en" : cardLang;
+            JSONObject o = new JSONObject()
+                    .put("key", action + "|" + lc + "|" + cardWord.toLowerCase(Locale.ROOT))
+                    .put("action", action)
+                    .put("word", cardWord)
+                    .put("lang", lc)
+                    .put("meaning", cardMeaning == null ? "" : cardMeaning)
+                    .put("meaningLang", cardMeaningLang == null ? "fa" : cardMeaningLang)
+                    .put("sentence", cardSentence == null ? cardWord : cardSentence)
+                    .put("rev", System.currentTimeMillis());
+            WordQueue.add(this, o);
+            BubblePlugin.notifyWordQueued();
+        } catch (Throwable t) {
+            showNotice(msg("ذخیره نشد", "Save failed"));
+        }
+    }
+
+    private void onCardStory()   { if (cardStoryDone) return;   cardStoryDone = true;   queueWord("story");   refreshCardButtons(); }
+    private void onCardGrammar() { if (cardGrammarDone) return; cardGrammarDone = true; queueWord("grammar"); refreshCardButtons(); }
+    private void onCardLeitner() { if (cardLeitnerDone) return; cardLeitnerDone = true; queueWord("leitner"); refreshCardButtons(); }
 
     private Entry newEntry() {
         ensurePanel();
@@ -791,7 +1177,16 @@ public class BubbleService extends Service {
                 ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
         dlp.topMargin = dp(8);
 
-        e.box.addView(e.tvSrc);
+        e.srcLang = currentSrcLang();
+        attachSelect(e.tvSrc, () -> e.srcLang);
+        TextView srcSpeak = speakerButton(() -> e.src, () -> e.srcLang);
+        e.srcRow = new LinearLayout(this);
+        e.srcRow.setOrientation(LinearLayout.HORIZONTAL);
+        e.srcRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        e.srcRow.addView(srcSpeak, new LinearLayout.LayoutParams(dp(32), ViewGroup.LayoutParams.WRAP_CONTENT));
+        e.srcRow.addView(e.tvSrc, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        e.box.addView(e.srcRow);
         e.box.addView(e.rowsBox);
         e.box.addView(divider, dlp);
         listBox.addView(e.box, new LinearLayout.LayoutParams(
@@ -819,7 +1214,7 @@ public class BubbleService extends Service {
         tag.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
         tag.setTypeface(Typeface.DEFAULT_BOLD);
         tag.setMinWidth(dp(26));
-        tag.setPadding(0, dp(5), dp(6), 0);
+        tag.setPadding(dp(4), dp(2), 0, 0);
 
         TextView tv = new TextView(this);
         tv.setTextColor(Color.WHITE);
@@ -828,8 +1223,15 @@ public class BubbleService extends Service {
         tv.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         tv.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
 
-        row.addView(tag, new LinearLayout.LayoutParams(
+        attachSelect(tv, () -> lang);
+        TextView rowSpeak = speakerButton(() -> tv.getText().toString(), () -> lang);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.addView(tag, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        col.addView(rowSpeak, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        row.addView(col, new LinearLayout.LayoutParams(dp(32), ViewGroup.LayoutParams.WRAP_CONTENT));
         row.addView(tv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         e.rowsBox.addView(row);
         e.rowBox.put(lang, row);
@@ -852,7 +1254,7 @@ public class BubbleService extends Service {
         else { showSrc = true; showTr = !ts.isEmpty(); }
 
         e.tvSrc.setText(e.src);
-        e.tvSrc.setVisibility(showSrc && !e.src.isEmpty() ? View.VISIBLE : View.GONE);
+        e.srcRow.setVisibility(showSrc && !e.src.isEmpty() ? View.VISIBLE : View.GONE);
 
         for (String t : ts) {
             if (!e.rowBox.containsKey(t)) makeRow(e, t);   // created in target order -> stable order on screen
@@ -887,6 +1289,7 @@ public class BubbleService extends Service {
 
     private void onPartialText(final String text) {
         if (wm == null || bubble == null || text == null || text.isEmpty()) return;
+        if (asrMuted()) return;
         if (live == null) live = newEntry();
         live.src = text;
         clearStatus();
@@ -958,6 +1361,7 @@ public class BubbleService extends Service {
 
     private void onFinalText(final String text) {
         if (wm == null || bubble == null || text == null || text.trim().isEmpty()) return;
+        if (asrMuted()) return;
         // the server sometimes returns the same final text several times - show it once
         if (text.equals(lastFinalText)) {
             Log.d(TAG, "skipping duplicate final text");
@@ -1372,6 +1776,7 @@ public class BubbleService extends Service {
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .excludeUid(android.os.Process.myUid())
                 .build();
         int[] rates = {48000, 44100, SAMPLE_RATE};
         for (int rate : rates) {
@@ -1515,6 +1920,7 @@ public class BubbleService extends Service {
                     .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                     .addMatchingUsage(AudioAttributes.USAGE_GAME)
                     .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .excludeUid(android.os.Process.myUid())
                     .build();
             AudioFormat fmt = new AudioFormat.Builder()
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)

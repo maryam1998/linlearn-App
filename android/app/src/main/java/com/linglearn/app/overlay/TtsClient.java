@@ -84,6 +84,23 @@ final class TtsClient {
         } catch (Throwable ignored) {}
     }
 
+    /** پنلِ شناور (BubbleService) وقتی اپ بسته است هم باید بتواند بخواند؛ فقط اگر هنوز init نشده init می‌کند
+     *  (listenerِ پلاگین را که بعداً در load() ست می‌شود خراب نمی‌کند). */
+    static void initIfNeeded(Context ctx) {
+        synchronized (LOCK) {
+            if (replyTo != null) return;
+        }
+        init(ctx, (lang, text, id, ok) -> {});
+    }
+
+    /** callbackِ یک‌بارمصرف برای یک پخشِ مشخص (id) — مستقل از listenerِ اصلی (که به JS می‌رود). */
+    private static final ConcurrentHashMap<String, Listener> ONESHOT = new ConcurrentHashMap<>();
+
+    static void speakWith(String lang, String text, float speed, String id, Listener cb) {
+        if (cb != null && id != null) ONESHOT.put(id, cb);
+        speak(lang, text, speed, id);
+    }
+
     // ================= API =================
 
     static boolean isBlocked(String lang) {
@@ -356,6 +373,12 @@ final class TtsClient {
     }
 
     private static void emit(String lang, String text, String id, boolean ok) {
+        if (id != null && !id.isEmpty()) {
+            Listener one = ONESHOT.remove(id);
+            if (one != null) {
+                try { one.onDone(lang, text, id, ok); } catch (Throwable t) { Log.w(TAG, "oneshot failed", t); }
+            }
+        }
         Listener l = listener;
         if (l == null) return;
         try { l.onDone(lang, text, id, ok); } catch (Throwable t) { Log.w(TAG, "listener failed", t); }

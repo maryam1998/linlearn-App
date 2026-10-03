@@ -67,9 +67,19 @@ public class BubblePlugin extends Plugin {
         intent.setData(null);
     }
 
+    private static volatile BubblePlugin inst;
+
+    /** از پنلِ شناور: «یه لغت تو صفِ اپ گذاشته شد» — اگه اپ زنده است همان لحظه وارد می‌شود. */
+    static void notifyWordQueued() {
+        BubblePlugin p = inst;
+        if (p == null) return;
+        try { p.notifyListeners("wordQueued", new JSObject()); } catch (Throwable ignored) {}
+    }
+
     @Override
     public void load() {
         super.load();
+        inst = this;
         try {
             TtsClient.init(getContext(), (lang, text, id, ok) ->
                     emitSpeakDone(lang, text, id.isEmpty() ? null : id, ok));
@@ -243,6 +253,23 @@ public class BubblePlugin extends Plugin {
     public void ytSavedAck(PluginCall call) {
         try {
             YtSaved.ack(getContext(), call.getArray("items"));
+        } catch (Exception ignored) {}
+        call.resolve();
+    }
+
+    // wordQueueList() → { items: [...] } — لغت/عبارت‌هایی که از پنلِ شناور زده شده و هنوز وارد اپ نشده
+    @PluginMethod
+    public void wordQueueList(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("items", WordQueue.list(getContext()));
+        call.resolve(ret);
+    }
+
+    // wordQueueAck({ items: [{ key, rev }] }) — بعد از واردشدن به اپ، از صف پاک می‌شوند
+    @PluginMethod
+    public void wordQueueAck(PluginCall call) {
+        try {
+            WordQueue.ack(getContext(), call.getArray("items"));
         } catch (Exception ignored) {}
         call.resolve();
     }
@@ -540,7 +567,7 @@ public class BubblePlugin extends Plugin {
     // ---------------- TTS خودِ گوشی (android.speech.tts) ----------------
     private static volatile SystemTts systemTts;
 
-    private static SystemTts sys(Context ctx) {
+    static SystemTts sys(Context ctx) {
         SystemTts s = systemTts;
         if (s == null) {
             synchronized (BubblePlugin.class) {

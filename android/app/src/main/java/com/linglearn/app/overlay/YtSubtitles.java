@@ -103,6 +103,7 @@ final class YtSubtitles {
     private String curTitle = "";
     private List<Cue> cues = new ArrayList<>();
     private String trackLang = "en";
+    String trackLang() { return trackLang; }
     private final HashMap<String, String[]> trs = new HashMap<>();   // lang -> ترجمه‌ی هر خط (null = هنوز نه)
     private final HashSet<String> done = new HashSet<>();            // "lang#chunk"
     private final HashMap<String, Integer> fails = new HashMap<>();
