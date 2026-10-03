@@ -302,7 +302,7 @@ public class BubblePlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("supported", SherpaModelManager.isTtsAvailable(lang));
         ret.put("downloaded", SherpaModelManager.getTtsModelDir(ctx, lang) != null);
-        ret.put("downloading", SherpaModelManager.isDownloading());
+        ret.put("downloading", SherpaModelManager.isTtsDownloading(lang));
         call.resolve(ret);
     }
 
@@ -320,9 +320,10 @@ public class BubblePlugin extends Plugin {
         }
         JSObject ret = new JSObject();
         ret.put("languages", arr);
-        ret.put("downloading", SherpaModelManager.isDownloading());
-        String dl = SherpaModelManager.getTtsDownloadingLang();
-        if (dl != null) ret.put("downloadingLang", dl);
+        ret.put("downloading", SherpaModelManager.isTtsDownloading());
+        JSArray dls = new JSArray();
+        for (String x : SherpaModelManager.getTtsDownloadingLangs()) dls.put(x);
+        ret.put("downloadingLangs", dls);
         call.resolve(ret);
     }
 
@@ -342,6 +343,9 @@ public class BubblePlugin extends Plugin {
             call.resolve(ret);
             return;
         }
+
+        // سرویس پیش‌زمینه: دانلود حتی بعد از بیرون‌رفتن از اپ ادامه پیدا می‌کنه
+        ModelDownloadService.start(ctx);
 
         SherpaModelManager.downloadTtsModel(ctx.getApplicationContext(), lang,
                 new SherpaModelManager.ProgressCallback() {
@@ -485,10 +489,59 @@ public class BubblePlugin extends Plugin {
         e.prefetch(text, (sp == null || sp <= 0) ? 1.0f : sp.floatValue());
     }
 
+    // ---------------- TTS خودِ گوشی (android.speech.tts) ----------------
+    private static volatile SystemTts systemTts;
+
+    private static SystemTts sys(Context ctx) {
+        SystemTts s = systemTts;
+        if (s == null) {
+            synchronized (BubblePlugin.class) {
+                if (systemTts == null) systemTts = new SystemTts(ctx.getApplicationContext());
+                s = systemTts;
+            }
+        }
+        return s;
+    }
+
+    // checkSystemTts({ lang }) → { available }
+    @PluginMethod
+    public void checkSystemTts(final PluginCall call) {
+        final Context ctx = getContext().getApplicationContext();
+        final String lang = call.getString("lang", "en");
+        new Thread(() -> {
+            JSObject ret = new JSObject();
+            ret.put("available", sys(ctx).isLanguageAvailable(lang));
+            call.resolve(ret);
+        }, "sys-tts-check").start();
+    }
+
+    // speakSystem({ text, lang, speed, id }) — بعد از پایان، رویداد «ttsSpeakDone» با { id, ok }
+    @PluginMethod
+    public void speakSystem(final PluginCall call) {
+        final Context ctx = getContext().getApplicationContext();
+        final String text = call.getString("text");
+        final String lang = call.getString("lang", "en");
+        final String id = call.getString("id");
+        Double sp = call.getDouble("speed", 1.0);
+        final float speed = (sp == null || sp <= 0) ? 1.0f : sp.floatValue();
+        if (text == null || text.trim().isEmpty()) {
+            call.reject("text is empty");
+            return;
+        }
+        call.resolve();
+        final int mySeq = SPEAK_SEQ.incrementAndGet();
+        new Thread(() -> {
+            if (mySeq != SPEAK_SEQ.get()) { emitSpeakDone(lang, text, id, true); return; }
+            sys(ctx).speak(text, lang, speed, id, ok -> emitSpeakDone(lang, text, id, ok));
+        }, "sys-tts-speak").start();
+    }
+
     /** ✅ توقف TTS */
     @PluginMethod
     public void stopSpeaking(PluginCall call) {
         SPEAK_SEQ.incrementAndGet();
+        SystemTts st = systemTts;
+        if (st != null) st.stop();
         for (TtsEngine e : ENGINES.values()) {
             try { e.stop(); } catch (Throwable ignored) {}
         }

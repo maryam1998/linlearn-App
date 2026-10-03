@@ -14,6 +14,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.json.JSONArray;
@@ -125,7 +127,18 @@ final class SherpaModelManager {
     private static final OkHttpClient HTTP = new OkHttpClient();
     private static final AtomicBoolean DOWNLOADING = new AtomicBoolean(false);
     private static volatile boolean DOWNLOADING_STATE = false;
-    private static volatile String TTS_DOWNLOADING_LANG = null;
+    // دانلودِ TTS برای هر زبان مستقله؛ چند زبان می‌تونن هم‌زمان دانلود بشن
+    private static final Set<String> TTS_ACTIVE = ConcurrentHashMap.newKeySet();
+    // espeak-ng-data بینِ همه‌ی زبان‌ها مشترکه؛ فقط یک نخ دانلودش می‌کنه، بقیه صبر می‌کنن
+    private static final Object ESPEAK_LOCK = new Object();
+    // آخرین مقدارِ پیشرفتِ هر زبان (بایت) — برای نوتیفیکیشنِ سرویسِ دانلود
+    private static final Map<String, Long> TTS_BYTES = new ConcurrentHashMap<>();
+
+    static long getTtsDownloadedBytes() {
+        long sum = 0;
+        for (Long v : TTS_BYTES.values()) if (v != null) sum += v;
+        return sum;
+    }
 
     // ============ متدهای مشترک ============
     static String normalize(String lang) {
@@ -181,9 +194,16 @@ final class SherpaModelManager {
         return new ArrayList<>(TTS_SPECS.keySet());
     }
 
-    /** زبانی که الان مدل TTS‌اش در حال دانلوده (یا null). */
-    static String getTtsDownloadingLang() {
-        return DOWNLOADING_STATE ? TTS_DOWNLOADING_LANG : null;
+    /** زبان‌هایی که مدل TTS‌شون همین الان در حال دانلوده. */
+    static List<String> getTtsDownloadingLangs() {
+        return new ArrayList<>(TTS_ACTIVE);
+    }
+
+    static boolean isTtsDownloading() { return !TTS_ACTIVE.isEmpty(); }
+
+    static boolean isTtsDownloading(String lang) {
+        String l = normalize(lang);
+        return l != null && TTS_ACTIVE.contains(l);
     }
 
     /** espeak-ng-data مشترکِ همه‌ی مدل‌های Piper (یک بار دانلود می‌شه). */
@@ -268,6 +288,7 @@ final class SherpaModelManager {
     }
 
     // ============ دانلود TTS ============
+    // هر زبان توی نخِ خودش دانلود می‌شه، پس می‌شه همه‌ی زبان‌ها رو هم‌زمان زد.
     static void downloadTtsModel(final Context ctx, final String lang, final ProgressCallback cb) {
         final Context app = ctx.getApplicationContext();
         final String l = normalize(lang);
@@ -276,50 +297,67 @@ final class SherpaModelManager {
             if (cb != null) cb.onError(String.valueOf(lang), new IllegalArgumentException("no TTS for " + lang));
             return;
         }
-        if (!DOWNLOADING.compareAndSet(false, true)) {
-            if (cb != null) cb.onError(l, new IllegalStateException("another download is running"));
+        if (!TTS_ACTIVE.add(l)) {
+            // همین زبان همین الان در حال دانلوده؛ دوباره شروعش نمی‌کنیم
             return;
         }
-        TTS_DOWNLOADING_LANG = l;
-        DOWNLOADING_STATE = true;
         Thread t = new Thread(() -> {
             try {
-                File dir = ttsDirFor(app, l);
-                if (!dir.isDirectory() && !dir.mkdirs()) throw new java.io.IOException("cannot create " + dir);
-
-                // ۱. دانلود model.onnx
-                File modelTarget = new File(dir, "model.onnx");
-                if (!modelTarget.isFile() || modelTarget.length() == 0) {
-                    downloadFile(
-                            HF_BASE + s.repo + "/resolve/main/" + s.modelFile,
-                            modelTarget, cb, l);
+                Exception last = null;
+                for (int attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        downloadTtsOnce(app, l, s, new ProgressCallback() {
+                            @Override public void onProgress(String lg, long done, long total) {
+                                TTS_BYTES.put(l, done);
+                                if (cb != null) cb.onProgress(lg, done, total);
+                            }
+                            @Override public void onDone(String lg) {}
+                            @Override public void onError(String lg, Exception e) {}
+                        });
+                        last = null;
+                        break;
+                    } catch (Exception e) {
+                        last = e;
+                        Log.w(TAG, "TTS download attempt " + attempt + " failed for " + l, e);
+                        try { Thread.sleep(1500L * attempt); } catch (InterruptedException ie) { break; }
+                    }
                 }
-
-                // ۲. دانلود tokens.txt
-                File tokensTarget = new File(dir, "tokens.txt");
-                if (!tokensTarget.isFile() || tokensTarget.length() == 0) {
-                    downloadFile(
-                            HF_BASE + s.repo + "/resolve/main/" + s.tokensFile,
-                            tokensTarget, cb, l);
+                if (last != null) {
+                    if (cb != null) cb.onError(l, last);
+                } else {
+                    if (cb != null) cb.onDone(l);
                 }
-
-                // ۳. دانلود espeak-ng-data مشترک (فقط یک بار برای همه‌ی زبان‌ها)
-                if (!isEspeakReady(app)) {
-                    downloadEspeakData(app, s.repo, cb, l);
-                }
-
-                if (cb != null) cb.onDone(l);
-            } catch (Exception e) {
-                Log.w(TAG, "TTS download failed for " + l, e);
-                if (cb != null) cb.onError(l, e);
             } finally {
-                TTS_DOWNLOADING_LANG = null;
-                DOWNLOADING.set(false);
-                DOWNLOADING_STATE = false;
+                TTS_BYTES.remove(l);
+                TTS_ACTIVE.remove(l);
             }
-        }, "sherpa-tts-download");
+        }, "sherpa-tts-download-" + l);
         t.setDaemon(true);
         t.start();
+    }
+
+    private static void downloadTtsOnce(Context app, String l, TtsSpec s, ProgressCallback cb) throws Exception {
+        // ۱. espeak-ng-data مشترک (فقط یک بار؛ بقیه‌ی زبان‌ها همین‌جا صبر می‌کنن تا تموم شه)
+        synchronized (ESPEAK_LOCK) {
+            if (!isEspeakReady(app)) {
+                downloadEspeakData(app, s.repo, cb, l);
+            }
+        }
+
+        File dir = ttsDirFor(app, l);
+        if (!dir.isDirectory() && !dir.mkdirs()) throw new java.io.IOException("cannot create " + dir);
+
+        // ۲. tokens.txt
+        File tokensTarget = new File(dir, "tokens.txt");
+        if (!tokensTarget.isFile() || tokensTarget.length() == 0) {
+            downloadFile(HF_BASE + s.repo + "/resolve/main/" + s.tokensFile, tokensTarget, cb, l);
+        }
+
+        // ۳. model.onnx (بزرگ‌ترین فایل)
+        File modelTarget = new File(dir, "model.onnx");
+        if (!modelTarget.isFile() || modelTarget.length() == 0) {
+            downloadFile(HF_BASE + s.repo + "/resolve/main/" + s.modelFile, modelTarget, cb, l);
+        }
     }
 
     /**
