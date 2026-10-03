@@ -72,7 +72,7 @@ final class YtSubtitles {
         void update(int idx, String lang, String text);
     }
 
-    private static final class Cue {
+    static final class Cue {
         final long startMs;
         final long endMs;
         final String text;
@@ -85,11 +85,16 @@ final class YtSubtitles {
     private final OkHttpClient http;
     private final OkHttpClient httpFast;
     private final Handler main = new Handler(Looper.getMainLooper());
-    private final ExecutorService netCaps = Executors.newSingleThreadExecutor();
+    private final ExecutorService netCaps = Executors.newCachedThreadPool();   // fetchهای ویدیوی قبلی جلوی ویدیوی جدید را نگیرند
     private final ExecutorService netChunk = Executors.newSingleThreadExecutor();   // فقط یک chunk هم‌زمان
     private final ExecutorService netQuick = Executors.newFixedThreadPool(2);
     private final YtMedia.Tracker tracker;
     private final Map<String, String> idByTitle = new HashMap<>();
+    // کشِ زیرنویسِ ویدیوهای اخیر (پخشِ دوباره / seek به ویدیوی قبلی فوری باشد)
+    private final Map<String, YtCaptionFetcher.Out> capCache = java.util.Collections.synchronizedMap(
+            new java.util.LinkedHashMap<String, YtCaptionFetcher.Out>(8, 0.75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, YtCaptionFetcher.Out> e) { return size() > 6; }
+            });
 
     private volatile boolean active = false;
     private volatile int gen = 0;                 // با هر ویدیو بالا می‌ره؛ جوابِ دیررسیده‌ی ویدیوی قبلی دور ریخته می‌شه
@@ -162,18 +167,13 @@ final class YtSubtitles {
     private void onState(YtMedia.State s) {
         if (!active) return;
         last = s;
-        if (!s.hasSession) {
-            if (cues.isEmpty()) {
-                host.notice(msg("ویدیوی یوتیوب پیدا نشد؛ یک ویدیو را پخش کن", "No YouTube video found — play one"));
-            }
-            return;
-        }
+        if (!s.hasSession) return;
         String key = keyOf(s);
         if (key.equals(curKey)) return;
         curKey = key;
         main.removeCallbacks(loadRunnable);
-        // با videoId سریع؛ بدون videoId کمی صبر می‌کنیم تا عنوانِ تبلیغ/گذرا جستجو نشه
-        main.postDelayed(loadRunnable, s.videoId != null ? 250 : 1500);
+        // با videoId فوری؛ بدون videoId کمی صبر می‌کنیم تا عنوانِ تبلیغ/گذرا جستجو نشه
+        main.postDelayed(loadRunnable, s.videoId != null ? 0 : 400);
     }
 
     private String keyOf(YtMedia.State s) {
@@ -192,30 +192,27 @@ final class YtSubtitles {
         // MediaSession شناسه نداد → از روی عنوان (+مدت و کانال) پیداش کن
         resetVideo();
         curTitle = s.title;
-        host.notice(msg("در حال پیدا کردن ویدیو…", "Identifying the video…"));
         final int g = gen;
         final String title = s.title, channel = s.channel;
         final long dur = s.durationMs / 1000;
         netCaps.execute(() -> {
             String found = null;
+            String err = null;
             try {
-                String url = base + RESOLVE_PATH + "?title=" + enc(title) + "&channel=" + enc(channel)
-                        + "&durationSec=" + dur;
-                JSONObject j = new JSONObject(getString(httpFast, url));
-                String v = j.optString("videoId", "");
-                if (YtMedia.isValidYouTubeVideoId(v)) found = v;
+                found = YtCaptionFetcher.resolve(httpFast, base, title, channel, dur);
             } catch (Exception e) {
                 Log.w(TAG, "resolve failed: " + e);
+                err = e.getMessage() == null ? "error" : e.getMessage();
             }
-            final String id2 = found;
+            final String id2 = found, ferr = err;
             main.post(() -> {
                 if (g != gen || !active) return;
                 if (id2 == null) {
-                    host.notice(msg("نتوانستم این ویدیو را تشخیص بدهم (شناسه‌ی ویدیو از یوتیوب نیامد)",
-                            "Couldn't identify this video"));
+                    host.notice(msg("نتوانستم ویدیو را تشخیص بدهم: ", "Couldn't identify the video: ") + ferr);
                     return;
                 }
                 idByTitle.put(title, id2);
+                curKey = id2;     // تا با تغییرِ کلید دوباره لود نشود
                 loadCaptions(id2, title);
             });
         });
@@ -238,42 +235,37 @@ final class YtSubtitles {
         String want = host.requestedSource();
         if (want == null || want.isEmpty() || "auto".equals(want)) want = "en";
         final String wantLang = want;
-        host.notice(msg("در حال گرفتن زیرنویس…", "Fetching captions…"));
+        final String cacheKey = videoId + "|" + wantLang;
         netCaps.execute(() -> {
-            List<Cue> out = new ArrayList<>();
-            String lang = wantLang;
+            YtCaptionFetcher.Out got = capCache.get(cacheKey);
             String err = null;
-            try {
-                String url = base + CAPTIONS_PATH + "?videoId=" + enc(videoId) + "&lang=" + enc(wantLang);
-                JSONObject j = new JSONObject(getString(http, url));
-                if (!j.optBoolean("ok", false)) throw new Exception(j.optString("error", "no captions"));
-                lang = normLang(j.optString("lang", wantLang));
-                JSONArray arr = j.getJSONArray("cues");
-                for (int i = 0; i < arr.length(); i++) {
-                    JSONObject c = arr.getJSONObject(i);
-                    String t = c.optString("text", "").trim();
-                    if (t.isEmpty()) continue;
-                    long st = Math.round(c.optDouble("start", 0) * 1000.0);
-                    long en = Math.round(c.optDouble("end", c.optDouble("start", 0)) * 1000.0);
-                    out.add(new Cue(st, Math.max(st, en), t));
+            boolean noCaps = false;
+            if (got == null) {
+                try {
+                    got = YtCaptionFetcher.fetch(httpFast, base, videoId, wantLang);
+                    capCache.put(cacheKey, got);
+                } catch (YtCaptionFetcher.Fail f) {
+                    Log.w(TAG, "captions failed: " + f.getMessage());
+                    err = f.getMessage();
+                    noCaps = f.noCaptions;
+                } catch (Exception e) {
+                    Log.w(TAG, "captions failed: " + e);
+                    err = e.getMessage() == null ? "error" : e.getMessage();
                 }
-                if (out.isEmpty()) throw new Exception("empty");
-            } catch (Exception e) {
-                Log.w(TAG, "captions failed: " + e);
-                err = e.getMessage() == null ? "error" : e.getMessage();
             }
-            final List<Cue> fin = out;
-            final String fl = lang;
+            final YtCaptionFetcher.Out fin = got;
             final String ferr = err;
+            final boolean fNoCaps = noCaps;
             main.post(() -> {
                 if (g != gen || !active) return;
-                if (ferr != null) {
-                    host.notice(msg("این ویدیو زیرنویس ندارد یا دریافتش ممکن نشد",
-                            "This video has no captions, or they couldn't be fetched"));
+                if (fin == null) {
+                    host.notice(fNoCaps
+                            ? msg("این ویدیو زیرنویس ندارد", "This video has no captions")
+                            : msg("زیرنویس نیامد: ", "Captions failed: ") + ferr);
                     return;
                 }
-                cues = fin;
-                trackLang = fl;
+                cues = fin.cues;
+                trackLang = fin.lang;
                 host.notice("");
                 pump();
             });

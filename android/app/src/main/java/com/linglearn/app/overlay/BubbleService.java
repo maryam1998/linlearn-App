@@ -1066,7 +1066,6 @@ public class BubbleService extends Service {
         ytEntries.clear();
         refreshHeader();
         updateYtButton();
-        showNotice(msg("زیرنویس یوتیوب روشن شد؛ ویدیو را پخش کن", "YouTube subtitles on — play a video"));
     }
 
     private void stopYoutube(boolean notify) {
