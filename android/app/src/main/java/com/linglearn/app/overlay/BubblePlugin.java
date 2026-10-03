@@ -86,6 +86,59 @@ public class BubblePlugin extends Plugin {
         notifyListeners("ttsSpeakDone", ret);
     }
 
+    // ================================================================
+    // ============ ورود با گوگل (deep link) ==========================
+    // ================================================================
+
+    private static final String AUTH_SCHEME = "com.linglearn.app";
+    private static final String AUTH_HOST = "login-callback";
+
+    /** اگه intent مالِ آدرسِ بازگشتِ ورود بود، به JS (رویداد authCallback) می‌فرسته. */
+    private void dispatchAuthIntent(Intent intent) {
+        if (intent == null) return;
+        Uri data = intent.getData();
+        if (data == null) return;
+        if (!AUTH_SCHEME.equals(data.getScheme()) || !AUTH_HOST.equals(data.getHost())) return;
+        JSObject ret = new JSObject();
+        ret.put("url", data.toString());
+        // retainUntilConsumed=true: اگه JS هنوز listener نذاشته، رویداد نگه داشته می‌شه
+        notifyListeners("authCallback", ret, true);
+        // جلوگیری از پردازشِ دوباره‌ی همین intent
+        intent.setData(null);
+    }
+
+    @Override
+    public void load() {
+        super.load();
+        try {
+            if (getActivity() != null) dispatchAuthIntent(getActivity().getIntent());
+        } catch (Throwable ignored) {}
+    }
+
+    @Override
+    protected void handleOnNewIntent(Intent intent) {
+        super.handleOnNewIntent(intent);
+        dispatchAuthIntent(intent);
+    }
+
+    // openExternal({ url }) — باز کردنِ آدرس توی مرورگرِ سیستم (برای ورود با گوگل)
+    @PluginMethod
+    public void openExternal(PluginCall call) {
+        String url = call.getString("url");
+        if (url == null || !(url.startsWith("https://") || url.startsWith("http://"))) {
+            call.reject("invalid url");
+            return;
+        }
+        try {
+            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("cannot open browser: " + e.getMessage());
+        }
+    }
+
     @PluginMethod
     public void checkPermission(PluginCall call) {
         JSObject ret = new JSObject();
