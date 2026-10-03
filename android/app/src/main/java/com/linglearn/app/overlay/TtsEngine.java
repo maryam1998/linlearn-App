@@ -100,8 +100,11 @@ final class TtsEngine {
                 }
             };
 
-    // تولیدِ صدا فقط روی یک thread (OfflineTts thread-safe نیست)
-    private final ExecutorService genExec = Executors.newSingleThreadExecutor(r -> {
+    // کدِ native (espeak-ng / onnxruntime) حالتِ سراسری داره و thread-safe نیست؛ پس تولیدِ صدای «همه‌ی»
+    // زبان‌ها روی «یک» thread ی مشترک انجام می‌شه (قبلاً هر موتور thread ی خودش رو داشت و دو زبان هم‌زمان
+    // وارد native می‌شدن → کرشِ تصادفی). NATIVE_LOCK هم ساختنِ موتور رو با تولید هم‌زمان نمی‌ذاره.
+    private static final Object NATIVE_LOCK = new Object();
+    private static final ExecutorService genExec = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(() -> {
             try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO); } catch (Throwable ignored) {}
             r.run();
@@ -199,9 +202,13 @@ final class TtsEngine {
             OfflineTtsConfig config = new OfflineTtsConfig();
             config.setModel(modelConfig);
 
-            OfflineTts engine = new OfflineTts(null, config);
-            // نرخ نمونه‌برداری رو از خودِ مدل بخون (مدل‌های Piper همه ۲۲۰۵۰ نیستن)
-            int sr = engine.sampleRate();
+            OfflineTts engine;
+            int sr;
+            synchronized (NATIVE_LOCK) {
+                engine = new OfflineTts(null, config);
+                // نرخ نمونه‌برداری رو از خودِ مدل بخون (مدل‌های Piper همه ۲۲۰۵۰ نیستن)
+                sr = engine.sampleRate();
+            }
             if (sr <= 0) sr = 22050;
             Log.i(TAG, "TTS loaded for " + lang + ", sampleRate=" + sr + ", threads=" + threads
                     + ", loadMs=" + (SystemClock.uptimeMillis() - t0));
@@ -237,7 +244,7 @@ final class TtsEngine {
                 try {
                     long t0 = SystemClock.uptimeMillis();
                     TtsCrumb.mark("warm:" + lang);
-                    tts.generate(w, 0, 1.0f);
+                    synchronized (NATIVE_LOCK) { tts.generate(w, 0, 1.0f); }
                     TtsCrumb.mark("idle");
                     Log.i(TAG, "warmUp " + lang + " ms=" + (SystemClock.uptimeMillis() - t0));
                 } catch (Throwable e) {
@@ -272,9 +279,10 @@ final class TtsEngine {
     }
 
     /** تولیدِ استریم؛ sink برای هر تکه صدا زده می‌شه. اگه sink false بده، null برمی‌گرده (لغو). */
-    private float[] synth(String t, float sp, final Sink sink) {
-        if (plain) {
-            com.k2fsa.sherpa.onnx.GeneratedAudio ga = tts.generate(t, 0, sp);
+    private float[] synth(String t, float sp, boolean pl, final Sink sink) {
+        if (pl) {
+            com.k2fsa.sherpa.onnx.GeneratedAudio ga;
+            synchronized (NATIVE_LOCK) { ga = tts.generate(t, 0, sp); }
             float[] all = ga == null ? null : ga.getSamples();
             if (all == null || all.length == 0) return new float[0];
             if (!sink.accept(all)) return null;
@@ -282,16 +290,28 @@ final class TtsEngine {
         }
         final ArrayList<float[]> parts = new ArrayList<>();
         final boolean[] aborted = {false};
-        tts.generateWithCallback(t, 0, sp, samples -> {
-            if (samples == null || samples.length == 0) return 1;
-            float[] copy = samples.clone();
-            parts.add(copy);
-            if (!sink.accept(copy)) {
-                aborted[0] = true;
-                return 0;
-            }
-            return 1;
-        });
+        final Throwable[] err = {null};
+        synchronized (NATIVE_LOCK) {
+            tts.generateWithCallback(t, 0, sp, samples -> {
+                // هیچ exception ی نباید از callback به native برگرده: JNI بعدش FindClass صدا می‌زنه
+                // و ART با exceptionِ معلق کلِ پردازه رو abort می‌کنه (SIGABRT / status=6).
+                try {
+                    if (samples == null || samples.length == 0) return 1;
+                    float[] copy = samples.clone();
+                    parts.add(copy);
+                    if (!sink.accept(copy)) {
+                        aborted[0] = true;
+                        return 0;
+                    }
+                    return 1;
+                } catch (Throwable e) {
+                    err[0] = e;
+                    aborted[0] = true;
+                    return 0;
+                }
+            });
+        }
+        if (err[0] != null) throw new RuntimeException("synth callback failed", err[0]);
         if (aborted[0]) return null;
         int total = 0;
         for (float[] p : parts) total += p.length;
@@ -318,9 +338,10 @@ final class TtsEngine {
             genExec.execute(() -> {
                 if (released || pfAbort.get() != g || cacheHas(key)) return;
                 inflightPrefetchKey = key;
+                final boolean pl = plain; // یک‌بار بخون تا بینِ crumb و synth عوض نشه
                 try {
-                    TtsCrumb.mark((plain ? "prefetchp:" : "prefetch:") + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
-                    float[] audio = synth(t, sp, s -> !released && pfAbort.get() == g);
+                    TtsCrumb.mark((pl ? "prefetchp:" : "prefetch:") + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
+                    float[] audio = synth(t, sp, pl, s -> !released && pfAbort.get() == g);
                     TtsCrumb.mark("idle");
                     if (audio != null) cachePut(key, audio);
                 } catch (Throwable e) {
@@ -404,8 +425,9 @@ final class TtsEngine {
             }
             long t0 = SystemClock.uptimeMillis();
             final boolean[] first = {true};
-            TtsCrumb.mark((plain ? "genp:" : "gen:") + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
-            float[] audio = synth(t, sp, s -> {
+            final boolean pl = plain; // یک‌بار بخون تا بینِ crumb و synth عوض نشه
+            TtsCrumb.mark((pl ? "genp:" : "gen:") + lang + ":" + t.length() + ":" + TtsCrumb.brief(t));
+            float[] audio = synth(t, sp, pl, s -> {
                 if (released || epoch.get() != myEpoch) return false;
                 if (first[0]) {
                     first[0] = false;
@@ -531,10 +553,9 @@ final class TtsEngine {
         haltPlayback();
         try {
             // release رو بعد از تولیدِ در حالِ اجرا انجام بده (وگرنه کرشِ native)
-            genExec.execute(() -> { try { tts.release(); } catch (Throwable ignored) {} });
+            genExec.execute(() -> { try { synchronized (NATIVE_LOCK) { tts.release(); } } catch (Throwable ignored) {} });
         } catch (Throwable e) {
             try { tts.release(); } catch (Throwable ignored) {}
         }
-        genExec.shutdown();
     }
 }
