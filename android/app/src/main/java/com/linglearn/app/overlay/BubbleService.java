@@ -308,7 +308,7 @@ public class BubbleService extends Service {
 
     private static volatile BubbleService instance;
     private volatile boolean micEngine = false;   // true = Android recognizer fed with SYSTEM audio
-    private volatile SherpaEngine sherpaEngine;   // on-device Sherpa-ONNX recognizer (null = Google/server path)
+    private volatile PcmSink sherpaEngine;   // on-device Sherpa-ONNX recognizer (null = Google/server path)
     private volatile boolean gotAsrText = false;
     private volatile int voicedSinceText = 0;
 
@@ -2459,9 +2459,14 @@ public class BubbleService extends Service {
         speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
         final String src = effectiveSource();
+        final String wModel = whisperModelPref();
+        if (wModel != null) {
+            // Song mode: offline Whisper (any language, incl. "auto"); falls through to the old paths if it can't start
+            if (startSherpaEngine(src, wModel)) return;
+        }
         if (src != null && !"auto".equals(src) && SherpaModelManager.isAvailable(src)) {
             // Sherpa path: feedLoop feeds the OnlineStream (no SpeechHostActivity)
-            if (startSherpaEngine(src)) return;
+            if (startSherpaEngine(src, null)) return;
         }
         boolean micOk = Build.VERSION.SDK_INT >= 33
                 && src != null && !src.isEmpty() && !"auto".equals(src)
@@ -2506,8 +2511,10 @@ public class BubbleService extends Service {
      * goes to SherpaEngine instead of PcmFeed. Returns false (-> Google/server path) if the model
      * is not downloaded or the capture cannot start.
      */
-    private boolean startSherpaEngine(final String src) {
-        if (SherpaModelManager.getModelDir(this, src) == null) return false;   // not downloaded yet
+    private boolean startSherpaEngine(final String src, final String whisperModel) {
+        if (whisperModel != null) {
+            if (WhisperModelManager.getModelDir(this, whisperModel) == null) return false;   // not downloaded yet
+        } else if (SherpaModelManager.getModelDir(this, src) == null) return false;           // not downloaded yet
         AudioRecord rec = null;
         try {
             rec = buildPlaybackRecord();
@@ -2518,7 +2525,7 @@ public class BubbleService extends Service {
             setRecordingUi(true);
             rec.startRecording();
             final AudioRecord fr = rec;
-            new Thread(() -> runSherpa(fr, src), "bubble-feed").start();
+            new Thread(() -> runSherpa(fr, src, whisperModel), "bubble-feed").start();
             showNotice(msg("🎙 گوش‌دادن به صدای سیستم (آفلاین)…", "🎙 Listening to system audio (offline)…"));
             return true;
         } catch (Exception e) {
@@ -2530,8 +2537,10 @@ public class BubbleService extends Service {
     }
 
     /** Feed-thread entry for Sherpa: loads the model off the main thread, then runs feedLoop. */
-    private void runSherpa(final AudioRecord rec, final String src) {
-        SherpaEngine eng = SherpaEngine.create(getApplicationContext(), src);
+    private void runSherpa(final AudioRecord rec, final String src, final String whisperModel) {
+        PcmSink eng = (whisperModel != null)
+                ? WhisperEngine.create(getApplicationContext(), whisperModel, src)
+                : SherpaEngine.create(getApplicationContext(), src);
         boolean stillActive = recording && micEngine && record == rec;
         if (eng != null && stillActive) {
             sherpaEngine = eng;
@@ -2553,8 +2562,16 @@ public class BubbleService extends Service {
         }
     }
 
+    /** Selected Whisper ("song mode") model id if the user enabled it and it is downloaded, else null. */
+    private String whisperModelPref() {
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (!"whisper".equals(sp.getString("sttEngine", "sherpa"))) return null;
+        String m = sp.getString("whisperModel", "base");
+        return WhisperModelManager.getModelDir(this, m) != null ? m : null;
+    }
+
     private void releaseSherpa() {
-        SherpaEngine e = sherpaEngine;
+        PcmSink e = sherpaEngine;
         sherpaEngine = null;
         if (e != null) e.release();
     }
@@ -2604,7 +2621,7 @@ public class BubbleService extends Service {
                 if (n < 0) break;
                 if (n == 0) continue;
                 int outBytes = toPcm16k(in, n, rate, out);
-                final SherpaEngine se = sherpaEngine;
+                final PcmSink se = sherpaEngine;
                 if (se != null) {
                     se.accept(out, outBytes);
                 } else {
@@ -2612,7 +2629,9 @@ public class BubbleService extends Service {
                 }
                 if (!gotAsrText) {
                     if (rms16(in, n) > SILENCE_RMS) voicedSinceText += 20;
-                    if (voicedSinceText >= ASR_WATCHDOG_VOICED_MS) {
+                    // Whisper answers in ~10-30 s windows, so give it a much longer leash than the streaming engine
+                    final int wd = (se instanceof WhisperEngine) ? ASR_WATCHDOG_VOICED_MS * 4 : ASR_WATCHDOG_VOICED_MS;
+                    if (voicedSinceText >= wd) {
                         voicedSinceText = 0;
                         main.post(() -> fallbackToServer(
                                 msg("تشخیص گفتار روی صدای سیستم کار نکرد؛ حالت سرور فعال شد",

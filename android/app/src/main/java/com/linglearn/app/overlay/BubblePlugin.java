@@ -357,6 +357,99 @@ public class BubblePlugin extends Plugin {
     }
 
     // ================================================================
+    // ============ STT برای آهنگ‌ها: Whisper (آفلاین، MIT) ===========
+    // ================================================================
+
+    // setSttEngine({ engine: "sherpa" | "whisper", model: "tiny"|"base"|"small" })
+    @PluginMethod
+    public void setSttEngine(PluginCall call) {
+        String engine = call.getString("engine", "sherpa");
+        String model = call.getString("model", "base");
+        if (!"whisper".equals(engine)) engine = "sherpa";
+        if (!WhisperModelManager.isValid(model)) model = "base";
+        try {
+            getContext().getSharedPreferences("bubble_prefs", Context.MODE_PRIVATE).edit()
+                    .putString("sttEngine", engine).putString("whisperModel", model).apply();
+        } catch (Throwable ignored) {}
+        call.resolve();
+    }
+
+    // getWhisperStatus() → { engine, model, models: [{id, downloaded, approxMb, partialBytes}], downloading, activeModel }
+    @PluginMethod
+    public void getWhisperStatus(PluginCall call) {
+        Context ctx = getContext();
+        SharedPreferences sp = ctx.getSharedPreferences("bubble_prefs", Context.MODE_PRIVATE);
+        JSArray arr = new JSArray();
+        for (String id : WhisperModelManager.models()) {
+            JSObject o = new JSObject();
+            o.put("id", id);
+            o.put("downloaded", WhisperModelManager.getModelDir(ctx, id) != null);
+            o.put("approxMb", WhisperModelManager.approxMb(id));
+            o.put("partialBytes", WhisperModelManager.partialBytes(ctx, id));
+            arr.put(o);
+        }
+        JSObject ret = new JSObject();
+        ret.put("engine", sp.getString("sttEngine", "sherpa"));
+        ret.put("model", sp.getString("whisperModel", "base"));
+        ret.put("models", arr);
+        ret.put("downloading", WhisperModelManager.isDownloading());
+        String active = WhisperModelManager.activeModel();
+        ret.put("activeModel", active == null ? "" : active);
+        call.resolve(ret);
+    }
+
+    // downloadWhisperModel({ model: "base" })  → events: whisperDownloadProgress / Done / Error
+    @PluginMethod
+    public void downloadWhisperModel(PluginCall call) {
+        final Context ctx = getContext();
+        final String model = call.getString("model", "base");
+        if (!WhisperModelManager.isValid(model)) {
+            call.reject("unknown whisper model: " + model);
+            return;
+        }
+        if (WhisperModelManager.getModelDir(ctx, model) != null) {
+            JSObject ret = new JSObject();
+            ret.put("alreadyDownloaded", true);
+            call.resolve(ret);
+            return;
+        }
+        WhisperModelManager.download(ctx.getApplicationContext(), model, new WhisperModelManager.Callback() {
+            @Override public void onProgress(String m, long done, long total) {
+                JSObject o = new JSObject();
+                o.put("model", m); o.put("bytes", done); o.put("total", total);
+                notifyListeners("whisperDownloadProgress", o);
+            }
+            @Override public void onDone(String m) {
+                JSObject o = new JSObject();
+                o.put("model", m);
+                notifyListeners("whisperDownloadDone", o);
+            }
+            @Override public void onError(String m, Exception e) {
+                JSObject o = new JSObject();
+                o.put("model", m);
+                o.put("cancelled", e instanceof WhisperModelManager.Cancelled);
+                o.put("error", e.getMessage() != null ? e.getMessage() : "unknown");
+                notifyListeners("whisperDownloadError", o);
+            }
+        });
+        call.resolve();
+    }
+
+    // cancelWhisperDownload()  — فایل .part می‌مونه تا دانلودِ بعدی ادامه پیدا کنه
+    @PluginMethod
+    public void cancelWhisperDownload(PluginCall call) {
+        WhisperModelManager.cancel();
+        call.resolve();
+    }
+
+    // deleteWhisperModel({ model: "base" })
+    @PluginMethod
+    public void deleteWhisperModel(PluginCall call) {
+        WhisperModelManager.delete(getContext(), call.getString("model", ""));
+        call.resolve();
+    }
+
+    // ================================================================
     // ============ TTS: تبدیل متن به گفتار (Piper/VITS) ==============
     // ================================================================
 

@@ -16,7 +16,7 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
 import java.io.File;
 import java.util.Locale;
 
-final class SherpaEngine {
+final class SherpaEngine implements PcmSink {
 
     private static final String TAG = "SherpaEngine";
     private static final int SAMPLE_RATE = 16000;
@@ -79,7 +79,8 @@ final class SherpaEngine {
         }
     }
 
-    void accept(byte[] pcm16k, int len) {
+    @Override
+    public void accept(byte[] pcm16k, int len) {
         if (pcm16k == null || len < 2) return;
         String partialToSend = null, finalToSend = null;
         boolean fail = false;
@@ -116,7 +117,8 @@ final class SherpaEngine {
         if (fail) MAIN.post(BubbleService::asrFallback);
     }
 
-    void release() {
+    @Override
+    public void release() {
         synchronized (lock) {
             if (released) return;
             released = true;
