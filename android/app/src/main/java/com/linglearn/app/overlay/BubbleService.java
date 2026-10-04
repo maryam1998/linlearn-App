@@ -55,6 +55,7 @@ import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 
 import com.google.mlkit.common.model.DownloadConditions;
@@ -833,12 +834,42 @@ public class BubbleService extends Service {
         tvFont.setTypeface(Typeface.DEFAULT_BOLD);
         tvFont.setOnLongClickListener(v -> { resetView(); return true; });
         header.addView(tvFont);
-        TextView tvOpacity = headerButton("\uD83C\uDF13", v -> cyclePanelAlpha());
+        TextView tvOpacity = headerButton("\uD83C\uDF13", v -> toggleOpacityRow());
         tvOpacity.setPadding(dp(8), dp(6), dp(8), dp(6));
         header.addView(tvOpacity);
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
         header.addView(headerButton("\u2715", v -> { userHidden = true; removePanel(); }));
         panel.addView(header, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        opacityRow = new LinearLayout(this);
+        opacityRow.setOrientation(LinearLayout.HORIZONTAL);
+        opacityRow.setGravity(Gravity.CENTER_VERTICAL);
+        opacityRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        opacityRow.setVisibility(View.GONE);
+        opacityBar = new SeekBar(this);
+        opacityBar.setMax(100);
+        opacityBar.setProgress(Math.round(panelAlpha * 100f));
+        opacityBar.setProgressTintList(android.content.res.ColorStateList.valueOf(COLOR_GOLD));
+        opacityBar.setThumbTintList(android.content.res.ColorStateList.valueOf(COLOR_GOLD));
+        final TextView opacityPct = new TextView(this);
+        opacityPct.setTextColor(Color.WHITE);
+        opacityPct.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        opacityPct.setMinWidth(dp(44));
+        opacityPct.setGravity(Gravity.CENTER);
+        opacityPct.setText(Math.round(panelAlpha * 100f) + "%");
+        opacityBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                panelAlpha = progress / 100f;
+                opacityPct.setText(progress + "%");
+                applyPanelAlpha();
+            }
+            @Override public void onStartTrackingTouch(SeekBar sb) {}
+            @Override public void onStopTrackingTouch(SeekBar sb) { saveViewPrefs(); }
+        });
+        opacityRow.addView(opacityBar, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        opacityRow.addView(opacityPct, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        panel.addView(opacityRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         buildWordCard();
@@ -1142,7 +1173,14 @@ public class BubbleService extends Service {
                 : msg("هر جمله " + repeatSetting + " بار، بعد جمله‌ی بعدی", "Each sentence " + repeatSetting + "×, then the next"));
     }
 
+    /** عددِ روی دکمه‌ی ↺: ۲ / ۳ / ∞ (خاموش = فقط ↺). */
+    private String replayLabel() {
+        return repeatSetting == 0 ? "\u21BA" : repeatSetting == REPEAT_INF ? "\u21BA\u221E" : "\u21BA" + repeatSetting;
+    }
+
     private void updateRepeatButton() {
+        for (Entry en : ytEntries.values())
+            if (en != null && en.ytReplayBtn != null) en.ytReplayBtn.setText(replayLabel());
         if (tvRepeat == null) return;
         tvRepeat.setText(repeatSetting == 0 ? "\uD83D\uDD01"
                 : repeatSetting == REPEAT_INF ? "\uD83D\uDD01\u221E" : "\uD83D\uDD01" + repeatSetting);
@@ -1626,8 +1664,9 @@ public class BubbleService extends Service {
     private int fontIdx = 0;
     private float panelHFrac = 0.42f;
     private float panelWFrac = -1f;            // -1 = تمام‌عرض
-    private static final float[] PANEL_ALPHAS = {0.94f, 0.80f, 0.65f, 0.50f, 0.35f, 0.20f};
-    private float panelAlpha = 0.94f;          // شفافیتِ پس‌زمینه‌ی کادر (۱ = کاملاً مات)
+    private float panelAlpha = 1f;             // شفافیتِ پس‌زمینه‌ی کادر: ۱ = کاملاً مات (solid)، ۰ = کاملاً شفاف
+    private LinearLayout opacityRow;
+    private SeekBar opacityBar;
     private GradientDrawable panelBgDrawable;
     private View gripTop, gripBottom;
 
@@ -1637,34 +1676,28 @@ public class BubbleService extends Service {
         fontIdx = Math.max(0, Math.min(FONT_FAMILIES.length - 1, sp.getInt("fontIdx", 0)));
         panelHFrac = Math.max(0.12f, Math.min(0.85f, sp.getFloat("panelHFrac", 0.42f)));
         panelWFrac = sp.getFloat("panelWFrac", -1f);
-        panelAlpha = Math.max(0.1f, Math.min(1f, sp.getFloat("panelAlpha", 0.94f)));
+        panelAlpha = Math.max(0f, Math.min(1f, sp.getFloat("panelAlphaV2", 1f)));
     }
 
     private void saveViewPrefs() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putFloat("fontScale", fontScale).putInt("fontIdx", fontIdx)
                 .putFloat("panelHFrac", panelHFrac).putFloat("panelWFrac", panelWFrac)
-                .putFloat("panelAlpha", panelAlpha).apply();
+                .putFloat("panelAlphaV2", panelAlpha).apply();
     }
 
     private void applyPanelAlpha() {
         if (panelBgDrawable == null) return;
-        int a = Math.round(Math.max(0.1f, Math.min(1f, panelAlpha)) * 255f);
+        int a = Math.round(Math.max(0f, Math.min(1f, panelAlpha)) * 255f);
         panelBgDrawable.setColor((a << 24) | 0x1C2541);
         panel.invalidate();
     }
 
-    /** 🌓 شفافیتِ کادر را مرحله‌ای عوض می‌کند (مات ← شفاف) و ذخیره می‌کند. */
-    private void cyclePanelAlpha() {
-        int cur = 0;
-        for (int i = 1; i < PANEL_ALPHAS.length; i++)
-            if (Math.abs(PANEL_ALPHAS[i] - panelAlpha) < Math.abs(PANEL_ALPHAS[cur] - panelAlpha)) cur = i;
-        int next = (cur + 1) % PANEL_ALPHAS.length;
-        panelAlpha = PANEL_ALPHAS[next];
-        applyPanelAlpha();
-        saveViewPrefs();
-        int pct = Math.round(panelAlpha * 100f);
-        showNotice(msg("شفافیت کادر: " + pct + "٪", "Panel opacity: " + pct + "%"));
+    /** 🌓 نوارِ تنظیمِ شفافیت (۰ تا ۱۰۰٪) را باز/بسته می‌کند. */
+    private void toggleOpacityRow() {
+        if (opacityRow == null) return;
+        opacityRow.setVisibility(opacityRow.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
+        refreshLayout();
     }
 
     private int panelMaxH() { return Math.max(dp(60), (int) (screenH() * panelHFrac)); }
@@ -1727,7 +1760,8 @@ public class BubbleService extends Service {
     }
 
     private void resetView() {
-        fontScale = 1f; fontIdx = 0; panelHFrac = 0.42f; panelWFrac = -1f; panelAlpha = 0.94f;
+        fontScale = 1f; fontIdx = 0; panelHFrac = 0.42f; panelWFrac = -1f; panelAlpha = 1f;
+        if (opacityBar != null) opacityBar.setProgress(100);
         applyPanelAlpha();
         applyScrollMax();
         relayoutAfterStyle();
@@ -1840,7 +1874,7 @@ public class BubbleService extends Service {
         e.srcRow.addView(e.tvSrc, srcLp);
         e.srcRow.addView(srcSpeak, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         TextView replay = new TextView(this);
-        replay.setText("\u21BA");
+        replay.setText(replayLabel());
         style(replay, 20, true);
         replay.setTextColor(Color.WHITE);
         replay.setGravity(Gravity.CENTER);
