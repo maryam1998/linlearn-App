@@ -1,6 +1,7 @@
 package com.linglearn.app.overlay;
 
 import android.animation.ObjectAnimator;
+import android.animation.ValueAnimator;
 import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.NotificationChannel;
@@ -46,6 +47,7 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.view.ViewGroup;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -499,15 +501,9 @@ public class BubbleService extends Service {
 
             @Override
             public boolean onSingleTapConfirmed(MotionEvent e) {
-                if (panelShown) { userHidden = true; removePanel(); }
-                else {
-                    userHidden = false;
-                    if (history.isEmpty()) {
-                        showNotice(isFa()
-                                ? "نگه‌داشتن: شروع/توقف ضبط  ·  دوبار لمس: بستن  ·  یک‌بار لمس: تاریخچه"
-                                : "Long-press: start/stop  ·  Double-tap: close  ·  Tap: history");
-                    } else showPanel();
-                }
+                // ✅ یک لمسِ معمولی = شروع/توقفِ ضبط (بدون نیاز به نگه‌داشتن)
+                bubble.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                toggleRecording();
                 return true;
             }
 
@@ -517,7 +513,16 @@ public class BubbleService extends Service {
             public void onLongPress(MotionEvent e) {
                 if (dragging) return;
                 bubble.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-                toggleRecording();
+                // نگه‌داشتن = نمایش/پنهان‌کردنِ تاریخچه
+                if (panelShown) { userHidden = true; removePanel(); }
+                else {
+                    userHidden = false;
+                    if (history.isEmpty()) {
+                        showNotice(isFa()
+                                ? "لمس: شروع/توقف ضبط  ·  نگه‌داشتن: تاریخچه  ·  دوبار لمس: بستن"
+                                : "Tap: start/stop  ·  Long-press: history  ·  Double-tap: close");
+                    } else showPanel();
+                }
             }
         });
 
@@ -547,6 +552,7 @@ public class BubbleService extends Service {
                         return true;
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
+                        if (dragging) dockBubble(recording);       // مغناطیس: بعد از رها کردن به نزدیک‌ترین لبه می‌چسبد
                         return true;
                 }
                 return true;
@@ -558,6 +564,28 @@ public class BubbleService extends Service {
     }
 
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    private ValueAnimator dockAnim;
+
+    /** حباب را مغناطیسی به نزدیک‌ترین لبه‌ی چپ/راست می‌چسباند؛ collapse=true یعنی نیمه‌اش بیرون از صفحه می‌رود (جمع می‌شود). */
+    private void dockBubble(final boolean collapse) {
+        if (wm == null || bubble == null || bubbleLp == null) return;
+        if (dockAnim != null) { dockAnim.cancel(); dockAnim = null; }
+        final int hide = collapse ? Math.round(bubbleSize * 0.5f) : 0;
+        final boolean left = bubbleLp.x + bubbleSize / 2 < screenW() / 2;
+        final int target = left ? -hide : screenW() - bubbleSize + hide;
+        final int from = bubbleLp.x;
+        if (from == target) return;
+        dockAnim = ValueAnimator.ofInt(from, target);
+        dockAnim.setDuration(220);
+        dockAnim.addUpdateListener(a -> {
+            if (wm == null || bubble == null) return;
+            bubbleLp.x = (Integer) a.getAnimatedValue();
+            try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
+            movePanel();
+        });
+        dockAnim.start();
+    }
 
 
     // ════════════════════════════════════════════════════════════════════════════
@@ -612,6 +640,7 @@ public class BubbleService extends Service {
 
     private void ensurePanel() {
         if (panel != null) return;
+        loadViewPrefs();
         panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(12), dp(6), dp(12), dp(10));
@@ -621,6 +650,10 @@ public class BubbleService extends Service {
         bg.setStroke(dp(1), COLOR_GOLD);
         panel.setBackground(bg);
 
+        gripTop = makeGrip(false);
+        panel.addView(gripTop, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(30)));
+
         // header: title + languages, clear-history, close
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
@@ -628,8 +661,7 @@ public class BubbleService extends Service {
         header.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         tvHeader = new TextView(this);
         tvHeader.setTextColor(COLOR_GOLD);
-        tvHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
-        tvHeader.setTypeface(Typeface.DEFAULT_BOLD);
+        style(tvHeader, 11, true);
         tvHeader.setSingleLine(true);
         header.addView(tvHeader, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         tvYt = headerButton("\u25B6", v -> toggleYoutube());
@@ -637,6 +669,10 @@ public class BubbleService extends Service {
         tvSave = headerButton("\uD83D\uDCBE", v -> saveCurrent());
         header.addView(tvSave);
         updateYtButton();
+        TextView tvFont = headerButton("Aa", v -> cycleFont());
+        tvFont.setTypeface(Typeface.DEFAULT_BOLD);
+        tvFont.setOnLongClickListener(v -> { resetView(); return true; });
+        header.addView(tvFont);
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
         header.addView(headerButton("\u2715", v -> { userHidden = true; removePanel(); }));
         panel.addView(header, new LinearLayout.LayoutParams(
@@ -646,7 +682,7 @@ public class BubbleService extends Service {
         panel.addView(wordCard);   // LayoutParams (با margin) داخلِ buildWordCard ست شده
 
         scroll = new HistoryScroll(this);
-        scroll.maxHeightPx = Math.max(dp(170), (int) (screenH() * 0.42f));
+        scroll.maxHeightPx = panelMaxH();
         scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
         scroll.setVerticalScrollBarEnabled(false);
         listBox = new LinearLayout(this);
@@ -658,12 +694,16 @@ public class BubbleService extends Service {
 
         tvStatus = new TextView(this);
         tvStatus.setTextColor(Color.parseColor("#C8CCD8"));
-        tvStatus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        style(tvStatus, 13, false);
         tvStatus.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         tvStatus.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
         tvStatus.setPadding(0, dp(4), 0, 0);
         tvStatus.setVisibility(View.GONE);
         panel.addView(tvStatus);
+
+        gripBottom = makeGrip(true);
+        panel.addView(gripBottom, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(30)));
 
         // touchable (history scrolls, buttons work) but touches outside the panel still reach the app below
         panelLp = new WindowManager.LayoutParams(
@@ -700,10 +740,13 @@ public class BubbleService extends Service {
     }
 
     private void computePanelPos() {
-        panelLp.width = screenW() - dp(24);
-        panelLp.x = dp(12);
+        panelLp.width = panelWidthPx();
+        panelLp.x = (screenW() - panelLp.width) / 2;
         int sh = screenH();
         boolean below = bubbleLp.y + bubbleSize / 2 < sh / 2;
+        // دستگیره‌ی تغییر اندازه همیشه سمتِ دورتر از حباب است (کشیدن به‌سمتِ بیرون = بزرگ‌تر)
+        if (gripBottom != null) gripBottom.setVisibility(below ? View.VISIBLE : View.GONE);
+        if (gripTop != null) gripTop.setVisibility(below ? View.GONE : View.VISIBLE);
         if (below) {
             panelLp.gravity = Gravity.TOP | Gravity.START;
             panelLp.y = bubbleLp.y + bubbleSize + dp(8);
@@ -812,7 +855,7 @@ public class BubbleService extends Service {
                                    final Txt lang) {
         final TextView b = new TextView(this);
         b.setText("\uD83D\uDD0A");
-        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        style(b, 15, false);
         b.setTextColor(Color.WHITE);
         b.setGravity(Gravity.CENTER);
         b.setPadding(dp(4), dp(3), dp(4), dp(3));
@@ -970,8 +1013,7 @@ public class BubbleService extends Service {
     private TextView cardAction(String label, View.OnClickListener l) {
         TextView b = new TextView(this);
         b.setText(label);
-        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        b.setTypeface(Typeface.DEFAULT_BOLD);
+        style(b, 12, true);
         b.setTextColor(Color.WHITE);
         b.setPadding(dp(10), dp(6), dp(10), dp(6));
         b.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
@@ -1012,8 +1054,7 @@ public class BubbleService extends Service {
         top.setGravity(Gravity.CENTER_VERTICAL);
         cardTerm = new TextView(this);
         cardTerm.setTextColor(Color.WHITE);
-        cardTerm.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
-        cardTerm.setTypeface(Typeface.DEFAULT_BOLD);
+        style(cardTerm, 17, true);
         cardTerm.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         cardTerm.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
         top.addView(cardTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
@@ -1023,7 +1064,7 @@ public class BubbleService extends Service {
 
         cardMeaningTv = new TextView(this);
         cardMeaningTv.setTextColor(Color.parseColor("#E8EAF2"));
-        cardMeaningTv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        style(cardMeaningTv, 15, false);
         cardMeaningTv.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         cardMeaningTv.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
         cardMeaningTv.setPadding(0, dp(2), 0, dp(6));
@@ -1055,13 +1096,7 @@ public class BubbleService extends Service {
         styleCardAction(cardBtnLeitner, cardLeitnerDone);
     }
 
-    private void setScrollCompact(boolean compact) {
-        if (scroll == null) return;
-        scroll.maxHeightPx = compact
-                ? Math.max(dp(90), (int) (screenH() * 0.22f))
-                : Math.max(dp(170), (int) (screenH() * 0.42f));
-        scroll.requestLayout();
-    }
+    private void setScrollCompact(boolean compact) { applyScrollMax(); }
 
     private void closeWordCard() {
         cardSeq++;
@@ -1156,6 +1191,156 @@ public class BubbleService extends Service {
     private void onCardGrammar() { if (cardGrammarDone) return; cardGrammarDone = true; queueWord("grammar"); refreshCardButtons(); }
     private void onCardLeitner() { if (cardLeitnerDone) return; cardLeitnerDone = true; queueWord("leitner"); refreshCardButtons(); }
 
+
+    // ════════════════════════════════════════════════════════════════════════════
+    //  🔎 اندازه‌ی کادر و فونت: دستگیره‌ی کرکره‌ای (یک انگشت) = ارتفاع ، A−/A+ = اندازه‌ی متن ، Aa = نوع فونت
+    // ════════════════════════════════════════════════════════════════════════════
+
+    private static final float FONT_MIN = 0.7f, FONT_MAX = 2.4f;
+    private static final String[] FONT_FAMILIES = {null, "serif", "monospace", "sans-serif-condensed", "casual"};
+    private static final String[][] FONT_NAMES = {
+            {"فونت: پیش‌فرض", "Font: Default"}, {"فونت: سریف", "Font: Serif"},
+            {"فونت: تک‌فاصله", "Font: Monospace"}, {"فونت: فشرده", "Font: Condensed"},
+            {"فونت: دستی", "Font: Casual"}};
+
+    private float fontScale = 1f;
+    private int fontIdx = 0;
+    private float panelHFrac = 0.42f;
+    private float panelWFrac = -1f;            // -1 = تمام‌عرض
+    private View gripTop, gripBottom;
+
+    private void loadViewPrefs() {
+        SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        fontScale = Math.max(FONT_MIN, Math.min(FONT_MAX, sp.getFloat("fontScale", 1f)));
+        fontIdx = Math.max(0, Math.min(FONT_FAMILIES.length - 1, sp.getInt("fontIdx", 0)));
+        panelHFrac = Math.max(0.12f, Math.min(0.85f, sp.getFloat("panelHFrac", 0.42f)));
+        panelWFrac = sp.getFloat("panelWFrac", -1f);
+    }
+
+    private void saveViewPrefs() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putFloat("fontScale", fontScale).putInt("fontIdx", fontIdx)
+                .putFloat("panelHFrac", panelHFrac).putFloat("panelWFrac", panelWFrac).apply();
+    }
+
+    private int panelMaxH() { return Math.max(dp(60), (int) (screenH() * panelHFrac)); }
+
+    private int panelWidthPx() {
+        int full = screenW() - dp(24);
+        if (panelWFrac < 0) return full;
+        return clamp(Math.round(screenW() * panelWFrac), dp(220), full);
+    }
+
+    private void applyScrollMax() {
+        if (scroll == null) return;
+        boolean compact = wordCard != null && wordCard.getVisibility() == View.VISIBLE;
+        scroll.maxHeightPx = compact ? Math.max(dp(90), (int) (panelMaxH() * 0.55f)) : panelMaxH();
+        scroll.requestLayout();
+    }
+
+    /** اندازه + نوعِ فونتِ یک TextView را ثبت و اعمال می‌کند (برای تغییرِ بعدیِ یک‌جا). */
+    private void style(TextView t, float baseSp, boolean bold) {
+        t.setTag(new float[]{baseSp, bold ? 1f : 0f});
+        applyStyle(t);
+    }
+
+    private void applyStyle(TextView t) {
+        Object tag = t.getTag();
+        if (!(tag instanceof float[])) return;
+        float[] st = (float[]) tag;
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, st[0] * fontScale);
+        t.setTypeface(Typeface.create(FONT_FAMILIES[fontIdx], st[1] > 0 ? Typeface.BOLD : Typeface.NORMAL));
+    }
+
+    private void restyle(View v) {
+        if (v instanceof TextView) applyStyle((TextView) v);
+        if (v instanceof ViewGroup) {
+            ViewGroup g = (ViewGroup) v;
+            for (int i = 0; i < g.getChildCount(); i++) restyle(g.getChildAt(i));
+        }
+    }
+
+    private void relayoutAfterStyle() {
+        if (panel == null) return;
+        restyle(panel);
+        panel.requestLayout();
+        refreshLayout();
+    }
+
+    private void setFontScale(float v, boolean persist) {
+        float q = Math.round(Math.max(FONT_MIN, Math.min(FONT_MAX, v)) * 20f) / 20f;   // قدم‌های ۰٫۰۵ تا لرزش/کندی نداشته باشد
+        if (Math.abs(q - fontScale) < 0.001f) { if (persist) saveViewPrefs(); return; }
+        fontScale = q;
+        relayoutAfterStyle();
+        if (persist) saveViewPrefs();
+    }
+
+    private void cycleFont() {
+        fontIdx = (fontIdx + 1) % FONT_FAMILIES.length;
+        relayoutAfterStyle();
+        saveViewPrefs();
+        showNotice(msg(FONT_NAMES[fontIdx][0], FONT_NAMES[fontIdx][1]));
+    }
+
+    private void resetView() {
+        fontScale = 1f; fontIdx = 0; panelHFrac = 0.42f; panelWFrac = -1f;
+        applyScrollMax();
+        relayoutAfterStyle();
+        saveViewPrefs();
+        showNotice(msg("اندازه و فونت به حالت اولیه برگشت", "Size and font reset"));
+    }
+
+    /** دستگیره‌ی «کرکره‌ای»: با یک انگشت به‌سمتِ بیرون بکش = کادر باز می‌شود، به‌سمتِ داخل = جمع می‌شود.
+     *  دو دکمه‌ی A− / A+ هم اندازه‌ی متن را کم و زیاد می‌کنند. */
+    @SuppressLint("ClickableViewAccessibility")
+    private View makeGrip(final boolean atBottom) {
+        FrameLayout f = new FrameLayout(this);
+        f.setMinimumHeight(dp(30));
+
+        View pill = new View(this);
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Color.parseColor("#B3FFFFFF"));
+        g.setCornerRadius(dp(4));
+        pill.setBackground(g);
+        f.addView(pill, new FrameLayout.LayoutParams(dp(64), dp(6), Gravity.CENTER));
+
+        TextView minus = headerButton("A\u2212", v -> setFontScale(fontScale - 0.1f, true));
+        minus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        minus.setTypeface(Typeface.DEFAULT_BOLD);
+        minus.setPadding(dp(12), dp(2), dp(12), dp(2));
+        f.addView(minus, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START | Gravity.CENTER_VERTICAL));
+        TextView plus = headerButton("A+", v -> setFontScale(fontScale + 0.1f, true));
+        plus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        plus.setTypeface(Typeface.DEFAULT_BOLD);
+        plus.setPadding(dp(12), dp(2), dp(12), dp(2));
+        f.addView(plus, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END | Gravity.CENTER_VERTICAL));
+
+        final float[] d = new float[2];      // downY, startH(frac)
+        f.setOnTouchListener((v, ev) -> {
+            switch (ev.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    d[0] = ev.getRawY(); d[1] = panelHFrac;
+                    return true;
+                case MotionEvent.ACTION_MOVE: {
+                    float dy = (ev.getRawY() - d[0]) * (atBottom ? 1f : -1f);
+                    panelHFrac = Math.max(0.12f, Math.min(0.85f, d[1] + dy / screenH()));
+                    if (scroll != null) scroll.atBottom = false;
+                    applyScrollMax();
+                    refreshLayout();
+                    return true;
+                }
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    saveViewPrefs();
+                    return true;
+            }
+            return true;
+        });
+        return f;
+    }
+
     private Entry newEntry() {
         ensurePanel();
         final Entry e = new Entry();
@@ -1165,7 +1350,7 @@ public class BubbleService extends Service {
 
         e.tvSrc = new TextView(this);
         e.tvSrc.setTextColor(Color.parseColor("#C8CCD8"));
-        e.tvSrc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        style(e.tvSrc, 13, false);
         e.tvSrc.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         e.tvSrc.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
 
@@ -1236,15 +1421,13 @@ public class BubbleService extends Service {
         TextView tag = new TextView(this);
         tag.setText(lang.toUpperCase(Locale.ROOT));
         tag.setTextColor(COLOR_GOLD);
-        tag.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
-        tag.setTypeface(Typeface.DEFAULT_BOLD);
+        style(tag, 10, true);
         tag.setMinWidth(dp(26));
         tag.setPadding(dp(4), dp(2), 0, 0);
 
         TextView tv = new TextView(this);
         tv.setTextColor(Color.WHITE);
-        tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        tv.setTypeface(Typeface.DEFAULT_BOLD);
+        style(tv, 16, true);
         tv.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         tv.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
 
@@ -1660,6 +1843,8 @@ public class BubbleService extends Service {
         } else {
             bubble.setAlpha(1f);
         }
+        // شروعِ ضبط → حباب جمع می‌شود و می‌رود گوشه؛ توقف → دوباره کامل به لبه می‌چسبد
+        main.postDelayed(() -> dockBubble(rec), rec ? 350 : 0);
     }
 
     private String msg(String fa, String en) { return isFa() ? fa : en; }
