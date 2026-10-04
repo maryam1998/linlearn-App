@@ -12,7 +12,12 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
+import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.LinearGradient;
+import android.graphics.Paint;
+import android.graphics.RectF;
+import android.graphics.Shader;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -268,8 +273,7 @@ public class BubbleService extends Service {
     private final AtomicInteger textPending = new AtomicInteger(0);
 
     private WindowManager wm;
-    private TextView bubble;
-    private GradientDrawable bubbleBg;
+    private BubbleView bubble;
     private WindowManager.LayoutParams bubbleLp;
     private int bubbleSize;
 
@@ -472,22 +476,14 @@ public class BubbleService extends Service {
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         bubbleSize = dp(56);
 
-        bubbleBg = new GradientDrawable();
-        bubbleBg.setShape(GradientDrawable.OVAL);
-        bubbleBg.setColor(COLOR_INK);
-        bubbleBg.setStroke(dp(3), COLOR_GOLD);
-
-        bubble = new TextView(this);
-        bubble.setText("\uD83C\uDF99");
-        bubble.setTextSize(TypedValue.COMPLEX_UNIT_SP, 24);
-        bubble.setGravity(Gravity.CENTER);
-        bubble.setBackground(bubbleBg);
+        bubble = new BubbleView(this);
 
         bubbleLp = new WindowManager.LayoutParams(
                 bubbleSize, bubbleSize,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS      // ← لازم برای اینکه نیمی از حباب بیرون از صفحه برود
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         bubbleLp.gravity = Gravity.TOP | Gravity.START;
@@ -535,6 +531,7 @@ public class BubbleService extends Service {
                 gestures.onTouchEvent(e);
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
+                        main.removeCallbacks(idleDockRun);
                         downX = e.getRawX(); downY = e.getRawY();
                         startX = bubbleLp.x; startY = bubbleLp.y;
                         dragging = false;
@@ -553,6 +550,7 @@ public class BubbleService extends Service {
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
                         if (dragging) dockBubble(recording);       // مغناطیس: بعد از رها کردن به نزدیک‌ترین لبه می‌چسبد
+                        scheduleIdleDock();                        // چند ثانیه بی‌کاری → نیمه‌پنهان کنار لبه
                         return true;
                 }
                 return true;
@@ -561,30 +559,144 @@ public class BubbleService extends Service {
 
         try { wm.addView(bubble, bubbleLp); }
         catch (Exception e) { Log.e(TAG, "addView failed", e); shutdown(); }
+        scheduleIdleDock();
     }
 
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 
     private ValueAnimator dockAnim;
+    private final Runnable idleDockRun = () -> { if (!dragging) dockBubble(true); };
 
-    /** حباب را مغناطیسی به نزدیک‌ترین لبه‌ی چپ/راست می‌چسباند؛ collapse=true یعنی نیمه‌اش بیرون از صفحه می‌رود (جمع می‌شود). */
+    /** چند ثانیه بعد از آخرین لمس، حباب خودش کنار لبه جمع می‌شود تا مزاحمِ محتوا نباشد. */
+    private void scheduleIdleDock() {
+        main.removeCallbacks(idleDockRun);
+        main.postDelayed(idleDockRun, 2500);
+    }
+
+    /** حباب را به نزدیک‌ترین لبه‌ی چپ/راست می‌چسباند؛ collapse=true یعنی نیمی از آن بیرون از صفحه می‌رود (آیکون در نیمه‌ی دیدنی می‌ماند). */
     private void dockBubble(final boolean collapse) {
         if (wm == null || bubble == null || bubbleLp == null) return;
         if (dockAnim != null) { dockAnim.cancel(); dockAnim = null; }
         final int hide = collapse ? Math.round(bubbleSize * 0.5f) : 0;
         final boolean left = bubbleLp.x + bubbleSize / 2 < screenW() / 2;
+        final int side = left ? -1 : 1;
         final int target = left ? -hide : screenW() - bubbleSize + hide;
         final int from = bubbleLp.x;
-        if (from == target) return;
-        dockAnim = ValueAnimator.ofInt(from, target);
-        dockAnim.setDuration(220);
+        final float c0 = bubble.collapseAmount(), c1 = collapse ? 1f : 0f;
+        dockAnim = ValueAnimator.ofFloat(0f, 1f);
+        dockAnim.setDuration(240);
+        dockAnim.setInterpolator(new android.view.animation.DecelerateInterpolator());
         dockAnim.addUpdateListener(a -> {
             if (wm == null || bubble == null) return;
-            bubbleLp.x = (Integer) a.getAnimatedValue();
+            float t = (Float) a.getAnimatedValue();
+            bubbleLp.x = Math.round(from + (target - from) * t);
+            bubble.setDock(side, c0 + (c1 - c0) * t);
             try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
             movePanel();
         });
         dockAnim.start();
+    }
+
+    /** حبابِ طراحی‌شده: دایره‌ی گرادیانی + حلقه‌ی طلایی + میکروفونِ برداری؛ هنگامِ ضبط حلقه‌ی قرمز + موجِ تپنده. */
+    private static final class BubbleView extends View {
+        private final float d;
+        private final Paint body = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint wave = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF rf = new RectF();
+        private boolean rec = false;
+        private int side = 1;
+        private float collapse = 0f, ripple = 0f;
+        private ValueAnimator rippleAnim;
+
+        BubbleView(Context c) {
+            super(c);
+            d = c.getResources().getDisplayMetrics().density;
+            setLayerType(LAYER_TYPE_SOFTWARE, null);      // سایه‌ی نرم روی API پایین هم کار کند
+            ring.setStyle(Paint.Style.STROKE);
+            wave.setStyle(Paint.Style.STROKE);
+            wave.setStrokeWidth(2f * d);
+            line.setStyle(Paint.Style.STROKE);
+            line.setStrokeCap(Paint.Cap.ROUND);
+            line.setColor(Color.WHITE);
+            fill.setColor(Color.WHITE);
+        }
+
+        float collapseAmount() { return collapse; }
+
+        void setDock(int s, float c) { side = s; collapse = c; applyAlpha(); invalidate(); }
+
+        void setRecording(boolean r) {
+            if (rec == r) return;
+            rec = r;
+            if (rippleAnim != null) { rippleAnim.cancel(); rippleAnim = null; }
+            ripple = 0f;
+            if (r) {
+                rippleAnim = ValueAnimator.ofFloat(0f, 1f);
+                rippleAnim.setDuration(1400);
+                rippleAnim.setRepeatCount(ValueAnimator.INFINITE);
+                rippleAnim.addUpdateListener(a -> { ripple = (Float) a.getAnimatedValue(); invalidate(); });
+                rippleAnim.start();
+            }
+            applyAlpha();
+            invalidate();
+        }
+
+        private void applyAlpha() { setAlpha(rec ? 1f : 1f - 0.22f * collapse); }
+
+        @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
+            super.onSizeChanged(w, h, ow, oh);
+            float r = Math.min(w, h) / 2f - 5f * d;
+            body.setShader(new LinearGradient(w / 2f, h / 2f - r, w / 2f, h / 2f + r, 0xFF34498A, 0xFF121A33, Shader.TileMode.CLAMP));
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            super.onDetachedFromWindow();
+            if (rippleAnim != null) { rippleAnim.cancel(); rippleAnim = null; }
+        }
+
+        @Override protected void onDraw(Canvas cv) {
+            float w = getWidth(), h = getHeight();
+            float cx = w / 2f, cy = h / 2f;
+            float r = Math.min(w, h) / 2f - 5f * d;          // ۵dp حاشیه برای سایه و موج
+            int accent = rec ? COLOR_REC : COLOR_GOLD;
+
+            if (rec) {                                        // موجِ تپنده‌ی ضبط
+                float rr = r + (Math.min(w, h) / 2f - 1f * d - r) * ripple;
+                wave.setColor(COLOR_REC);
+                wave.setAlpha((int) (140 * (1f - ripple)));
+                cv.drawCircle(cx, cy, rr, wave);
+            }
+
+            body.setShadowLayer(4f * d, 0f, 1.5f * d, 0x73000000);
+            cv.drawCircle(cx, cy, r, body);
+
+            ring.setColor(accent);
+            ring.setStrokeWidth((rec ? 2.6f : 2f) * d);
+            cv.drawCircle(cx, cy, r - 1f * d, ring);
+
+            // آیکونِ میکروفون؛ هنگامِ جمع‌شدن به سمتِ نیمه‌ی دیدنی می‌رود
+            float ix = cx - side * collapse * (w * 0.22f);
+            float k = 0.85f * d;
+            rf.set(ix - 4.2f * k, cy - 11f * k, ix + 4.2f * k, cy + 2f * k);
+            cv.drawRoundRect(rf, 4.2f * k, 4.2f * k, fill);
+            line.setStrokeWidth(1.9f * k);
+            rf.set(ix - 8f * k, cy - 8f * k, ix + 8f * k, cy + 7f * k);
+            cv.drawArc(rf, 0f, 180f, false, line);
+            cv.drawLine(ix, cy + 7f * k, ix, cy + 11f * k, line);
+            cv.drawLine(ix - 4f * k, cy + 11f * k, ix + 4f * k, cy + 11f * k, line);
+
+            if (rec) {                                        // نقطه‌ی قرمزِ «در حال ضبط»
+                float bx = cx + r * 0.72f, by = cy - r * 0.72f;
+                fill.setColor(Color.WHITE);
+                cv.drawCircle(bx, by, 5.2f * d, fill);
+                fill.setColor(COLOR_REC);
+                cv.drawCircle(bx, by, 3.6f * d, fill);
+                fill.setColor(Color.WHITE);
+            }
+        }
     }
 
 
@@ -652,7 +764,7 @@ public class BubbleService extends Service {
 
         gripTop = makeGrip(false);
         panel.addView(gripTop, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(30)));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(24)));
 
         // header: title + languages, clear-history, close
         LinearLayout header = new LinearLayout(this);
@@ -703,7 +815,7 @@ public class BubbleService extends Service {
 
         gripBottom = makeGrip(true);
         panel.addView(gripBottom, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(30)));
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(24)));
 
         // touchable (history scrolls, buttons work) but touches outside the panel still reach the app below
         panelLp = new WindowManager.LayoutParams(
@@ -855,10 +967,12 @@ public class BubbleService extends Service {
                                    final Txt lang) {
         final TextView b = new TextView(this);
         b.setText("\uD83D\uDD0A");
-        style(b, 15, false);
+        style(b, 18, false);
         b.setTextColor(Color.WHITE);
         b.setGravity(Gravity.CENTER);
-        b.setPadding(dp(4), dp(3), dp(4), dp(3));
+        b.setMinWidth(dp(44));
+        b.setMinHeight(dp(40));
+        b.setPadding(dp(6), dp(4), dp(6), dp(4));
         b.setOnClickListener(v -> toggleSpeak(b, text.get(), lang.get()));
         return b;
     }
@@ -1290,38 +1404,44 @@ public class BubbleService extends Service {
         showNotice(msg("اندازه و فونت به حالت اولیه برگشت", "Size and font reset"));
     }
 
-    /** دستگیره‌ی «کرکره‌ای»: با یک انگشت به‌سمتِ بیرون بکش = کادر باز می‌شود، به‌سمتِ داخل = جمع می‌شود.
-     *  دو دکمه‌ی A− / A+ هم اندازه‌ی متن را کم و زیاد می‌کنند. */
+    /** دستگیره‌ی «کرکره‌ای»: یک خطِ باریک؛ با یک انگشت به‌سمتِ بیرون بکش = کادر باز می‌شود، به‌سمتِ داخل = جمع می‌شود.
+     *  سمتِ راستِ همان نوار یک کپسولِ کوچکِ A− | A+ برای اندازه‌ی متن است. */
     @SuppressLint("ClickableViewAccessibility")
     private View makeGrip(final boolean atBottom) {
-        FrameLayout f = new FrameLayout(this);
-        f.setMinimumHeight(dp(30));
+        final FrameLayout f = new FrameLayout(this);
 
-        View pill = new View(this);
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(Color.parseColor("#B3FFFFFF"));
-        g.setCornerRadius(dp(4));
-        pill.setBackground(g);
-        f.addView(pill, new FrameLayout.LayoutParams(dp(64), dp(6), Gravity.CENTER));
+        final GradientDrawable pillBg = new GradientDrawable();
+        pillBg.setColor(Color.parseColor("#59FFFFFF"));
+        pillBg.setCornerRadius(dp(2));
+        final View pill = new View(this);
+        pill.setBackground(pillBg);
+        f.addView(pill, new FrameLayout.LayoutParams(dp(36), dp(4), Gravity.CENTER));
 
-        TextView minus = headerButton("A\u2212", v -> setFontScale(fontScale - 0.1f, true));
-        minus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        minus.setTypeface(Typeface.DEFAULT_BOLD);
-        minus.setPadding(dp(12), dp(2), dp(12), dp(2));
-        f.addView(minus, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START | Gravity.CENTER_VERTICAL));
-        TextView plus = headerButton("A+", v -> setFontScale(fontScale + 0.1f, true));
-        plus.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
-        plus.setTypeface(Typeface.DEFAULT_BOLD);
-        plus.setPadding(dp(12), dp(2), dp(12), dp(2));
-        f.addView(plus, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END | Gravity.CENTER_VERTICAL));
+        // کپسولِ اندازه‌ی متن
+        LinearLayout cap = new LinearLayout(this);
+        cap.setOrientation(LinearLayout.HORIZONTAL);
+        cap.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        cap.setGravity(Gravity.CENTER_VERTICAL);
+        GradientDrawable capBg = new GradientDrawable();
+        capBg.setColor(Color.parseColor("#1AFFFFFF"));
+        capBg.setCornerRadius(dp(10));
+        cap.setBackground(capBg);
+        cap.addView(fontStep("A\u2212", 11, -0.1f));
+        View div = new View(this);
+        div.setBackgroundColor(Color.parseColor("#33FFFFFF"));
+        cap.addView(div, new LinearLayout.LayoutParams(dp(1), dp(12)));
+        cap.addView(fontStep("A+", 14, +0.1f));
+        FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(22), Gravity.END | Gravity.CENTER_VERTICAL);
+        clp.setMarginEnd(dp(2));
+        f.addView(cap, clp);
 
         final float[] d = new float[2];      // downY, startH(frac)
         f.setOnTouchListener((v, ev) -> {
             switch (ev.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     d[0] = ev.getRawY(); d[1] = panelHFrac;
+                    pillBg.setColor(COLOR_GOLD);
                     return true;
                 case MotionEvent.ACTION_MOVE: {
                     float dy = (ev.getRawY() - d[0]) * (atBottom ? 1f : -1f);
@@ -1333,12 +1453,25 @@ public class BubbleService extends Service {
                 }
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
+                    pillBg.setColor(Color.parseColor("#59FFFFFF"));
                     saveViewPrefs();
                     return true;
             }
             return true;
         });
         return f;
+    }
+
+    private TextView fontStep(String label, int sp, final float delta) {
+        TextView t = new TextView(this);
+        t.setText(label);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        t.setTextColor(Color.parseColor("#B3FFFFFF"));
+        t.setGravity(Gravity.CENTER);
+        t.setMinWidth(dp(34));
+        t.setPadding(dp(4), 0, dp(4), 0);
+        t.setOnClickListener(v -> setFontScale(fontScale + delta, true));
+        return t;
     }
 
     private Entry newEntry() {
@@ -1369,8 +1502,11 @@ public class BubbleService extends Service {
         e.srcRow = new LinearLayout(this);
         e.srcRow.setOrientation(LinearLayout.HORIZONTAL);
         e.srcRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
-        e.srcRow.addView(srcSpeak, new LinearLayout.LayoutParams(dp(32), ViewGroup.LayoutParams.WRAP_CONTENT));
-        e.srcRow.addView(e.tvSrc, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        e.srcRow.setBaselineAligned(false);     // ← علتِ بریده‌شدنِ خطِ آخر: هم‌ترازیِ baseline متن را چند dp پایین می‌برد
+        LinearLayout.LayoutParams srcLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        srcLp.setMarginStart(dp(2));
+        e.srcRow.addView(e.tvSrc, srcLp);
+        e.srcRow.addView(srcSpeak, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         e.box.addView(e.srcRow);
         e.box.addView(e.rowsBox);
@@ -1423,7 +1559,7 @@ public class BubbleService extends Service {
         tag.setTextColor(COLOR_GOLD);
         style(tag, 10, true);
         tag.setMinWidth(dp(26));
-        tag.setPadding(dp(4), dp(2), 0, 0);
+        tag.setPadding(dp(4), dp(5), 0, 0);
 
         TextView tv = new TextView(this);
         tv.setTextColor(Color.WHITE);
@@ -1433,14 +1569,14 @@ public class BubbleService extends Service {
 
         attachSelect(tv, () -> lang);
         TextView rowSpeak = speakerButton(() -> tv.getText().toString(), () -> lang);
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.addView(tag, new LinearLayout.LayoutParams(
+        row.setBaselineAligned(false);
+        row.addView(tag, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        col.addView(rowSpeak, new LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams tvLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        tvLp.setMarginStart(dp(2));
+        row.addView(tv, tvLp);
+        row.addView(rowSpeak, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        row.addView(col, new LinearLayout.LayoutParams(dp(32), ViewGroup.LayoutParams.WRAP_CONTENT));
-        row.addView(tv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         e.rowsBox.addView(row);
         e.rowBox.put(lang, row);
         e.rowText.put(lang, tv);
@@ -1831,20 +1967,11 @@ public class BubbleService extends Service {
     };
 
     private void setRecordingUi(boolean rec) {
-        if (bubbleBg == null) return;
-        bubbleBg.setStroke(dp(rec ? 4 : 3), rec ? COLOR_REC : COLOR_GOLD);
-        if (pulse != null) { pulse.cancel(); pulse = null; }
-        if (rec) {
-            pulse = ObjectAnimator.ofFloat(bubble, View.ALPHA, 1f, 0.55f);
-            pulse.setDuration(700);
-            pulse.setRepeatCount(ObjectAnimator.INFINITE);
-            pulse.setRepeatMode(ObjectAnimator.REVERSE);
-            pulse.start();
-        } else {
-            bubble.setAlpha(1f);
-        }
-        // شروعِ ضبط → حباب جمع می‌شود و می‌رود گوشه؛ توقف → دوباره کامل به لبه می‌چسبد
+        if (bubble == null) return;
+        bubble.setRecording(rec);
+        // شروعِ ضبط → حباب جمع می‌شود و می‌رود گوشه؛ توقف → کامل به لبه می‌چسبد و بعد از چند ثانیه دوباره جمع می‌شود
         main.postDelayed(() -> dockBubble(rec), rec ? 350 : 0);
+        if (!rec) scheduleIdleDock();
     }
 
     private String msg(String fa, String en) { return isFa() ? fa : en; }
