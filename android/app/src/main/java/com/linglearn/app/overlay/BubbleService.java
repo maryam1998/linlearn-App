@@ -746,6 +746,7 @@ public class BubbleService extends Service {
         final HashMap<String, ArrayList<String>> chunkTr = new HashMap<>();   // lang -> ترجمه‌ی هر تکه ("" = در انتظار)
         int committedWords = 0;
         TextView srcSpeakBtn;                                              // 🔊 کنار متن اصلی
+        TextView ytReplayBtn;                                              // ↺ پخش دوباره‌ی جمله با صدای پلیر یوتیوب
         final HashMap<String, TextView> rowSpeakBtn = new HashMap<>();     // 🔊 کنار ترجمه‌ی هر زبان
     }
 
@@ -801,6 +802,8 @@ public class BubbleService extends Service {
         bg.setCornerRadius(dp(16));
         bg.setStroke(dp(1), COLOR_GOLD);
         panel.setBackground(bg);
+        panelBgDrawable = bg;
+        applyPanelAlpha();
 
         gripTop = makeGrip(false);
         panel.addView(gripTop, new LinearLayout.LayoutParams(
@@ -830,6 +833,9 @@ public class BubbleService extends Service {
         tvFont.setTypeface(Typeface.DEFAULT_BOLD);
         tvFont.setOnLongClickListener(v -> { resetView(); return true; });
         header.addView(tvFont);
+        TextView tvOpacity = headerButton("\uD83C\uDF13", v -> cyclePanelAlpha());
+        tvOpacity.setPadding(dp(8), dp(6), dp(8), dp(6));
+        header.addView(tvOpacity);
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
         header.addView(headerButton("\u2715", v -> { userHidden = true; removePanel(); }));
         panel.addView(header, new LinearLayout.LayoutParams(
@@ -1253,6 +1259,23 @@ public class BubbleService extends Service {
         clearSpeakHighlight();
     }
 
+    /** ↺ همان جمله را با صدای خودِ پلیر یوتیوب پخش می‌کند؛ تعداد تکرار از تنظیمِ 🔁 (۲ / ۳ / ∞) می‌آید. دوباره زدن = توقفِ تکرار. */
+    private void replayInYoutube(Entry e) {
+        if (e == null || e.ytIdx < 0 || yt == null || !yt.isActive()) return;
+        if (yt.isLooping(e.ytIdx)) {
+            yt.stopLoop();
+            showNotice(msg("تکرار متوقف شد", "Repeat stopped"));
+            return;
+        }
+        stopPanelSpeech();                                   // صدای برنامه با صدای یوتیوب قاطی نشود
+        int times = repeatSetting == 0 ? 1 : repeatSetting;  // REPEAT_INF = -1 → بی‌نهایت
+        if (!yt.replaySentence(e.ytIdx, times))
+            showNotice(msg("پلیر یوتیوب در دسترس نیست", "YouTube player not available"));
+        else if (times != 1)
+            showNotice(times < 0 ? msg("تکرار ∞ با صدای یوتیوب", "Repeat ∞ with YouTube audio")
+                    : msg("تکرار " + times + " بار با صدای یوتیوب", "Repeat " + times + "× with YouTube audio"));
+    }
+
     private void stopPanelSpeech() {
         if (speakingBtn == null && !panelSpeaking && speakTv == null) return;
         speakToken++;
@@ -1603,6 +1626,9 @@ public class BubbleService extends Service {
     private int fontIdx = 0;
     private float panelHFrac = 0.42f;
     private float panelWFrac = -1f;            // -1 = تمام‌عرض
+    private static final float[] PANEL_ALPHAS = {0.94f, 0.80f, 0.65f, 0.50f, 0.35f, 0.20f};
+    private float panelAlpha = 0.94f;          // شفافیتِ پس‌زمینه‌ی کادر (۱ = کاملاً مات)
+    private GradientDrawable panelBgDrawable;
     private View gripTop, gripBottom;
 
     private void loadViewPrefs() {
@@ -1611,12 +1637,34 @@ public class BubbleService extends Service {
         fontIdx = Math.max(0, Math.min(FONT_FAMILIES.length - 1, sp.getInt("fontIdx", 0)));
         panelHFrac = Math.max(0.12f, Math.min(0.85f, sp.getFloat("panelHFrac", 0.42f)));
         panelWFrac = sp.getFloat("panelWFrac", -1f);
+        panelAlpha = Math.max(0.1f, Math.min(1f, sp.getFloat("panelAlpha", 0.94f)));
     }
 
     private void saveViewPrefs() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putFloat("fontScale", fontScale).putInt("fontIdx", fontIdx)
-                .putFloat("panelHFrac", panelHFrac).putFloat("panelWFrac", panelWFrac).apply();
+                .putFloat("panelHFrac", panelHFrac).putFloat("panelWFrac", panelWFrac)
+                .putFloat("panelAlpha", panelAlpha).apply();
+    }
+
+    private void applyPanelAlpha() {
+        if (panelBgDrawable == null) return;
+        int a = Math.round(Math.max(0.1f, Math.min(1f, panelAlpha)) * 255f);
+        panelBgDrawable.setColor((a << 24) | 0x1C2541);
+        panel.invalidate();
+    }
+
+    /** 🌓 شفافیتِ کادر را مرحله‌ای عوض می‌کند (مات ← شفاف) و ذخیره می‌کند. */
+    private void cyclePanelAlpha() {
+        int cur = 0;
+        for (int i = 1; i < PANEL_ALPHAS.length; i++)
+            if (Math.abs(PANEL_ALPHAS[i] - panelAlpha) < Math.abs(PANEL_ALPHAS[cur] - panelAlpha)) cur = i;
+        int next = (cur + 1) % PANEL_ALPHAS.length;
+        panelAlpha = PANEL_ALPHAS[next];
+        applyPanelAlpha();
+        saveViewPrefs();
+        int pct = Math.round(panelAlpha * 100f);
+        showNotice(msg("شفافیت کادر: " + pct + "٪", "Panel opacity: " + pct + "%"));
     }
 
     private int panelMaxH() { return Math.max(dp(60), (int) (screenH() * panelHFrac)); }
@@ -1679,7 +1727,8 @@ public class BubbleService extends Service {
     }
 
     private void resetView() {
-        fontScale = 1f; fontIdx = 0; panelHFrac = 0.42f; panelWFrac = -1f;
+        fontScale = 1f; fontIdx = 0; panelHFrac = 0.42f; panelWFrac = -1f; panelAlpha = 0.94f;
+        applyPanelAlpha();
         applyScrollMax();
         relayoutAfterStyle();
         saveViewPrefs();
@@ -1790,6 +1839,18 @@ public class BubbleService extends Service {
         srcLp.setMarginStart(dp(2));
         e.srcRow.addView(e.tvSrc, srcLp);
         e.srcRow.addView(srcSpeak, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        TextView replay = new TextView(this);
+        replay.setText("\u21BA");
+        style(replay, 20, true);
+        replay.setTextColor(Color.WHITE);
+        replay.setGravity(Gravity.CENTER);
+        replay.setMinWidth(dp(40));
+        replay.setMinHeight(dp(40));
+        replay.setPadding(dp(4), dp(4), dp(4), dp(4));
+        replay.setVisibility(View.GONE);                    // فقط در لیستِ زیرنویسِ یوتیوب دیده می‌شود
+        replay.setOnClickListener(v -> replayInYoutube(e));
+        e.ytReplayBtn = replay;
+        e.srcRow.addView(replay, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         e.box.addView(e.srcRow);
         e.box.addView(e.rowsBox);
@@ -2422,6 +2483,7 @@ public class BubbleService extends Service {
         for (int i = from; i < end; i++) {
             Entry e = newEntry();
             e.ytIdx = i;
+            if (e.ytReplayBtn != null) e.ytReplayBtn.setVisibility(View.VISIBLE);
             e.src = sents.get(i);
             e.srcLang = currentSrcLang();
             for (Map.Entry<String, String[]> x : tr.entrySet()) {

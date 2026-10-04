@@ -154,17 +154,17 @@ final class YtSubtitles {
     void setOffsetMs(long ms) { offsetMs = ms; }
 
     /**
-     * 💾 عکسِ فوریِ جلسه برای ذخیره در «داستان‌های ذخیره‌شده»: همه‌ی خط‌هایی که تا الان نمایش داده شده‌اند
-     * (به ترتیبِ زمان) + ترجمه‌هایی که تا الان رسیده + لینکِ ویدیو. null = هنوز چیزی برای ذخیره نیست.
+     * 💾 عکسِ فوریِ جلسه برای ذخیره در «داستان‌های ذخیره‌شده»: «کلِ» زیرنویسِ ویدیو (حتی خط‌هایی که هنوز
+     * نخوانده/پخش نشده‌اند، به ترتیبِ زمان) + ترجمه‌هایی که تا الان رسیده + لینکِ ویدیو. null = هنوز چیزی برای ذخیره نیست.
      * فقط روی main thread صدا بزن.
      */
     JSONObject snapshot() throws Exception {
-        if (cues.isEmpty() || shown.isEmpty() || curVideoId.isEmpty()) return null;
+        if (cues.isEmpty() || curVideoId.isEmpty()) return null;
         List<String> ls = langs();
         JSONArray lines = new JSONArray();
-        for (int idx : shown) {
-            if (idx < 0 || idx >= cues.size()) continue;
+        for (int idx = 0; idx < cues.size(); idx++) {
             Cue c = cues.get(idx);
+            if (c.text == null || c.text.trim().isEmpty()) continue;
             JSONObject tr = new JSONObject();
             for (String lang : ls) {
                 String[] a = trs.get(lang);
@@ -191,6 +191,55 @@ final class YtSubtitles {
                 .put("lines", lines);
     }
 
+    // ── 🔁 تکرارِ جمله با صدای خودِ پلیر یوتیوب
+    private int loopSent = -1;            // جمله‌ی در حالِ تکرار (-1 = هیچ)
+    private int loopLeft = 0;             // تعداد دفعاتِ باقی‌مانده‌ی برگشت (-1 = بی‌نهایت)
+    private long loopStartMs = 0, loopEndMs = 0;
+    private long loopCooldownUntil = 0;   // بعد از هر seek چند لحظه صبر می‌کنیم تا موقعیتِ پلیر به‌روز شود
+
+    boolean isLooping(int sentIdx) { return loopSent >= 0 && loopSent == sentIdx; }
+
+    void stopLoop() { loopSent = -1; loopLeft = 0; }
+
+    /**
+     * پلیر یوتیوب را به ابتدای جمله‌ی sentIdx برمی‌گرداند و با صدای خودِ یوتیوب پخش می‌کند.
+     * times: تعداد کلِ پخش‌ها (۱ = یک بار)، یا -1 = بی‌نهایت تا وقتی کاربر دوباره بزند.
+     */
+    boolean replaySentence(int sentIdx, int times) {
+        if (!active || sentIdx < 0 || sentIdx >= sentFirstCue.length) return false;
+        int c = sentFirstCue[sentIdx], c2 = sentLastCue[sentIdx];
+        if (c < 0 || c >= cues.size() || c2 < c) return false;
+        loopStartMs = Math.max(0L, cues.get(c).startMs - offsetMs);
+        long end = cues.get(c2).endMs;
+        if (end <= cues.get(c).startMs) end = cues.get(c).startMs + 2500;
+        loopEndMs = end - offsetMs;
+        boolean ok = tracker.seekTo(loopStartMs);
+        if (!ok) { stopLoop(); return false; }
+        tracker.play();
+        loopCooldownUntil = android.os.SystemClock.uptimeMillis() + 900;
+        if (times == 1 || times == 0) stopLoop();
+        else { loopSent = sentIdx; loopLeft = times < 0 ? -1 : times - 1; }
+        return true;
+    }
+
+    private void loopTick(long pos) {
+        if (loopSent < 0) return;
+        if (android.os.SystemClock.uptimeMillis() < loopCooldownUntil) return;
+        long p = pos - offsetMs;
+        if (p >= loopEndMs - 150) {
+            // کاربر خودش جلو/عقب رفته (خیلی دور از جمله) → تکرار را رها کن
+            if (p > loopEndMs + 2500 || p < loopStartMs - 2500) { stopLoop(); return; }
+            if (loopLeft == 0) { stopLoop(); return; }
+            if (loopLeft > 0) loopLeft--;
+            if (tracker.seekTo(loopStartMs)) {
+                tracker.play();
+                loopCooldownUntil = android.os.SystemClock.uptimeMillis() + 900;
+            } else stopLoop();
+        } else if (p < loopStartMs - 2500) {
+            stopLoop();
+        }
+    }
+
     /** false = «دسترسی به اعلان‌ها» داده نشده. */
     boolean start() {
         if (active) return true;
@@ -202,6 +251,7 @@ final class YtSubtitles {
     }
 
     void stop() {
+        stopLoop();
         active = false;
         YtMedia.setActive(null);
         main.removeCallbacksAndMessages(null);
@@ -284,6 +334,7 @@ final class YtSubtitles {
     // ════════════════════ ۲) گرفتنِ زیرنویس ════════════════════
 
     private void resetVideo() {
+        stopLoop();
         gen++;
         cues = new ArrayList<>();
         buildSentences();
@@ -389,6 +440,7 @@ final class YtSubtitles {
         final YtMedia.State s = last;
         if (cues.isEmpty() || s == null || !s.hasSession) return;
         long pos = s.nowMs() + offsetMs;
+        loopTick(pos);
         int idx = findCue(pos);
         if (idx >= 0 && idx != shownIdx) {
             boolean reset = shownIdx < 0 || idx < shownIdx || idx - shownIdx > 3;   // seek یا شروع

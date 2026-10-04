@@ -290,6 +290,13 @@ public class YtMedia extends NotificationListenerService {
             return null;
         }
 
+        /** پخش (اگر مکث بود) از همان controller. */
+        public void play() {
+            MediaController c = ctrl;
+            if (c == null) return;
+            try { c.getTransportControls().play(); } catch (Throwable ignored) {}
+        }
+
         /** seek از همان controller. */
         public boolean seekTo(long ms) {
             MediaController c = ctrl;
