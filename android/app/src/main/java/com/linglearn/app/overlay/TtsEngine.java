@@ -104,9 +104,14 @@ final class TtsEngine {
     // زبان‌ها روی «یک» thread ی مشترک انجام می‌شه (قبلاً هر موتور thread ی خودش رو داشت و دو زبان هم‌زمان
     // وارد native می‌شدن → کرشِ تصادفی). NATIVE_LOCK هم ساختنِ موتور رو با تولید هم‌زمان نمی‌ذاره.
     private static final Object NATIVE_LOCK = new Object();
+    // ⚡ اولویتِ threadهای «تولیدِ صدا» (و threadهای ONNX که ازش ارث می‌برن). قبلاً URGENT_AUDIO بود و
+    // باعث می‌شد با هر جمله، تولیدِ صدا CPU رو از UI/WebView بگیره و هایلایت و اسکرول لگ کنن.
+    // پخشِ صدا (tts-play) همچنان با اولویتِ AUDIO اجرا می‌شه. اگه صدا قطع‌وصل شد، این رو
+    // به Process.THREAD_PRIORITY_FOREGROUND (یا بالاتر) برگردون.
+    private static final int GEN_PRIORITY = Process.THREAD_PRIORITY_DEFAULT;
     private static final ExecutorService genExec = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(() -> {
-            try { Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO); } catch (Throwable ignored) {}
+            try { Process.setThreadPriority(GEN_PRIORITY); } catch (Throwable ignored) {}
             r.run();
         }, "tts-gen");
         t.setDaemon(true);
@@ -181,7 +186,7 @@ final class TtsEngine {
             // threadهای ONNX Runtime اولویتِ threadی رو که می‌سازتشون به ارث می‌برن
             try {
                 oldPrio = Process.getThreadPriority(Process.myTid());
-                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO);
+                Process.setThreadPriority(GEN_PRIORITY);
                 prioChanged = true;
             } catch (Throwable ignored) {}
 
