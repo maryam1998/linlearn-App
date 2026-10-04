@@ -19,21 +19,25 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * تشخیص گفتارِ آفلاین با Whisper (برای آهنگ‌ها). Whisper جریانی نیست، پس:
- *  - صدا توی پنجره‌های ~۸ تا ۱۶ ثانیه جمع می‌شه (برش روی ساکت‌ترین نقطه، تا وسطِ کلمه قطع نشه)؛
+ * تشخیص گفتارِ آفلاین (برای آهنگ‌ها). مدل جریانی نیست، پس:
+ *  - صدا توی پنجره‌های کوتاهِ تطبیقی (~۳ تا ۱۰ ثانیه، بسته به سرعتِ گوشی) جمع می‌شه
+ *    (برش روی مکث/ساکت‌ترین نقطه، تا وسطِ کلمه قطع نشه)؛
  *  - هر پنجره توی یک نخِ جدا decode می‌شه تا feedLoop (ضبطِ صدا) هیچ‌وقت بلاک نشه؛
  *  - نتیجه با تأخیرِ چند ثانیه به BubbleService.asrFinal می‌ره (partial نداریم).
- * نکته: Whisper همیشه ۳۰ ثانیه رو پردازش می‌کنه، پس پنجره‌ی کوتاه‌تر سریع‌تر نمی‌شه.
+ * پنجره‌ی حداقل خودکار با زمانِ واقعیِ decode تنظیم می‌شه: گوشیِ سریع → تأخیرِ کم؛ گوشیِ کند → پنجره‌ی
+ * بزرگ‌تر تا decode عقب نیفته و صدا دور ریخته نشه.
  */
 final class WhisperEngine implements PcmSink {
 
     private static final String TAG = "WhisperEngine";
     private static final int SR = 16000;
     private static final int FRAME = SR / 10;              // ۱۰۰ms
-    private static final int MIN_WIN = 8 * SR;
-    private static final int MAX_WIN = 16 * SR;
-    private static final int SEARCH_BACK = 4 * SR;         // برش توی ۴ ثانیه‌ی آخرِ پنجره
-    private static final int MAX_QUEUE = 2;                // عقب افتادیم → قدیمی‌ترین پنجره دور ریخته می‌شه
+    private static final int FIRST_WIN = 2 * SR + SR / 2;  // اولین پنجره زود بره تا متنِ اول سریع بیاد
+    private static final int MIN_WIN_FLOOR = 3 * SR;       // کمترین طولِ پنجره (بعد از اولی)
+    private static final int MIN_WIN_CEIL = 9 * SR;        // بیشترین مقدارِ «حداقلِ تطبیقی»
+    private static final int MAX_WIN = 12 * SR;
+    private static final int SEARCH_BACK = 3 * SR;         // برش توی ۳ ثانیه‌ی آخرِ پنجره
+    private static final int MAX_QUEUE = 3;                // عقب افتادیم → قدیمی‌ترین پنجره دور ریخته می‌شه
     private static final double SILENT_RMS = 0.004;        // پنجره‌ی تقریباً ساکت decode نمی‌شه
 
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
@@ -44,6 +48,9 @@ final class WhisperEngine implements PcmSink {
     private int len = 0;
     private boolean released = false;
     private boolean failed = false;
+    private boolean firstSent = false;
+    private int minWin = MIN_WIN_FLOOR;                    // زیرِ lock؛ با زمانِ decode تطبیق پیدا می‌کنه
+    private double avgDecodeMs = 0;
     private String lastText = "";
 
     private final OfflineRecognizer recognizer;   // فقط از نخِ worker استفاده می‌شه
@@ -78,7 +85,8 @@ final class WhisperEngine implements PcmSink {
             OfflineModelConfig mc = new OfflineModelConfig();
             mc.setWhisper(w);
             mc.setTokens(new File(dir, WhisperModelManager.tokensFile(model)).getAbsolutePath());
-            mc.setNumThreads(Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2)));
+            int cores = Runtime.getRuntime().availableProcessors();
+            mc.setNumThreads(Math.max(2, Math.min(4, cores >= 8 ? 4 : cores - 1)));
             mc.setDebug(false);
             mc.setProvider("cpu");
 
@@ -118,21 +126,21 @@ final class WhisperEngine implements PcmSink {
 
             if (len >= MAX_WIN) {
                 cutAtQuietestPoint();
-            } else if (len >= MIN_WIN && tailIsQuiet()) {
+            } else if (len >= (firstSent ? minWin : FIRST_WIN) && tailIsQuiet()) {
                 enqueue(len);
             }
         }
     }
 
-    /** ۵۰۰ms آخر خیلی ساکت‌تر از میانگینِ پنجره‌ست؟ (مکثِ بینِ دو خط) */
+    /** ۳۰۰ms آخر خیلی ساکت‌تر از میانگینِ پنجره‌ست؟ (مکثِ بینِ دو خط) */
     private boolean tailIsQuiet() {
-        double tail = rms(len - SR / 2, len);
+        double tail = rms(len - (SR * 3) / 10, len);
         double all = rms(0, len);
         return tail < Math.max(0.003, all * 0.25);
     }
 
     private void cutAtQuietestPoint() {
-        int from = Math.max(MIN_WIN, len - SEARCH_BACK);
+        int from = Math.max(firstSent ? minWin : FIRST_WIN, len - SEARCH_BACK);
         int best = len, bestFrameStart = len - FRAME;
         double bestRms = Double.MAX_VALUE;
         for (int s = from; s + FRAME <= len; s += FRAME) {
@@ -149,6 +157,7 @@ final class WhisperEngine implements PcmSink {
         int rest = len - n;
         if (rest > 0) System.arraycopy(buf, n, buf, 0, rest);
         len = Math.max(0, rest);
+        firstSent = true;
 
         if (rms(win, 0, win.length) < SILENT_RMS) return;       // ساکت → decode نکن
         while (queue.size() >= MAX_QUEUE) {
@@ -182,7 +191,9 @@ final class WhisperEngine implements PcmSink {
                     win = queue.pollFirst();
                 }
                 if (win == null) continue;
+                long t0 = android.os.SystemClock.elapsedRealtime();
                 String text = decode(win);
+                adaptWindow(android.os.SystemClock.elapsedRealtime() - t0);
                 if (text == null) {
                     synchronized (lock) { failed = true; }
                     MAIN.post(BubbleService::asrFallback);
@@ -195,6 +206,15 @@ final class WhisperEngine implements PcmSink {
             }
         } finally {
             try { recognizer.release(); } catch (Throwable e) { Log.w(TAG, "release", e); }
+        }
+    }
+
+    /** حداقلِ طولِ پنجره رو کمی بیشتر از زمانِ واقعیِ decode نگه می‌داره تا صف عقب نیفته. */
+    private void adaptWindow(long ms) {
+        synchronized (lock) {
+            avgDecodeMs = (avgDecodeMs == 0) ? ms : (avgDecodeMs * 0.6 + ms * 0.4);
+            long want = (long) (avgDecodeMs * 1.25 * SR / 1000.0);
+            minWin = (int) Math.max(MIN_WIN_FLOOR, Math.min(MIN_WIN_CEIL, want));
         }
     }
 
@@ -223,7 +243,7 @@ final class WhisperEngine implements PcmSink {
         return t.replaceAll("\\s+", " ").trim();
     }
 
-    /** Whisper روی موسیقی گاهی یه عبارت رو بی‌نهایت تکرار می‌کنه؛ اون خروجی رو دور بریز. */
+    /** مدل روی موسیقی گاهی یه عبارت رو بی‌نهایت تکرار می‌کنه؛ اون خروجی رو دور بریز. */
     static boolean looksLikeLoop(String t) {
         String s = t.toLowerCase(Locale.ROOT);
         if (s.length() < 24) return false;
