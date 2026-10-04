@@ -19,7 +19,10 @@ import java.util.Locale;
 import java.util.Set;
 
 /**
- * تشخیص گفتارِ آفلاین (برای آهنگ‌ها). مدل جریانی نیست، پس:
+ * تشخیص گفتارِ آفلاین (برای آهنگ‌ها). مدل ذاتاً جریانی نیست، پس «استریمِ شبه‌زنده» داریم:
+ *  - هر ~۲ تا ۶ ثانیه روی صدای جمع‌شده یک پیش‌نمایش decode می‌شه و متن حین پخش (بدونِ نیاز به مکث) می‌آد؛
+ *  - وقتی مکث/طولِ کافی رسید، همون بخش «نهایی» می‌شه (دقیق‌تر) و جایگزینِ پیش‌نمایش می‌شه؛
+ *  - جزئیاتِ پنجره‌های نهایی:
  *  - صدا توی پنجره‌های کوتاهِ تطبیقی (~۳ تا ۱۰ ثانیه، بسته به سرعتِ گوشی) جمع می‌شه
  *    (برش روی مکث/ساکت‌ترین نقطه، تا وسطِ کلمه قطع نشه)؛
  *  - هر پنجره توی یک نخِ جدا decode می‌شه تا feedLoop (ضبطِ صدا) هیچ‌وقت بلاک نشه؛
@@ -32,8 +35,10 @@ final class WhisperEngine implements PcmSink {
     private static final String TAG = "WhisperEngine";
     private static final int SR = 16000;
     private static final int FRAME = SR / 10;              // ۱۰۰ms
-    private static final int FIRST_WIN = 2 * SR + SR / 2;  // اولین پنجره زود بره تا متنِ اول سریع بیاد
-    private static final int MIN_WIN_FLOOR = 3 * SR;       // کمترین طولِ پنجره (بعد از اولی)
+    private static final int PARTIAL_MIN = 2 * SR;         // اولین «پیش‌نمایشِ زنده» بعد از ۲ ثانیه صدا
+    private static final long PARTIAL_MIN_GAP_MS = 1500;   // کمترین فاصله‌ی دو پیش‌نمایش
+    private static final long PARTIAL_MAX_GAP_MS = 6000;
+    private static final int MIN_WIN_FLOOR = 5 * SR;       // کمترین طولِ پنجره‌ی «نهایی» (پیش‌نمایش‌ها زودتر متن رو نشون می‌دن)
     private static final int MIN_WIN_CEIL = 9 * SR;        // بیشترین مقدارِ «حداقلِ تطبیقی»
     private static final int MAX_WIN = 12 * SR;
     private static final int SEARCH_BACK = 3 * SR;         // برش توی ۳ ثانیه‌ی آخرِ پنجره
@@ -48,8 +53,14 @@ final class WhisperEngine implements PcmSink {
     private int len = 0;
     private boolean released = false;
     private boolean failed = false;
-    private boolean firstSent = false;
-    private int minWin = MIN_WIN_FLOOR;                    // زیرِ lock؛ با زمانِ decode تطبیق پیدا می‌کنه
+    private int minWin = MIN_WIN_FLOOR;
+    // ── استریم زنده: روی صدای در حال جمع‌شدن هر چند ثانیه یک‌بار decode می‌شه و به‌عنوان partial می‌ره
+    private float[] partialReq = null;                     // آخرین درخواستِ پیش‌نمایش (فقط آخری مهمه)
+    private boolean partialBusy = false;
+    private int sincePartial = 0;                          // نمونه‌های رسیده از آخرین درخواستِ پیش‌نمایش
+    private int epoch = 0;                                 // با هر برشِ نهایی بالا می‌ره؛ پیش‌نمایشِ کهنه دور ریخته می‌شه
+    private boolean partialShown = false;                  // برای این بخش پیش‌نمایشی نشون داده شده؟
+    private String lastPartialText = "";                    // زیرِ lock؛ با زمانِ decode تطبیق پیدا می‌کنه
     private double avgDecodeMs = 0;
     private String lastText = "";
 
@@ -124,10 +135,13 @@ final class WhisperEngine implements PcmSink {
             }
             len += n;
 
+            sincePartial += n;
             if (len >= MAX_WIN) {
                 cutAtQuietestPoint();
-            } else if (len >= (firstSent ? minWin : FIRST_WIN) && tailIsQuiet()) {
+            } else if (len >= minWin && tailIsQuiet()) {
                 enqueue(len);
+            } else {
+                maybeRequestPartial();
             }
         }
     }
@@ -140,7 +154,7 @@ final class WhisperEngine implements PcmSink {
     }
 
     private void cutAtQuietestPoint() {
-        int from = Math.max(firstSent ? minWin : FIRST_WIN, len - SEARCH_BACK);
+        int from = Math.max(minWin, len - SEARCH_BACK);
         int best = len, bestFrameStart = len - FRAME;
         double bestRms = Double.MAX_VALUE;
         for (int s = from; s + FRAME <= len; s += FRAME) {
@@ -157,7 +171,9 @@ final class WhisperEngine implements PcmSink {
         int rest = len - n;
         if (rest > 0) System.arraycopy(buf, n, buf, 0, rest);
         len = Math.max(0, rest);
-        firstSent = true;
+        epoch++;                       // پیش‌نمایشِ در راهِ این بخش دیگه معتبر نیست؛ نسخه‌ی نهایی می‌آد
+        partialReq = null;
+        sincePartial = 0;
 
         if (rms(win, 0, win.length) < SILENT_RMS) return;       // ساکت → decode نکن
         while (queue.size() >= MAX_QUEUE) {
@@ -165,6 +181,17 @@ final class WhisperEngine implements PcmSink {
             Log.w(TAG, "decoder is behind real-time; dropped oldest window");
         }
         queue.addLast(win);
+        lock.notifyAll();
+    }
+
+    /** هر ~۲ تا ۶ ثانیه (بسته به سرعتِ گوشی) از صدای جمع‌شده تا الان یک پیش‌نمایشِ متن می‌گیریم. (زیرِ lock) */
+    private void maybeRequestPartial() {
+        if (partialBusy || partialReq != null || len < PARTIAL_MIN || !queue.isEmpty()) return;
+        long gapMs = (long) Math.max(PARTIAL_MIN_GAP_MS, Math.min(PARTIAL_MAX_GAP_MS, avgDecodeMs * 1.3));
+        if (sincePartial < gapMs * SR / 1000) return;
+        if (rms(0, len) < SILENT_RMS) { sincePartial = 0; return; }       // ساکت → decode نکن
+        partialReq = java.util.Arrays.copyOf(buf, len);
+        sincePartial = 0;
         lock.notifyAll();
     }
 
@@ -182,27 +209,59 @@ final class WhisperEngine implements PcmSink {
     private void runWorker() {
         try {
             while (true) {
-                float[] win;
+                float[] win = null, part = null;
+                int partEpoch = 0;
                 synchronized (lock) {
-                    while (!released && queue.isEmpty()) {
+                    while (!released && queue.isEmpty() && partialReq == null) {
                         try { lock.wait(); } catch (InterruptedException e) { return; }
                     }
                     if (released) return;
-                    win = queue.pollFirst();
+                    if (!queue.isEmpty()) {
+                        win = queue.pollFirst();                    // نسخه‌ی نهایی همیشه اولویت داره
+                    } else {
+                        part = partialReq; partialReq = null;
+                        partialBusy = true;
+                        partEpoch = epoch;
+                    }
                 }
-                if (win == null) continue;
-                long t0 = android.os.SystemClock.elapsedRealtime();
-                String text = decode(win);
-                adaptWindow(android.os.SystemClock.elapsedRealtime() - t0);
-                if (text == null) {
-                    synchronized (lock) { failed = true; }
-                    MAIN.post(BubbleService::asrFallback);
-                    return;
+                if (win != null) {
+                    long t0 = android.os.SystemClock.elapsedRealtime();
+                    String text = decode(win, true);
+                    adaptWindow(android.os.SystemClock.elapsedRealtime() - t0);
+                    if (text == null) {
+                        synchronized (lock) { failed = true; }
+                        MAIN.post(BubbleService::asrFallback);
+                        return;
+                    }
+                    boolean hadPartial;
+                    synchronized (lock) {
+                        if (released) return;
+                        hadPartial = partialShown;
+                        partialShown = false;
+                        lastPartialText = "";
+                    }
+                    if (!text.isEmpty()) {
+                        final String t = text;
+                        MAIN.post(() -> BubbleService.asrFinal(t));
+                    } else if (hadPartial) {
+                        MAIN.post(BubbleService::asrCommit);        // نسخه‌ی نهایی چیزِ جدیدی نداشت؛ همون پیش‌نمایش بمونه
+                    }
+                } else if (part != null) {
+                    long t0 = android.os.SystemClock.elapsedRealtime();
+                    String text = decode(part, false);
+                    adaptWindow(android.os.SystemClock.elapsedRealtime() - t0);
+                    synchronized (lock) {
+                        partialBusy = false;
+                        if (released) return;
+                        if (text == null) continue;                 // خطای پیش‌نمایش مهم نیست؛ نسخه‌ی نهایی تلاش می‌کنه
+                        if (partEpoch != epoch) continue;           // وسطِ decode برشِ نهایی خورد → کهنه‌ست
+                        if (text.isEmpty() || text.equals(lastPartialText)) continue;
+                        lastPartialText = text;
+                        partialShown = true;
+                    }
+                    final String t = text;
+                    MAIN.post(() -> BubbleService.asrPartial(t));
                 }
-                if (text.isEmpty()) continue;
-                synchronized (lock) { if (released) return; }
-                final String t = text;
-                MAIN.post(() -> BubbleService.asrFinal(t));
             }
         } finally {
             try { recognizer.release(); } catch (Throwable e) { Log.w(TAG, "release", e); }
@@ -219,7 +278,7 @@ final class WhisperEngine implements PcmSink {
     }
 
     /** متنِ پاک‌شده؛ "" = چیزی نبود/هذیان؛ null = خطا. */
-    private String decode(float[] samples) {
+    private String decode(float[] samples, boolean isFinal) {
         OfflineStream st = null;
         try {
             st = recognizer.createStream();
@@ -227,6 +286,7 @@ final class WhisperEngine implements PcmSink {
             recognizer.decode(st);
             String text = clean(recognizer.getResult(st).getText());
             if (text.isEmpty() || looksLikeLoop(text)) return "";
+            if (!isFinal) return text;                       // پیش‌نمایش: dedupe نداره
             if (text.equalsIgnoreCase(lastText)) return "";
             lastText = text;
             return text;

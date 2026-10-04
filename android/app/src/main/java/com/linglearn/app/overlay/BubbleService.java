@@ -330,6 +330,7 @@ public class BubbleService extends Service {
     // ── ترجمه‌ی زنده‌ی نرم و پایدار ──
     private static final long SRC_RENDER_MS = 220;       // متنِ اصلی حداکثر هر ۲۲۰ms به‌روز می‌شود (نه با هر تکانِ تشخیص)
     private static final long PAUSE_COMMIT_MS = 700;     // با ۷۰۰ms سکوت، باقیِ جمله هم ترجمه می‌شود
+    private static final long PAUSE_COMMIT_SONG_MS = 6000;   // حالت آهنگ: پیش‌نمایش‌ها هر چند ثانیه می‌آن، پس زود commit نکن
     private static final int TAIL_GUARD_WORDS = 3;       // ۳ کلمه‌ی آخر هنوز ممکن است توسطِ تشخیص عوض شوند
     private static final int CHUNK_MIN_WORDS = 7;
     private static final int CHUNK_MAX_WORDS = 12;
@@ -1950,7 +1951,8 @@ public class BubbleService extends Service {
             main.postDelayed(srcRenderRunnable, wait);
         }
         main.removeCallbacks(pauseCommitRunnable);
-        main.postDelayed(pauseCommitRunnable, PAUSE_COMMIT_MS);
+        main.postDelayed(pauseCommitRunnable,
+                (sherpaEngine instanceof WhisperEngine) ? PAUSE_COMMIT_SONG_MS : PAUSE_COMMIT_MS);
     }
 
     private void flushPartial(boolean pause) {
@@ -2820,6 +2822,15 @@ public class BubbleService extends Service {
     static void asrFinal(String text) {
         BubbleService s = instance;
         if (s != null && s.micEngine) { s.gotAsrText = true; s.onFinalText(text); }
+    }
+
+    /** نسخه‌ی نهایی چیزِ جدیدی نداشت: خطِ زنده همون‌طور که هست بسته می‌شه (و ترجمه‌ی بقیه‌اش شروع می‌شه). */
+    static void asrCommit() {
+        BubbleService s = instance;
+        if (s == null || !s.micEngine || s.live == null) return;
+        s.flushPartial(true);
+        s.cancelLivePending();
+        s.live = null;
     }
 
     static void asrFallback() {
