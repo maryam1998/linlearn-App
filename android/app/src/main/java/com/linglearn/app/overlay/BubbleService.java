@@ -77,6 +77,8 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -325,10 +327,22 @@ public class BubbleService extends Service {
     private volatile String prevFinalText = "";   // previous final sentence, sent as translation context
     // ✅ تغییر ۱: آخرین متن نهایی — برای جلوگیری از تکرار
     private volatile String lastFinalText = "";
-    private final Runnable partialRunnable = () -> {
-        partialScheduled = false;
-        translatePartialNow();
-    };
+    // ── ترجمه‌ی زنده‌ی نرم و پایدار ──
+    private static final long SRC_RENDER_MS = 220;       // متنِ اصلی حداکثر هر ۲۲۰ms به‌روز می‌شود (نه با هر تکانِ تشخیص)
+    private static final long PAUSE_COMMIT_MS = 700;     // با ۷۰۰ms سکوت، باقیِ جمله هم ترجمه می‌شود
+    private static final int TAIL_GUARD_WORDS = 3;       // ۳ کلمه‌ی آخر هنوز ممکن است توسطِ تشخیص عوض شوند
+    private static final int CHUNK_MIN_WORDS = 7;
+    private static final int CHUNK_MAX_WORDS = 12;
+    private static final String CHUNK_FAIL = "\u0000";
+    private static final java.util.Set<String> BREAK_BEFORE = new HashSet<>(Arrays.asList(
+            "and", "but", "then", "that", "which", "when", "because", "so", "or", "while",
+            "who", "where", "as", "if", "though", "until", "after", "before"));
+    private String pendingHyp = "";
+    private long lastSrcRenderAt = 0;
+    private boolean srcRenderScheduled = false;
+    private TextView selectingTv = null;                 // متنی که الان انگشتِ کاربر رویش است (بازنویسی نشود)
+    private final Runnable srcRenderRunnable = () -> { srcRenderScheduled = false; flushPartial(false); };
+    private final Runnable pauseCommitRunnable = () -> flushPartial(true);
 
     private int speechHostRestarts = 0;
     private static final int MAX_SPEECH_HOST_RESTARTS = 40;
@@ -719,12 +733,17 @@ public class BubbleService extends Service {
         int ytIdx = -1;                 // شماره‌ی خطِ زیرنویسِ یوتیوب (برای چیدنِ مرتب بعد از seek)
         final HashMap<String, LinearLayout> rowBox = new HashMap<>();
         final HashMap<String, TextView> rowText = new HashMap<>();
+        // ترجمه‌ی زنده‌ی تکه‌تکه (پایدار): تکه‌های متنِ اصلیِ «قفل‌شده» و ترجمه‌ی هر تکه به‌ازای هر زبان
+        final ArrayList<String> chunkSrc = new ArrayList<>();
+        final HashMap<String, ArrayList<String>> chunkTr = new HashMap<>();   // lang -> ترجمه‌ی هر تکه ("" = در انتظار)
+        int committedWords = 0;
     }
 
     /** ScrollView with a max height that follows new text unless the user scrolled up to read older lines. */
     private static final class HistoryScroll extends ScrollView {
         int maxHeightPx = Integer.MAX_VALUE;
         boolean atBottom = true;
+        boolean frozen = false;      // وقتی کاربر دارد متن انتخاب می‌کند / کادرِ لغت باز است، خودکار به پایین نپر
 
         HistoryScroll(Context c) { super(c); }
 
@@ -736,7 +755,7 @@ public class BubbleService extends Service {
         @Override
         protected void onLayout(boolean changed, int l, int t, int r, int b) {
             super.onLayout(changed, l, t, r, b);
-            if (atBottom) {
+            if (atBottom && !frozen) {
                 View c = getChildAt(0);
                 if (c != null) scrollTo(0, Math.max(0, c.getHeight() - getHeight()));
             }
@@ -933,6 +952,7 @@ public class BubbleService extends Service {
         lastFinalText = "";
         prevFinalText = "";
         lastPartialSrc = "";
+        cancelLivePending();
         refreshLayout();
     }
 
@@ -1057,6 +1077,8 @@ public class BubbleService extends Service {
             if (st[2] != 1) return;
             st[2] = 2;
             tv.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            selectingTv = tv;
+            updateScrollFreeze();
             if (tv.getParent() != null) tv.getParent().requestDisallowInterceptTouchEvent(true);
             int[] w = wordBounds(tv.getText(), st[0]);
             if (w != null) highlight(tv, w[0], w[1]);
@@ -1069,12 +1091,16 @@ public class BubbleService extends Service {
                 case MotionEvent.ACTION_DOWN:
                     down[0] = ev.getX(); down[1] = ev.getY();
                     st[0] = off; st[1] = off; st[2] = 1;
+                    selectingTv = tv;            // تا انگشت روی متن است، ترجمه‌ی زنده بازنویسی‌اش نکند
+                    updateScrollFreeze();
                     main.postDelayed(longPress, ViewConfiguration.getLongPressTimeout());
                     return true;
                 case MotionEvent.ACTION_MOVE:
                     if (st[2] == 1 && (Math.abs(ev.getX() - down[0]) > slop || Math.abs(ev.getY() - down[1]) > slop)) {
                         st[2] = 0;                                   // کشیدنِ معمولی → اسکرولِ لیست
                         main.removeCallbacks(longPress);
+                        selectingTv = null;
+                        updateScrollFreeze();
                         return true;
                     }
                     if (st[2] == 2) {
@@ -1103,12 +1129,17 @@ public class BubbleService extends Service {
                     } else {
                         clearHighlight(tv);
                     }
+                    selectingTv = null;
+                    updateScrollFreeze();
+                    refreshRecentEntries();
                     return true;
                 }
                 case MotionEvent.ACTION_CANCEL:
                     main.removeCallbacks(longPress);
                     if (st[2] == 2) clearHighlight(tv);
                     st[2] = 0;
+                    selectingTv = null;
+                    updateScrollFreeze();
                     return true;
             }
             return false;
@@ -1173,6 +1204,13 @@ public class BubbleService extends Service {
         cardTerm.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
         top.addView(cardTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         top.addView(speakerButton(() -> cardWord, () -> cardLang));
+        // 📄 کلِ جمله را به‌جای لغت/محدوده انتخاب کن
+        top.addView(headerButton("\uD83D\uDCC4", v -> {
+            if (cardSentence == null || cardSrcTv == null || cardSentence.equals(cardWord)) return;
+            String full = cardSrcTv.getText().toString();
+            highlight(cardSrcTv, 0, full.length());
+            openWordCard(cardSentence, cardLang, cardSentence, cardSrcTv);
+        }));
         top.addView(headerButton("\u2715", v -> closeWordCard()));
         wordCard.addView(top);
 
@@ -1215,8 +1253,10 @@ public class BubbleService extends Service {
     private void closeWordCard() {
         cardSeq++;
         if (cardSrcTv != null) { clearHighlight(cardSrcTv); cardSrcTv = null; }
-        if (wordCard == null || wordCard.getVisibility() == View.GONE) return;
+        refreshRecentEntries();                // متنی که تا الان فریز بود، به آخرین نسخه برمی‌گردد
+        if (wordCard == null || wordCard.getVisibility() == View.GONE) { updateScrollFreeze(); return; }
         wordCard.setVisibility(View.GONE);
+        updateScrollFreeze();
         setScrollCompact(false);
         refreshLayout();
     }
@@ -1224,7 +1264,11 @@ public class BubbleService extends Service {
     private void openWordCard(final String word, final String lang, final String sentence, final TextView srcTv) {
         if (word == null || word.isEmpty() || wm == null || bubble == null) return;
         ensurePanel();
-        if (cardSrcTv != null && cardSrcTv != srcTv) clearHighlight(cardSrcTv);
+        if (cardSrcTv != null && cardSrcTv != srcTv) {
+            clearHighlight(cardSrcTv);
+            cardSrcTv = srcTv;
+            refreshRecentEntries();
+        }
         cardSrcTv = srcTv;
         final int my = ++cardSeq;
         cardWord = word;
@@ -1240,6 +1284,7 @@ public class BubbleService extends Service {
         cardMeaningTv.setText("…");
         refreshCardButtons();
         wordCard.setVisibility(View.VISIBLE);
+        updateScrollFreeze();
         setScrollCompact(true);
         if (!userHidden) showPanel(); else refreshLayout();
 
@@ -1248,7 +1293,7 @@ public class BubbleService extends Service {
             try {
                 netTr.execute(() -> {
                     String out;
-                    try { out = FreeTranslator.translate(HTTP_FAST, word, from, to); }
+                    try { out = LiveTranslator.translate(this, HTTP_FAST, word, from, to, aiBackend); }
                     catch (Exception ex) { out = ""; }
                     final String res = out == null ? "" : out.trim();
                     main.post(() -> onCardMeaning(my, res));
@@ -1597,7 +1642,7 @@ public class BubbleService extends Service {
         else if ("translation".equals(mode)) { showTr = !ts.isEmpty(); showSrc = ts.isEmpty() || !anyTr; }
         else { showSrc = true; showTr = !ts.isEmpty(); }
 
-        e.tvSrc.setText(e.src);
+        setTextIfChanged(e.tvSrc, e.src);
         e.srcRow.setVisibility(showSrc && !e.src.isEmpty() ? View.VISIBLE : View.GONE);
 
         for (String t : ts) {
@@ -1606,11 +1651,29 @@ public class BubbleService extends Service {
             String v = e.tr.get(t);
             boolean has = v != null && !v.isEmpty();
             row.setVisibility(showTr && has ? View.VISIBLE : View.GONE);
-            if (has) e.rowText.get(t).setText(v);
+            if (has) setTextIfChanged(e.rowText.get(t), v);
         }
         for (Map.Entry<String, LinearLayout> r : e.rowBox.entrySet()) {
             if (!ts.contains(r.getKey())) r.getValue().setVisibility(View.GONE);
         }
+    }
+
+    /** متنِ بدونِ تغییر دوباره ست نمی‌شود، و متنی که کاربر دارد انتخابش می‌کند (یا کادرِ لغتش باز است) دست‌نخورده می‌ماند. */
+    private void setTextIfChanged(TextView tv, String v) {
+        if (tv == null || v == null) return;
+        if (tv == cardSrcTv || tv == selectingTv) return;
+        CharSequence cur = tv.getText();
+        if (!(cur instanceof Spanned) && cur.toString().equals(v)) return;
+        tv.setText(v);
+    }
+
+    private void updateScrollFreeze() {
+        if (scroll == null) return;
+        scroll.frozen = selectingTv != null || (wordCard != null && wordCard.getVisibility() == View.VISIBLE);
+    }
+
+    private void refreshRecentEntries() {
+        for (int i = Math.max(0, history.size() - 6); i < history.size(); i++) renderEntry(history.get(i));
     }
 
     private void setTranslation(Entry e, String lang, String text, String fromSrc) {
@@ -1631,77 +1694,213 @@ public class BubbleService extends Service {
     //  Live recognition -> translation into ALL target languages
     // ════════════════════════════════════════════════════════════════════════════
 
+    private static String[] words(String s) {
+        String t = s == null ? "" : s.trim();
+        return t.isEmpty() ? new String[0] : t.split("\\s+");
+    }
+
+    private static String joinWords(String[] w, int from, int to) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = from; i < to; i++) { if (i > from) sb.append(' '); sb.append(w[i]); }
+        return sb.toString();
+    }
+
+    private void cancelLivePending() {
+        main.removeCallbacks(srcRenderRunnable);
+        srcRenderScheduled = false;
+        main.removeCallbacks(pauseCommitRunnable);
+        pendingHyp = "";
+    }
+
+    /** هر تکانِ تشخیصِ گفتار فقط «آخرین فرضیه» را ذخیره می‌کند؛ نمایش با ریتمِ ثابت و نرم به‌روز می‌شود. */
     private void onPartialText(final String text) {
         if (wm == null || bubble == null || text == null || text.isEmpty()) return;
         if (asrMuted()) return;
+        pendingHyp = text;
         if (live == null) live = newEntry();
-        live.src = text;
         clearStatus();
-        renderEntry(live);
-        afterChange();
-
-        List<String> ts = activeTargets();
-        if (ts.isEmpty()) return;
-        lastPartialSrc = text;
-        // first language: instant on-device translation when its model is ready; the rest: free online services
-        boolean localCovers = localReady && localTr != null;
-        if (localCovers) {
-            long wait = lastPartialAt + PARTIAL_TRANSLATE_INTERVAL_MS - SystemClock.uptimeMillis();
-            if (wait <= 0) translatePartialNow();
-            else if (!partialScheduled) {
-                partialScheduled = true;
-                main.postDelayed(partialRunnable, wait);
-            }
+        long wait = lastSrcRenderAt + SRC_RENDER_MS - SystemClock.uptimeMillis();
+        if (wait <= 0) {
+            main.removeCallbacks(srcRenderRunnable);
+            srcRenderScheduled = false;
+            flushPartial(false);
+        } else if (!srcRenderScheduled) {
+            srcRenderScheduled = true;
+            main.postDelayed(srcRenderRunnable, wait);
         }
-        remotePartialTranslate(text, localCovers ? new ArrayList<>(ts.subList(1, ts.size())) : ts);
+        main.removeCallbacks(pauseCommitRunnable);
+        main.postDelayed(pauseCommitRunnable, PAUSE_COMMIT_MS);
     }
 
-    private void translatePartialNow() {
-        final String src = lastPartialSrc;
-        final Translator tr = localTr;
-        final List<String> ts = activeTargets();
-        final Entry target = live;
-        if (src.isEmpty() || tr == null || !localReady || partialBusy || ts.isEmpty() || target == null) return;
-        final String lang = ts.get(0);
-        partialBusy = true;
-        lastPartialAt = SystemClock.uptimeMillis();
-        final int seq = ++partialSeq;
-        tr.translate(src).addOnCompleteListener(task -> {
-            partialBusy = false;
-            if (task.isSuccessful() && recording && seq > shownPartialSeq && live == target) {
-                shownPartialSeq = seq;
-                setTranslation(target, lang, task.getResult(), src);
-            }
-            if (recording && !lastPartialSrc.isEmpty() && !lastPartialSrc.equals(src)) {
-                translatePartialNow();
-            }
-        });
+    private void flushPartial(boolean pause) {
+        final Entry e = live;
+        if (e == null || pendingHyp.isEmpty()) return;
+        final String next = smoothHyp(e.src, pendingHyp);
+        lastSrcRenderAt = SystemClock.uptimeMillis();
+        if (!next.equals(e.src)) {
+            e.src = next;
+            renderEntry(e);
+            afterChange();
+        }
+        if (!activeTargets().isEmpty()) commitChunks(e, pause);
     }
 
-    private void remotePartialTranslate(final String text, final List<String> langs) {
-        if (langs.isEmpty() || text == null || text.isEmpty()) return;
-        long now = SystemClock.uptimeMillis();
-        if (now - lastRemotePartialAt < REMOTE_PARTIAL_INTERVAL_MS) return;
-        if (!hasInternet()) return;
-        final Entry target = live;
-        if (target == null) return;
-        lastRemotePartialAt = now;
+    /** اصلاحِ کوچکِ انتهای جمله (مثلاً beings↔being) متنِ روی صفحه را عقب‌وجلو نمی‌کند. */
+    private static String smoothHyp(String shown, String hyp) {
+        if (shown == null || shown.isEmpty() || hyp.startsWith(shown)) return hyp;
+        String[] a = words(shown), b = words(hyp);
+        int common = 0;
+        while (common < a.length && common < b.length && a[common].equals(b[common])) common++;
+        if (b.length <= a.length && a.length - common <= 2 && b.length - common <= 2) return shown;
+        return hyp;
+    }
+
+    // ───────── تکه‌تکه کردنِ جمله‌ی زنده ─────────
+    // کلمه‌های پایدار (همه به‌جز ۳ کلمه‌ی آخر) در تکه‌های ۷ تا ۱۲ کلمه‌ای «قفل» و هر تکه فقط یک‌بار ترجمه می‌شود.
+    // ترجمه‌ی قبلی هیچ‌وقت عوض نمی‌شود؛ فقط ترجمه‌ی تکه‌ی بعدی به انتهایش اضافه می‌شود → دیگر نمی‌پرد.
+
+    private void reconcileChunks(Entry e, String[] w) {
+        int keep = 0, kept = 0;
+        for (int i = 0; i < e.chunkSrc.size(); i++) {
+            String[] cw = words(e.chunkSrc.get(i));
+            if (kept + cw.length > w.length) break;
+            boolean same = true;
+            for (int j = 0; j < cw.length; j++) {
+                if (!cw[j].equals(w[kept + j])) { same = false; break; }
+            }
+            if (!same) break;
+            kept += cw.length;
+            keep = i + 1;
+        }
+        while (e.chunkSrc.size() > keep) removeChunk(e, e.chunkSrc.size() - 1);
+        e.committedWords = kept;
+    }
+
+    private void removeChunk(Entry e, int idx) {
+        e.chunkSrc.remove(idx);
+        for (ArrayList<String> l : e.chunkTr.values()) if (idx < l.size()) l.remove(idx);
+    }
+
+    private static int pickBreak(String[] w, int from, int limit, boolean flushAll) {
+        if (flushAll && limit - from <= CHUNK_MAX_WORDS + 2) return limit;
+        int maxEnd = Math.min(limit, from + CHUNK_MAX_WORDS);
+        for (int i = maxEnd; i >= from + 3; i--) {                     // اولویت: آخرین نقطه/ویرگول
+            String x = w[i - 1];
+            char c = x.isEmpty() ? ' ' : x.charAt(x.length() - 1);
+            if (",.;:?!\u061F\u060C".indexOf(c) >= 0) return i;
+        }
+        for (int i = maxEnd - 1; i >= from + 4; i--) {                 // بعد: قبل از حرفِ ربط
+            if (BREAK_BEFORE.contains(w[i].toLowerCase(Locale.ROOT))) return i;
+        }
+        return maxEnd;
+    }
+
+    private void commitChunks(Entry e, boolean flushAll) {
+        final String[] w = words(e.src);
+        reconcileChunks(e, w);
+        final int limit = flushAll ? w.length : w.length - TAIL_GUARD_WORDS;
+        while (true) {
+            int from = e.committedWords;
+            if (limit - from < (flushAll ? 1 : CHUNK_MIN_WORDS)) break;
+            int end = pickBreak(w, from, limit, flushAll);
+            if (end <= from) break;
+            addChunk(e, joinWords(w, from, end));
+            e.committedWords = end;
+        }
+    }
+
+    private void addChunk(Entry e, String text) {
+        final int idx = e.chunkSrc.size();
+        e.chunkSrc.add(text);
+        for (String lang : activeTargets()) {
+            ArrayList<String> l = e.chunkTr.get(lang);
+            if (l == null) { l = new ArrayList<>(); e.chunkTr.put(lang, l); }
+            int have = l.size();
+            while (l.size() <= idx) l.add("");
+            for (int i = have; i <= idx; i++) requestChunk(e, i, e.chunkSrc.get(i), lang);
+        }
+    }
+
+    /** کش → سرویس‌های رایگان (+ بررسیِ مشکوک بودن/AI) → در آخر مترجمِ آفلاین. */
+    private void requestChunk(final Entry e, final int idx, final String text, final String lang) {
         final String srcLang = effectiveSource();
-        for (final String lang : langs) {
-            final int id = ++reqCounter;
-            try {
-                netPartial.execute(() -> {
-                    final String out;
-                    try { out = FreeTranslator.translate(HTTP_FAST, text, srcLang, lang); }
-                    catch (Exception ex) { return; }   // partials are best effort
-                    main.post(() -> {
-                        if (!recording || live != target) return;
-                        setTranslationSeq(target, lang, out, text, id);
-                    });
+        final boolean first = lang.equals(primaryTarget());
+        String hit = TransCache.get(this).get(srcLang, lang, text);
+        if (hit != null && !LiveTranslator.looksLikelyMistranslated(text, hit, lang, srcLang)) {
+            applyChunk(e, idx, text, lang, hit);
+            return;
+        }
+        if (!hasInternet()) { localChunk(e, idx, text, lang, first); return; }
+        try {
+            netPartial.execute(() -> {
+                String out = null;
+                try { out = LiveTranslator.translate(this, HTTP_FAST, text, srcLang, lang, aiBackend); }
+                catch (Exception ex) { Log.d(TAG, "chunk translate failed: " + ex); }
+                final String res = out;
+                main.post(() -> {
+                    if (res != null) applyChunk(e, idx, text, lang, res);
+                    else localChunk(e, idx, text, lang, first);
                 });
-            } catch (Exception ignored) {}
+            });
+        } catch (Exception ex) { localChunk(e, idx, text, lang, first); }
+    }
+
+    private void localChunk(final Entry e, final int idx, final String text, final String lang, boolean first) {
+        final Translator tr = localTr;
+        if (first && localReady && tr != null) {
+            tr.translate(text)
+                    .addOnSuccessListener(o -> applyChunk(e, idx, text, lang, o))
+                    .addOnFailureListener(x -> applyChunk(e, idx, text, lang, null));
+        } else {
+            applyChunk(e, idx, text, lang, null);
         }
     }
+
+    private void applyChunk(Entry e, int idx, String text, String lang, String out) {
+        if (idx >= e.chunkSrc.size() || !e.chunkSrc.get(idx).equals(text)) return;     // تکه در این بین عوض/حذف شده
+        ArrayList<String> l = e.chunkTr.get(lang);
+        if (l == null || idx >= l.size()) return;
+        l.set(idx, (out == null || out.trim().isEmpty()) ? CHUNK_FAIL : out.trim());
+        String ts = e.trSrc.get(lang);
+        if (ts != null && !ts.isEmpty()) return;          // ترجمه‌ی کاملِ جمله قبلاً نشسته؛ تکه‌ها بازنویسی‌اش نکنند
+        String joined = joinChunks(e, lang, false);
+        if (joined == null || joined.isEmpty()) return;
+        setTranslation(e, lang, e == live ? joined + " …" : joined, "");
+    }
+
+    /** ترجمه‌ی تکه‌های آماده‌ی پشتِ‌سرهم. completeOnly=true: اگر حتی یک تکه آماده/موفق نباشد null. */
+    private static String joinChunks(Entry e, String lang, boolean completeOnly) {
+        ArrayList<String> l = e.chunkTr.get(lang);
+        if (l == null) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < l.size(); i++) {
+            String v = l.get(i);
+            if (v.isEmpty()) { if (completeOnly) return null; break; }
+            if (v.equals(CHUNK_FAIL)) { if (completeOnly) return null; continue; }
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(v);
+        }
+        return sb.toString();
+    }
+
+    private final LiveTranslator.Ai aiBackend = new LiveTranslator.Ai() {
+        @Override public String translate(String text, String tgt) throws Exception {
+            return BubbleService.this.translate(text, "", tgt);
+        }
+
+        @Override public String verify(String text, String tgt, String draft) throws Exception {
+            String name = LANG_NAMES.containsKey(tgt) ? LANG_NAMES.get(tgt) : tgt;
+            String prompt = "Source text: \"" + text + "\"\n"
+                    + "Draft translation into " + name + ": \"" + draft + "\"\n\n"
+                    + "Is the draft an accurate, complete translation? If yes, reply with EXACTLY: OK\n"
+                    + "If no, reply with ONLY the corrected translation \u2014 no quotes, no explanation, nothing else.";
+            JSONObject body = new JSONObject();
+            body.put(GENERATE_PROMPT_KEY, prompt);
+            String resp = postBytes(HTTP_FAST, 1, WORKER_BASE + GENERATE_PATH,
+                    "application/json; charset=utf-8", body.toString().getBytes(StandardCharsets.UTF_8));
+            return extractText(resp);
+        }
+    };
 
     private void onFinalText(final String text) {
         if (wm == null || bubble == null || text == null || text.trim().isEmpty()) return;
@@ -1713,8 +1912,7 @@ public class BubbleService extends Service {
         }
         lastFinalText = text;
 
-        partialSeq++; shownPartialSeq = partialSeq;
-        main.removeCallbacks(partialRunnable); partialScheduled = false;
+        cancelLivePending();
         lastPartialSrc = "";
         final String ctxPrev = prevFinalText;
         prevFinalText = text;
@@ -1730,11 +1928,27 @@ public class BubbleService extends Service {
         final String srcLang = effectiveSource();
         final boolean online = hasInternet();
         final String offlineMsg = msg("ترجمه در دسترس نیست (آفلاین)", "No translation (offline)");
+        final String[] fw = words(text);
+        reconcileChunks(e, fw);
         for (int i = 0; i < ts.size(); i++) {
             final String lang = ts.get(i);
+            // اگر تکه‌های زنده کلِ جمله را پوشانده‌اند و ترجمه‌شان مشکوک نیست، همان‌ها نهایی می‌شوند → هیچ پرشی در پایانِ جمله نیست
+            if (fw.length > 0 && e.committedWords == fw.length) {
+                String joined = joinChunks(e, lang, true);
+                if (joined != null && !joined.isEmpty()
+                        && !LiveTranslator.looksLikelyMistranslated(text, joined, lang, srcLang)) {
+                    setTranslation(e, lang, joined, text);
+                    continue;
+                }
+            }
             String have = e.tr.get(lang);
             boolean haveGood = have != null && !have.isEmpty() && !have.equals("…");
             if (haveGood && text.equals(e.trSrc.get(lang))) continue;   // live translation already matches the final text
+            if (haveGood) {
+                // ترجمه‌ی تکه‌ایِ فعلی را نگه دار (علامتِ «…»ی انتها را بردار) تا ترجمه‌ی کاملِ جمله برسد
+                String cur = have.endsWith(" …") ? have.substring(0, have.length() - 2) : have;
+                if (!cur.equals(have)) e.tr.put(lang, cur);
+            }
             if (!haveGood) e.tr.put(lang, "…");
             if (!online) {
                 final Translator tr = localTr;
@@ -1776,12 +1990,8 @@ public class BubbleService extends Service {
 
     /** Free services first (Google -> MyMemory -> Lingva -> Libre); the app's AI worker is the last resort. */
     private String translateOne(String text, String srcLang, String tgt, String ctxPrev) throws Exception {
-        try {
-            return FreeTranslator.translate(HTTP_FAST, text, srcLang, tgt);
-        } catch (Exception freeErr) {
-            Log.w(TAG, "free translators failed (" + freeErr + "); using the app AI worker");
-        }
-        return translate(text, ctxPrev, tgt);
+        // کش → سرویس‌های رایگان → (اگر مشکوک بود) بازبینی/ترجمه با AI → کشِ نتیجه‌ی تأییدشده
+        return LiveTranslator.translate(this, HTTP_FAST, text, srcLang, tgt, aiBackend);
     }
 
     // ───────── 📺 حالت یوتیوب: روشن/خاموش و اتصال به پنل ─────────
@@ -2024,6 +2234,7 @@ public class BubbleService extends Service {
         partialBusy = false;
         shownPartialSeq = partialSeq;
         lastPartialSrc = ""; live = null;
+        cancelLivePending();
         speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
         final String src = effectiveSource();
@@ -2611,6 +2822,7 @@ public class BubbleService extends Service {
         pendingYt = false;
         stopYoutube(false);
         main.removeCallbacksAndMessages(null);
+        try { TransCache.get(this).flush(); } catch (Throwable ignored) {}
         closeLocalTranslator();
         recording = false;
         if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); }
