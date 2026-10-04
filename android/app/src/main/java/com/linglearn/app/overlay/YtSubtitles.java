@@ -45,11 +45,11 @@ final class YtSubtitles {
 
     private static final String TAG = "YtSubtitles";
 
-    static final int CHUNK = 5;                    // تعداد «جمله» در هر chunk (نه تکه‌ی زیرنویس)
+    static final int CHUNK = 8;                    // تعداد «جمله» در هر chunk (نه تکه‌ی زیرنویس)
+    private static final int PARALLEL = 3;         // چند chunk هم‌زمان ترجمه شود
     private static final long GAP_BREAK_MS = 1200;  // مکثِ بیشتر از این بینِ دو تکه = مرزِ جمله
     private static final int MAX_SENT_CHARS = 220;  // جمله‌ی بدونِ نقطه از این بلندتر نشه
-    private static final int AHEAD_CHUNKS = 3;     // چند chunk جلوتر از پخش از قبل ترجمه بشه
-    private static final int CONTEXT_LINES = 3;    // جمله‌های همسایه (قبل/بعد) به‌عنوان زمینه
+        private static final int CONTEXT_LINES = 3;    // جمله‌های همسایه (قبل/بعد) به‌عنوان زمینه
     private static final long TICK_MS = 150;
     private static final int MAX_FAILS = 2;
 
@@ -90,7 +90,8 @@ final class YtSubtitles {
     private final OkHttpClient httpFast;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService netCaps = Executors.newCachedThreadPool();   // fetchهای ویدیوی قبلی جلوی ویدیوی جدید را نگیرند
-    private final ExecutorService netChunk = Executors.newSingleThreadExecutor();   // فقط یک chunk هم‌زمان
+    private final ExecutorService netChunk = Executors.newFixedThreadPool(PARALLEL);   // چند chunk موازی
+    private final ExecutorService netIo = Executors.newSingleThreadExecutor();        // نوشتن کش روی دیسک
     private final ExecutorService netQuick = Executors.newFixedThreadPool(2);
     private final YtMedia.Tracker tracker;
     private final Map<String, String> idByTitle = new HashMap<>();
@@ -122,7 +123,7 @@ final class YtSubtitles {
     private final HashSet<String> done = new HashSet<>();            // "lang#chunk"
     private final HashMap<String, Integer> fails = new HashMap<>();
     private final HashSet<String> quickAsked = new HashSet<>();      // "lang#idx"
-    private boolean chunkBusy = false;
+    private final HashSet<String> running = new HashSet<>();      // "lang#chunk" های در حالِ ترجمه
     private int shownIdx = -1;
     private int tickCount = 0;
     private volatile long offsetMs = 0;
@@ -208,6 +209,7 @@ final class YtSubtitles {
         netCaps.shutdownNow();
         netChunk.shutdownNow();
         netQuick.shutdownNow();
+        netIo.shutdown();
     }
 
     /** زبان‌های مقصد یا نمایش عوض شد. */
@@ -282,7 +284,7 @@ final class YtSubtitles {
         cues = new ArrayList<>();
         buildSentences();
         trs.clear(); sentTr.clear(); done.clear(); fails.clear(); quickAsked.clear();
-        chunkBusy = false;
+        running.clear();
         shownIdx = -1;
         shown.clear();
         curVideoId = "";
@@ -302,12 +304,17 @@ final class YtSubtitles {
         final String cacheKey = videoId + "|" + wantLang;
         netCaps.execute(() -> {
             YtCaptionFetcher.Out got = capCache.get(cacheKey);
+            if (got == null) {
+                got = YtDiskCache.loadCaps(app, videoId, wantLang);      // 💾 بار دوم: فوری از دیسک
+                if (got != null) capCache.put(cacheKey, got);
+            }
             String err = null;
             boolean noCaps = false;
             if (got == null) {
                 try {
                     got = YtCaptionFetcher.fetch(httpFast, base, videoId, wantLang);
                     capCache.put(cacheKey, got);
+                    YtDiskCache.saveCaps(app, videoId, wantLang, got);
                 } catch (YtCaptionFetcher.Fail f) {
                     Log.w(TAG, "captions failed: " + f.getMessage());
                     err = f.getMessage();
@@ -332,6 +339,7 @@ final class YtSubtitles {
                 trackLang = fin.lang;
                 buildSentences();
                 host.notice("");
+                restoreCachedTranslations();     // 💾 ترجمه‌های قبلیِ همین ویدیو (اگر هست) فوری
                 pump();
             });
         });
@@ -403,25 +411,29 @@ final class YtSubtitles {
         return si / CHUNK;
     }
 
+    /** ⚡ ترجمه‌ی کلِ ویدیو در پس‌زمینه: اول chunk جاری، بعد به‌ترتیبِ جلوتر، بعد عقب‌تر؛ تا PARALLEL تا هم‌زمان. */
     private void pump() {
-        if (!active || chunkBusy || cues.isEmpty() || sents.isEmpty()) return;
+        if (!active || cues.isEmpty() || sents.isEmpty()) return;
         final List<String> ls = langs();
         if (ls.isEmpty()) return;
         final int total = (sents.size() + CHUNK - 1) / CHUNK;
-        final int cur = currentChunk();
-        for (int d = 0; d <= AHEAD_CHUNKS; d++) {
-            int c = cur + d;
-            if (c >= total) break;
+        final int cur = Math.min(currentChunk(), total - 1);
+        // ترتیبِ اولویت: cur, cur+1, ..., total-1, cur-1, cur-2, ..., 0
+        for (int step = 0; step < total && running.size() < PARALLEL; step++) {
+            int c = (cur + step < total) ? cur + step : cur - (cur + step - total + 1);
+            if (c < 0 || c >= total) continue;
             for (String lang : ls) {
-                if (done.contains(lang + "#" + c)) continue;
+                if (running.size() >= PARALLEL) break;
+                String key = lang + "#" + c;
+                if (done.contains(key) || running.contains(key)) continue;
                 startChunk(c, lang);
-                return;
             }
         }
     }
 
     private void startChunk(final int chunk, final String lang) {
-        chunkBusy = true;
+        final String key = lang + "#" + chunk;
+        running.add(key);
         final int g = gen;
         final int from = chunk * CHUNK;
         final int to = Math.min(sents.size(), from + CHUNK);
@@ -436,7 +448,6 @@ final class YtSubtitles {
         final String tone = host.tone();
         final String srcName = host.langName(src);
         final String tgtName = host.langName(lang);
-        final String key = lang + "#" + chunk;
 
         netChunk.execute(() -> {
             String[] out = null;
@@ -455,7 +466,7 @@ final class YtSubtitles {
             final String[] res = out;
             main.post(() -> {
                 if (g != gen || !active) return;     // ویدیوی دیگه‌ای شده
-                chunkBusy = false;
+                running.remove(key);
                 boolean any = false;
                 for (int i = 0; i < res.length; i++) {
                     if (res[i] == null || res[i].trim().isEmpty()) continue;
@@ -464,6 +475,7 @@ final class YtSubtitles {
                 }
                 if (any) {
                     done.add(key);
+                    persistTranslations(lang);
                     pump();
                 } else {
                     int f = fails.containsKey(key) ? fails.get(key) + 1 : 1;
@@ -473,6 +485,43 @@ final class YtSubtitles {
                 }
             });
         });
+    }
+
+    // ───── 💾 کشِ ماندگارِ ترجمه‌ها ─────
+
+    /** ترجمه‌های ذخیره‌شده‌ی همین ویدیو را (اگر هست) بدونِ شبکه اعمال می‌کند. روی main thread. */
+    private void restoreCachedTranslations() {
+        if (curVideoId.isEmpty() || sents.isEmpty()) return;
+        final String sig = YtDiskCache.signature(sentTexts);
+        final String tone = host.tone() == null ? "neutral" : host.tone();
+        for (String lang : langs()) {
+            String[] saved = YtDiskCache.loadTr(app, curVideoId, lang, tone, sig);
+            if (saved == null || saved.length != sents.size()) continue;
+            String[] sa = sentArr(lang);
+            for (int i = 0; i < saved.length; i++) if (saved[i] != null) sa[i] = saved[i];
+            String[] a = arr(lang);
+            for (int c = 0; c < a.length; c++) {
+                String v = composeCue(lang, c);
+                if (v != null) a[c] = v;
+            }
+            final int total = (sents.size() + CHUNK - 1) / CHUNK;
+            for (int ch = 0; ch < total; ch++) {
+                boolean full = true;
+                for (int i = ch * CHUNK; i < Math.min(sents.size(), (ch + 1) * CHUNK); i++) if (sa[i] == null) { full = false; break; }
+                if (full) done.add(lang + "#" + ch);
+            }
+        }
+    }
+
+    private void persistTranslations(final String lang) {
+        if (curVideoId.isEmpty() || sents.isEmpty()) return;
+        final String vid = curVideoId;
+        final String sig = YtDiskCache.signature(sentTexts);
+        final String tone = host.tone() == null ? "neutral" : host.tone();
+        final String[] snap = sentArr(lang).clone();
+        try {
+            netIo.execute(() -> YtDiskCache.saveTr(app, vid, lang, tone, sig, snap));
+        } catch (Exception ignored) {}
     }
 
     private String[] requestChunk(List<String> lines, List<String> before, List<String> after, String title,
