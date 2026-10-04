@@ -68,10 +68,13 @@ final class YtSubtitles {
         boolean fa();
         /** پیامِ کوتاهِ وضعیت؛ "" = پاک کن. */
         void notice(String message);
-        /** خطِ جدیدِ جاری رو نشون بده. reset=true یعنی تاریخچه اول پاک بشه (seek / ویدیوی جدید). */
-        void show(int idx, String src, Map<String, String> tr, boolean reset);
-        /** ترجمه‌ی خطِ idx به lang رسید (ممکنه هنوز نمایش داده نشده باشه؛ Host خودش چک می‌کنه). */
-        void update(int idx, String lang, String text);
+        /** کلِ زیرنویس (جمله‌به‌جمله) رسید: همه‌ی جمله‌ها یک‌جا و کم‌رنگ در پنل چیده شوند.
+         *  tr: lang -> ترجمه‌ی هر جمله (null = هنوز نه). cur = جمله‌ی در حالِ پخش (یا -1). */
+        void loadAll(List<String> sentences, Map<String, String[]> tr, int cur);
+        /** جمله‌ی در حالِ پخش عوض شد: پررنگش کن. force=true (seek/شروع) یعنی حتماً اسکرول کن. */
+        void setCurrent(int sentIdx, boolean force);
+        /** ترجمه‌ی جمله‌ی sentIdx به lang رسید. */
+        void updateSentence(int sentIdx, String lang, String text);
         /** ویدیوی دیگری شروع شد: تاریخچه‌ی ویدیوی قبلی باید پاک شود. */
         void videoChanged();
     }
@@ -125,6 +128,7 @@ final class YtSubtitles {
     private final HashSet<String> quickAsked = new HashSet<>();      // "lang#idx"
     private final HashSet<String> running = new HashSet<>();      // "lang#chunk" های در حالِ ترجمه
     private int shownIdx = -1;
+    private int shownSent = -1;
     private int tickCount = 0;
     private volatile long offsetMs = 0;
     private final java.util.TreeSet<Integer> shown = new java.util.TreeSet<>();   // خط‌هایی که واقعاً روی پنل نمایش داده شدند (برای ذخیره)
@@ -286,6 +290,7 @@ final class YtSubtitles {
         trs.clear(); sentTr.clear(); done.clear(); fails.clear(); quickAsked.clear();
         running.clear();
         shownIdx = -1;
+        shownSent = -1;
         shown.clear();
         curVideoId = "";
     }
@@ -340,6 +345,7 @@ final class YtSubtitles {
                 buildSentences();
                 host.notice("");
                 restoreCachedTranslations();     // 💾 ترجمه‌های قبلیِ همین ویدیو (اگر هست) فوری
+                publishList();                   // 📜 کلِ زیرنویس یک‌جا و کم‌رنگ در پنل
                 pump();
             });
         });
@@ -388,20 +394,49 @@ final class YtSubtitles {
             boolean reset = shownIdx < 0 || idx < shownIdx || idx - shownIdx > 3;   // seek یا شروع
             shownIdx = idx;
             shown.add(idx);
-            Cue c = cues.get(idx);
-            HashMap<String, String> tr = new HashMap<>();
             for (String lang : langs()) {
-                String v = arr(lang)[idx];
-                tr.put(lang, v == null ? "…" : v);
-                if (v == null) quick(idx, lang);
+                if (arr(lang)[idx] == null) quick(idx, lang);     // ترجمه‌ی سریعِ جمله‌ی جاری تا منتظرِ chunk نمانیم
             }
-            host.show(idx, c.text, tr, reset);
+            int si = sentOfCue(idx);
+            if (si >= 0 && (si != shownSent || reset)) {
+                shownSent = si;
+                host.setCurrent(si, reset);
+            }
             pump();
         }
         if (++tickCount % 7 == 0) pump();    // ~هر ثانیه: chunk های جدید/زبان‌های تازه
     }
 
     // ════════════════════ ۳) ترجمه‌ی lazy، chunk به chunk ════════════════════
+
+    /** جمله‌ای که بیشترین هم‌پوشانی را با تکه‌ی cue دارد. */
+    private int sentOfCue(int cue) {
+        if (cue < 0 || cue >= cueSents.length || cueSents[cue].length == 0) return -1;
+        int best = cueSents[cue][0], bestOv = -1;
+        for (int si : cueSents[cue]) {
+            int[] sp = sents.get(si);
+            int ov = Math.min(cueRangeE[cue], sp[1]) - Math.max(cueRangeS[cue], sp[0]);
+            if (ov >= bestOv) { bestOv = ov; best = si; }
+        }
+        return best;
+    }
+
+    private static final int MAX_LIST = 3000;
+
+    /** کلِ جمله‌ها + ترجمه‌های موجود را به پنل می‌دهد. */
+    private void publishList() {
+        if (sents.isEmpty()) return;
+        int n = Math.min(sents.size(), MAX_LIST);
+        List<String> texts = new ArrayList<>(sentTexts.subList(0, n));
+        HashMap<String, String[]> trCopy = new HashMap<>();
+        for (String lang : langs()) {
+            String[] a = sentArr(lang);
+            trCopy.put(lang, java.util.Arrays.copyOf(a, n));
+        }
+        int cur = -1;
+        if (last != null && last.hasSession) cur = sentOfCue(findCue(last.nowMs() + offsetMs));
+        host.loadAll(texts, trCopy, cur);
+    }
 
     private int currentChunk() {
         int i = shownIdx;
@@ -714,8 +749,8 @@ final class YtSubtitles {
             if (v == null) continue;
             if (v.equals(a[c])) continue;
             a[c] = v;
-            host.update(c, lang, v);
         }
+        host.updateSentence(si, lang, sa[si]);
     }
 
     // ════════════════════ ابزارهای شبکه ════════════════════

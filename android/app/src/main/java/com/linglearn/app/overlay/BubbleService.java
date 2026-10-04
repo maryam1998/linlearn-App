@@ -294,6 +294,13 @@ public class BubbleService extends Service {
     private TextView tvSave;              // دکمه‌ی 💾 (هم حالت یوتیوب، هم ترجمه‌ی زنده)
     private String liveKey = null;        // شناسه‌ی جلسه‌ی ترجمه‌ی زنده برای ذخیره (با پاک کردنِ تاریخچه ریست می‌شود)
     private long liveStartMs = 0;
+    private boolean ytListMode = false;       // 📺 لیستِ کاملِ زیرنویس در پنل است (سقفِ تاریخچه اعمال نشود)
+    private int ytListGen = 0;
+    private int ytCur = -1;                   // جمله‌ی پررنگ‌شده
+    private int ytWanted = -1;                // جمله‌ی جاری در حینِ ساختنِ لیست
+    private boolean ytWantedForce = false;
+    private boolean ytRefreshQueued = false;
+    private static final float YT_DIM = 0.42f;
     private final HashMap<Integer, Entry> ytEntries = new HashMap<>();   // شماره‌ی خطِ زیرنویس -> ردیفِ روی پنل
     private int reqCounter = 0;           // monotonically increasing translation request id
     private final Runnable hidePanel = this::removePanel;
@@ -747,6 +754,17 @@ public class BubbleService extends Service {
         int maxHeightPx = Integer.MAX_VALUE;
         boolean atBottom = true;
         boolean frozen = false;      // وقتی کاربر دارد متن انتخاب می‌کند / کادرِ لغت باز است، خودکار به پایین نپر
+        boolean ytMode = false;      // 📺 لیستِ کاملِ زیرنویس: به‌جای پرش به انتها، خودِ برنامه خطِ جاری را اسکرول می‌کند
+        long lastUserTouch = 0;      // آخرین لمسِ کاربر (تا وسطِ خواندن اسکرولش را نپرانیم)
+
+        @Override
+        public boolean dispatchTouchEvent(MotionEvent ev) {
+            int a = ev.getActionMasked();
+            if (a == MotionEvent.ACTION_DOWN || a == MotionEvent.ACTION_MOVE || a == MotionEvent.ACTION_UP) {
+                lastUserTouch = SystemClock.uptimeMillis();
+            }
+            return super.dispatchTouchEvent(ev);
+        }
 
         HistoryScroll(Context c) { super(c); }
 
@@ -758,7 +776,7 @@ public class BubbleService extends Service {
         @Override
         protected void onLayout(boolean changed, int l, int t, int r, int b) {
             super.onLayout(changed, l, t, r, b);
-            if (atBottom && !frozen) {
+            if (atBottom && !frozen && !ytMode) {
                 View c = getChildAt(0);
                 if (c != null) scrollTo(0, Math.max(0, c.getHeight() - getHeight()));
             }
@@ -1779,7 +1797,7 @@ public class BubbleService extends Service {
         listBox.addView(e.box, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         history.add(e);
-        while (history.size() > MAX_HISTORY) {
+        while (!ytListMode && history.size() > MAX_HISTORY) {
             Entry old = history.get(0);
             if (old == live) break;
             history.remove(0);
@@ -2331,6 +2349,8 @@ public class BubbleService extends Service {
         YtSubtitles engine = yt;
         yt = null;
         ytEntries.clear();
+        ytListMode = false; ytListGen++; ytCur = -1;
+        if (scroll != null) scroll.ytMode = false;
         if (engine != null) { try { engine.stop(); } catch (Throwable ignored) {} }
         if (engine == null) return;
         refreshHeader();
@@ -2353,51 +2373,122 @@ public class BubbleService extends Service {
             showNotice(m);
         }
 
-        @Override public void show(int idx, String src, Map<String, String> tr, boolean reset) {
+        @Override public void loadAll(final List<String> sentences, final Map<String, String[]> tr, final int cur) {
             if (wm == null || bubble == null) return;
             clearStatus();
-            // ✅ تاریخچه با seek/شروع پاک نمی‌شود؛ فقط با 🗑 یا عوض‌شدنِ ویدیو.
-            Entry e = ytEntries.get(idx);
-            if (e != null && history.contains(e)) {
-                for (Map.Entry<String, String> x : tr.entrySet()) {
-                    String cur = e.tr.get(x.getKey());
-                    boolean haveGood = cur != null && !cur.isEmpty() && !cur.equals("…");
-                    if (!x.getValue().equals("…") || !haveGood) {
-                        e.tr.put(x.getKey(), x.getValue());
-                        e.trSrc.put(x.getKey(), src);
-                    }
-                }
-                renderEntry(e);
-                afterChange();
-                if (reset) scrollToEntry(e);
-                return;
-            }
-            e = newEntry();
-            e.ytIdx = idx;
-            e.src = src;
-            for (Map.Entry<String, String> x : tr.entrySet()) {
-                e.tr.put(x.getKey(), x.getValue());
-                e.trSrc.put(x.getKey(), src);
-            }
-            ytEntries.put(idx, e);
-            placeByCueIndex(e);
+            final int g = ++ytListGen;
+            clearHistory();
+            ytEntries.clear();
+            ytCur = -1;
+            ytWanted = cur;
+            ytWantedForce = true;
+            ytListMode = true;
+            ensurePanel();
+            scroll.ytMode = true;
+            scroll.atBottom = false;
+            buildYtBatch(sentences, tr, 0, g);
+        }
+
+        @Override public void setCurrent(int sentIdx, boolean force) {
+            ytWanted = sentIdx;
+            ytWantedForce = ytWantedForce || force;
+            applyYtCurrent(false);
+        }
+
+        @Override public void updateSentence(int sentIdx, String lang, String text) {
+            Entry e = ytEntries.get(sentIdx);
+            if (e == null || text == null || text.isEmpty()) return;
+            e.tr.put(lang, text);
+            e.trSrc.put(lang, e.src);
             renderEntry(e);
-            afterChange();
-            if (reset) scrollToEntry(e);
+            queueYtRefresh();
         }
 
         @Override public void videoChanged() {
             if (wm == null || bubble == null) return;
+            ytListGen++;
             clearHistory();
             ytEntries.clear();
-        }
-
-        @Override public void update(int idx, String lang, String text) {
-            Entry e = ytEntries.get(idx);
-            if (e == null) return;
-            setTranslation(e, lang, text, e.src);
+            ytCur = -1;
         }
     };
+
+    // ─── 📜 لیستِ کاملِ زیرنویس: همه کم‌رنگ، جمله‌ی در حالِ پخش پررنگ ───
+
+    /** ردیف‌ها را دسته‌دسته (۴۰ تا در هر فریم) می‌سازد تا گوشی برای ویدیوهای بلند هنگ نکند. */
+    private void buildYtBatch(final List<String> sents, final Map<String, String[]> tr, final int from, final int g) {
+        if (g != ytListGen || wm == null || bubble == null) return;
+        int end = Math.min(sents.size(), from + 40);
+        for (int i = from; i < end; i++) {
+            Entry e = newEntry();
+            e.ytIdx = i;
+            e.src = sents.get(i);
+            e.srcLang = currentSrcLang();
+            for (Map.Entry<String, String[]> x : tr.entrySet()) {
+                String[] a = x.getValue();
+                if (a != null && i < a.length && a[i] != null && !a[i].isEmpty()) {
+                    e.tr.put(x.getKey(), a[i]);
+                    e.trSrc.put(x.getKey(), e.src);
+                }
+            }
+            styleYtEntry(e, false);
+            ytEntries.put(i, e);
+            renderEntry(e);
+        }
+        afterChange();
+        if (end < sents.size()) {
+            final int nxt = end;
+            main.post(() -> buildYtBatch(sents, tr, nxt, g));
+        } else {
+            applyYtCurrent(true);
+        }
+    }
+
+    private void styleYtEntry(Entry e, boolean current) {
+        if (e == null || e.box == null) return;
+        e.box.setAlpha(current ? 1f : YT_DIM);
+        e.tvSrc.setTextColor(current ? Color.WHITE : Color.parseColor("#C8CCD8"));
+        e.tvSrc.setTag(new float[]{13f, current ? 1f : 0f});
+        applyStyle(e.tvSrc);
+    }
+
+    private void applyYtCurrent(boolean listJustBuilt) {
+        int idx = ytWanted;
+        if (idx < 0) return;
+        Entry n = ytEntries.get(idx);
+        if (n == null) return;                 // هنوز در حالِ ساختنِ لیست؛ آخرِ ساخت دوباره صدا زده می‌شود
+        boolean changed = ytCur != idx;
+        if (changed) {
+            Entry o = ytEntries.get(ytCur);
+            if (o != null) styleYtEntry(o, false);
+            ytCur = idx;
+        }
+        for (String t : activeTargets()) {
+            String v = n.tr.get(t);
+            if (v == null || v.isEmpty()) n.tr.put(t, "…");
+        }
+        styleYtEntry(n, true);
+        renderEntry(n);
+        boolean force = ytWantedForce || listJustBuilt;
+        ytWantedForce = false;
+        if (scroll != null && (changed || force)) {
+            boolean userBusy = SystemClock.uptimeMillis() - scroll.lastUserTouch < 4000;
+            if (force || !userBusy) scrollToYtEntry(n);
+        }
+        queueYtRefresh();
+    }
+
+    private void scrollToYtEntry(final Entry e) {
+        if (scroll == null || e == null || e.box == null) return;
+        scroll.post(() -> scroll.smoothScrollTo(0, Math.max(0, e.box.getTop() - scroll.getHeight() / 3)));
+    }
+
+    /** چند به‌روزرسانیِ پشتِ‌سرهم (ترجمه‌ی یک chunk) فقط یک بار layout پنل را تازه می‌کنند. */
+    private void queueYtRefresh() {
+        if (ytRefreshQueued) return;
+        ytRefreshQueued = true;
+        main.postDelayed(() -> { ytRefreshQueued = false; afterChange(); }, 120);
+    }
 
     private void setRecordingUi(boolean rec) {
         if (bubble == null) return;
