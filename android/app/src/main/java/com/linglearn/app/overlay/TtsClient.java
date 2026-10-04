@@ -257,24 +257,18 @@ final class TtsClient {
     }
 
     private static void showCrashToast(String stage, String lang) {
+        // فقط لاگ — دیگه چیزی توی کلیپ‌بورد کپی نمی‌شه و Toast نشون داده نمی‌شه
+        // (قبلاً گزارشِ کرش خودکار توی کلیپ‌بورد می‌نشست و کیبورد نشونش می‌داد).
         Context c = app;
         if (c == null) return;
         String info = exitInfo();
-        StringBuilder sb = new StringBuilder("Piper TTS crashed @ ").append(stage).append(info);
+        StringBuilder sb = new StringBuilder("TTS crashed @ ").append(stage).append(info);
         if (lang != null && isBlocked(lang)) {
-            sb.append(" | Piper off for '").append(lang).append("' until app restart");
+            sb.append(" | off for '").append(lang).append("' until app restart");
         } else if (lang != null && isPlain(lang)) {
             sb.append(" | retry in safe mode");
         }
-        final String full = sb.toString() + lastTrace;
-        Log.e(TAG, full);
-        try {
-            ClipboardManager cm = (ClipboardManager) c.getSystemService(Context.CLIPBOARD_SERVICE);
-            if (cm != null) cm.setPrimaryClip(ClipData.newPlainText("piper-crash", full));
-        } catch (Throwable ignored) {}
-        String shortMsg = sb.toString();
-        if (shortMsg.length() > 120) shortMsg = shortMsg.substring(0, 120) + "…";
-        try { Toast.makeText(c, shortMsg + "\n(full details copied — paste it to Claude)", Toast.LENGTH_LONG).show(); } catch (Throwable ignored) {}
+        Log.e(TAG, sb.toString() + lastTrace);
     }
 
     private static volatile String lastTrace = "";
@@ -360,13 +354,6 @@ final class TtsClient {
             resetCrash(lang);
         } else if (err != null) {
             Log.w(TAG, "TTS failed (" + lang + "): " + err);
-            final String msg = "Piper TTS (" + lang + "): " + err;
-            MAIN.post(() -> {
-                Context c = app;
-                if (c != null) {
-                    try { Toast.makeText(c, msg, Toast.LENGTH_LONG).show(); } catch (Throwable ignored) {}
-                }
-            });
         }
         emit(lang, v == null ? "" : v[1], id, ok);
         return true;

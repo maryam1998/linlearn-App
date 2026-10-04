@@ -45,7 +45,9 @@ final class YtSubtitles {
 
     private static final String TAG = "YtSubtitles";
 
-    static final int CHUNK = 7;                    // تعداد خط در هر chunk
+    static final int CHUNK = 5;                    // تعداد «جمله» در هر chunk (نه تکه‌ی زیرنویس)
+    private static final long GAP_BREAK_MS = 1200;  // مکثِ بیشتر از این بینِ دو تکه = مرزِ جمله
+    private static final int MAX_SENT_CHARS = 220;  // جمله‌ی بدونِ نقطه از این بلندتر نشه
     private static final int AHEAD_CHUNKS = 3;     // چند chunk جلوتر از پخش از قبل ترجمه بشه
     private static final int CONTEXT_LINES = 3;    // جمله‌های همسایه (قبل/بعد) به‌عنوان زمینه
     private static final long TICK_MS = 150;
@@ -107,6 +109,16 @@ final class YtSubtitles {
     private String trackLang = "en";
     String trackLang() { return trackLang; }
     private final HashMap<String, String[]> trs = new HashMap<>();   // lang -> ترجمه‌ی هر خط (null = هنوز نه)
+    // ── ترجمه در سطحِ «جمله»: تکه‌های زیرنویس یوتیوب وسطِ جمله بریده می‌شن و ترجمه‌ی جدا‌جدایِ هر تکه غلط درمی‌آد.
+    //    پس جمله‌ی کامل ترجمه می‌شه و بعد کلمه‌های ترجمه بینِ همون تکه‌ها (به نسبتِ طولِ متنِ اصلی) پخش می‌شه.
+    private List<int[]> sents = new ArrayList<>();                 // هر جمله: {شروع، پایان} توی متنِ چسبیده
+    private List<String> sentTexts = new ArrayList<>();
+    private int[] cueRangeS = new int[0];                          // محدوده‌ی هر تکه توی متنِ چسبیده (کاشی‌شده، بدونِ فاصله)
+    private int[] cueRangeE = new int[0];
+    private int[][] cueSents = new int[0][];                       // هر تکه: جمله‌هایی که باهاشون هم‌پوشانی داره
+    private int[] sentFirstCue = new int[0];
+    private int[] sentLastCue = new int[0];
+    private final HashMap<String, String[]> sentTr = new HashMap<>();   // lang -> ترجمه‌ی هر جمله
     private final HashSet<String> done = new HashSet<>();            // "lang#chunk"
     private final HashMap<String, Integer> fails = new HashMap<>();
     private final HashSet<String> quickAsked = new HashSet<>();      // "lang#idx"
@@ -191,7 +203,8 @@ final class YtSubtitles {
         tracker.stop();
         gen++;
         cues = new ArrayList<>();
-        trs.clear(); done.clear(); fails.clear(); quickAsked.clear();
+        buildSentences();
+        trs.clear(); sentTr.clear(); done.clear(); fails.clear(); quickAsked.clear();
         netCaps.shutdownNow();
         netChunk.shutdownNow();
         netQuick.shutdownNow();
@@ -267,7 +280,8 @@ final class YtSubtitles {
     private void resetVideo() {
         gen++;
         cues = new ArrayList<>();
-        trs.clear(); done.clear(); fails.clear(); quickAsked.clear();
+        buildSentences();
+        trs.clear(); sentTr.clear(); done.clear(); fails.clear(); quickAsked.clear();
         chunkBusy = false;
         shownIdx = -1;
         shown.clear();
@@ -316,6 +330,7 @@ final class YtSubtitles {
                 }
                 cues = fin.cues;
                 trackLang = fin.lang;
+                buildSentences();
                 host.notice("");
                 pump();
             });
@@ -383,14 +398,16 @@ final class YtSubtitles {
     private int currentChunk() {
         int i = shownIdx;
         if (i < 0 && last != null && !cues.isEmpty()) i = findCue(last.nowMs() + offsetMs);
-        return Math.max(0, i) / CHUNK;
+        i = Math.max(0, i);
+        int si = (i < cueSents.length && cueSents[i].length > 0) ? cueSents[i][0] : 0;
+        return si / CHUNK;
     }
 
     private void pump() {
-        if (!active || chunkBusy || cues.isEmpty()) return;
+        if (!active || chunkBusy || cues.isEmpty() || sents.isEmpty()) return;
         final List<String> ls = langs();
         if (ls.isEmpty()) return;
-        final int total = (cues.size() + CHUNK - 1) / CHUNK;
+        final int total = (sents.size() + CHUNK - 1) / CHUNK;
         final int cur = currentChunk();
         for (int d = 0; d <= AHEAD_CHUNKS; d++) {
             int c = cur + d;
@@ -407,13 +424,13 @@ final class YtSubtitles {
         chunkBusy = true;
         final int g = gen;
         final int from = chunk * CHUNK;
-        final int to = Math.min(cues.size(), from + CHUNK);
+        final int to = Math.min(sents.size(), from + CHUNK);
         final List<String> lines = new ArrayList<>();
-        for (int i = from; i < to; i++) lines.add(cues.get(i).text);
+        for (int i = from; i < to; i++) lines.add(sentTexts.get(i));
         final List<String> before = new ArrayList<>();
-        for (int i = Math.max(0, from - CONTEXT_LINES); i < from; i++) before.add(cues.get(i).text);
+        for (int i = Math.max(0, from - CONTEXT_LINES); i < from; i++) before.add(sentTexts.get(i));
         final List<String> after = new ArrayList<>();
-        for (int i = to; i < Math.min(cues.size(), to + CONTEXT_LINES); i++) after.add(cues.get(i).text);
+        for (int i = to; i < Math.min(sents.size(), to + CONTEXT_LINES); i++) after.add(sentTexts.get(i));
         final String src = trackLang;
         final String title = curTitle;
         final String tone = host.tone();
@@ -426,7 +443,7 @@ final class YtSubtitles {
             try {
                 out = requestChunk(lines, before, after, title, src, srcName, lang, tgtName, tone);
             } catch (Exception e) {
-                Log.w(TAG, "chunk request failed (" + e + "); falling back to per-line translation");
+                Log.w(TAG, "chunk request failed (" + e + "); falling back to per-sentence translation");
             }
             if (out == null) {
                 out = new String[lines.size()];
@@ -440,12 +457,10 @@ final class YtSubtitles {
                 if (g != gen || !active) return;     // ویدیوی دیگه‌ای شده
                 chunkBusy = false;
                 boolean any = false;
-                String[] a = arr(lang);
                 for (int i = 0; i < res.length; i++) {
                     if (res[i] == null || res[i].trim().isEmpty()) continue;
                     any = true;
-                    a[from + i] = res[i].trim();
-                    host.update(from + i, lang, a[from + i]);
+                    setSentence(from + i, lang, res[i].trim(), true);
                 }
                 if (any) {
                     done.add(key);
@@ -481,27 +496,177 @@ final class YtSubtitles {
         return out;
     }
 
-    /** ترجمه‌ی سریعِ تک‌خطی برای خطِ جاری تا منتظر chunk نمونیم؛ chunk بعداً جایگزینش می‌کنه. */
+    /**
+     * ترجمه‌ی سریعِ «جمله‌ی کامل» (نه تکه‌ی شکسته) برای خطِ جاری تا منتظر chunk نمونیم؛
+     * chunk بعداً جایگزینش می‌کنه.
+     */
     private void quick(final int idx, final String lang) {
-        if (!quickAsked.add(lang + "#" + idx)) return;
-        final int g = gen;
-        final String text = cues.get(idx).text;
-        final String src = trackLang;
-        try {
-            netQuick.execute(() -> {
-                final String out;
-                try { out = FreeTranslator.translate(httpFast, text, src, lang); }
-                catch (Exception e) { return; }
-                main.post(() -> {
-                    if (g != gen || !active) return;
-                    String[] a = arr(lang);
-                    if (idx < a.length && a[idx] == null) {     // اگه chunk زودتر رسیده بود، دست نزن
-                        a[idx] = out;
-                        host.update(idx, lang, out);
-                    }
+        if (idx < 0 || idx >= cueSents.length) return;
+        final int[] ss = cueSents[idx];
+        for (final int si : ss) {
+            if (!quickAsked.add(lang + "#" + si)) continue;
+            final int g = gen;
+            final String text = sentTexts.get(si);
+            final String src = trackLang;
+            try {
+                netQuick.execute(() -> {
+                    final String out;
+                    try { out = FreeTranslator.translate(httpFast, text, src, lang); }
+                    catch (Exception e) { return; }
+                    main.post(() -> {
+                        if (g != gen || !active) return;
+                        setSentence(si, lang, out == null ? "" : out.trim(), false);   // اگه chunk زودتر رسیده بود، دست نزن
+                    });
                 });
-            });
-        } catch (Exception ignored) {}
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // ───── ساختنِ جمله‌ها از تکه‌های زیرنویس، و پخشِ ترجمه‌ی جمله بینِ تکه‌ها ─────
+
+    private static boolean isTerminal(char ch) {
+        return ch == '.' || ch == '!' || ch == '?' || ch == '…' || ch == '。' || ch == '！' || ch == '？' || ch == '۔' || ch == '؟';
+    }
+
+    private void buildSentences() {
+        sents = new ArrayList<>();
+        sentTexts = new ArrayList<>();
+        final int n = cues.size();
+        cueRangeS = new int[n]; cueRangeE = new int[n];
+        cueSents = new int[n][];
+        if (n == 0) { sentFirstCue = new int[0]; sentLastCue = new int[0]; return; }
+
+        StringBuilder full = new StringBuilder();
+        int[] cs = new int[n], ce = new int[n];
+        for (int i = 0; i < n; i++) {
+            String t = cues.get(i).text.replaceAll("\\s+", " ").trim();
+            if (full.length() > 0) full.append(' ');
+            cs[i] = full.length();
+            full.append(t);
+            ce[i] = full.length();
+        }
+        final int len = full.length();
+        boolean[] brk = new boolean[len + 1];
+        // ۱) مرزِ جمله از روی علامتِ پایان (فقط وقتی بعدش فاصله/انتها باشه؛ «3.5» نشکنه)
+        for (int i = 0; i < len; i++) {
+            if (!isTerminal(full.charAt(i))) continue;
+            int j = i + 1;
+            while (j < len && isTerminal(full.charAt(j))) j++;                       // «...» / «?!»
+            while (j < len && "\"'”’»)]".indexOf(full.charAt(j)) >= 0) j++;         // نقل‌قولِ بسته
+            if (j >= len || full.charAt(j) == ' ') brk[Math.min(j, len)] = true;
+            i = Math.max(i, j - 1);
+        }
+        // ۲) مرزِ اجباری: مکثِ زیاد بینِ دو تکه، یا جمله‌ی خیلی بلندِ بدونِ نقطه (زیرنویس‌های خودکار)
+        int lastB = 0;
+        int scan = 0;
+        for (int i = 0; i < n - 1; i++) {
+            while (scan <= ce[i]) { if (brk[scan]) lastB = scan; scan++; }
+            long gap = cues.get(i + 1).startMs - cues.get(i).endMs;
+            if (!brk[ce[i]] && (gap > GAP_BREAK_MS || ce[i] - lastB >= MAX_SENT_CHARS)) {
+                brk[ce[i]] = true;
+                lastB = ce[i];
+            }
+        }
+        brk[len] = true;
+        // ۳) برش
+        int start = 0;
+        for (int i = 1; i <= len; i++) {
+            if (!brk[i]) continue;
+            int a = start, b = i;
+            while (a < b && full.charAt(a) == ' ') a++;
+            while (b > a && full.charAt(b - 1) == ' ') b--;
+            if (b > a) { sents.add(new int[]{a, b}); sentTexts.add(full.substring(a, b)); }
+            start = i;
+        }
+        // ۴) محدوده‌ی کاشی‌شده‌ی هر تکه (فاصله‌ی بینِ دو تکه به تکه‌ی قبلی تعلق داره) + هم‌پوشانی با جمله‌ها
+        sentFirstCue = new int[sents.size()];
+        sentLastCue = new int[sents.size()];
+        java.util.Arrays.fill(sentFirstCue, Integer.MAX_VALUE);
+        java.util.Arrays.fill(sentLastCue, -1);
+        int sp = 0;
+        for (int i = 0; i < n; i++) {
+            cueRangeS[i] = cs[i];
+            cueRangeE[i] = (i < n - 1) ? cs[i + 1] : ce[i];
+            ArrayList<Integer> hit = new ArrayList<>();
+            while (sp < sents.size() && sents.get(sp)[1] <= cueRangeS[i]) sp++;
+            for (int k = sp; k < sents.size() && sents.get(k)[0] < cueRangeE[i]; k++) {
+                int o1 = Math.max(cueRangeS[i], sents.get(k)[0]), o2 = Math.min(cueRangeE[i], sents.get(k)[1]);
+                if (o2 > o1) hit.add(k);
+            }
+            if (hit.isEmpty() && !sents.isEmpty()) hit.add(Math.min(Math.max(0, sp), sents.size() - 1));
+            cueSents[i] = new int[hit.size()];
+            for (int h = 0; h < hit.size(); h++) {
+                int k = hit.get(h);
+                cueSents[i][h] = k;
+                sentFirstCue[k] = Math.min(sentFirstCue[k], i);
+                sentLastCue[k] = Math.max(sentLastCue[k], i);
+            }
+        }
+    }
+
+    private String[] sentArr(String lang) {
+        String[] a = sentTr.get(lang);
+        if (a == null || a.length != sents.size()) { a = new String[sents.size()]; sentTr.put(lang, a); }
+        return a;
+    }
+
+    private static String[] tokens(String t) {
+        String x = t.trim();
+        if (x.isEmpty()) return new String[0];
+        if (x.indexOf(' ') < 0 && x.codePointCount(0, x.length()) > 8) {     // چینی/ژاپنی/تایلندی: بدونِ فاصله
+            int[] cps = x.codePoints().toArray();
+            String[] out = new String[cps.length];
+            for (int i = 0; i < cps.length; i++) out[i] = new String(Character.toChars(cps[i]));
+            return out;
+        }
+        return x.split("\\s+");
+    }
+
+    /** بخشی از ترجمه‌ی جمله‌ی si که مالِ تکه‌ی cue است. */
+    private String segment(String lang, int si, int cue) {
+        String tr = sentArr(lang)[si];
+        if (tr == null) return null;
+        int[] sp = sents.get(si);
+        String[] w = tokens(tr);
+        int nw = w.length;
+        int a = sp[0], b = sp[1];
+        int o1 = Math.max(cueRangeS[cue], a), o2 = Math.min(cueRangeE[cue], b);
+        if (nw == 0 || b <= a) return "";
+        int ts = (o1 <= a) ? 0 : (int) Math.round((double) nw * (o1 - a) / (b - a));
+        int te = (o2 >= b) ? nw : (int) Math.round((double) nw * (o2 - a) / (b - a));
+        if (te <= ts) return "";
+        boolean joinNoSpace = tr.indexOf(' ') < 0 && nw > 8;
+        StringBuilder sb = new StringBuilder();
+        for (int i = ts; i < te; i++) { if (sb.length() > 0 && !joinNoSpace) sb.append(' '); sb.append(w[i]); }
+        return sb.toString();
+    }
+
+    /** ترجمه‌ی نهاییِ یک تکه از روی جمله‌هایی که پوشش می‌ده؛ null = هنوز یکی از جمله‌ها نرسیده. */
+    private String composeCue(String lang, int cue) {
+        if (cue < 0 || cue >= cueSents.length) return null;
+        StringBuilder sb = new StringBuilder();
+        for (int si : cueSents[cue]) {
+            String seg = segment(lang, si, cue);
+            if (seg == null) return null;
+            if (!seg.isEmpty()) { if (sb.length() > 0) sb.append(' '); sb.append(seg); }
+        }
+        return sb.length() == 0 ? "…" : sb.toString();
+    }
+
+    /** ترجمه‌ی جمله‌ی si رسید (overwrite=false: فقط اگه هنوز چیزی نداره) → همه‌ی تکه‌های مربوطه به‌روز می‌شن. */
+    private void setSentence(int si, String lang, String text, boolean overwrite) {
+        if (si < 0 || si >= sents.size() || text == null || text.trim().isEmpty()) return;
+        String[] sa = sentArr(lang);
+        if (!overwrite && sa[si] != null) return;
+        sa[si] = text.trim();
+        String[] a = arr(lang);
+        for (int c = sentFirstCue[si]; c <= sentLastCue[si] && c < a.length; c++) {
+            String v = composeCue(lang, c);
+            if (v == null) continue;
+            if (v.equals(a[c])) continue;
+            a[c] = v;
+            host.update(c, lang, v);
+        }
     }
 
     // ════════════════════ ابزارهای شبکه ════════════════════
