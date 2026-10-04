@@ -737,6 +737,8 @@ public class BubbleService extends Service {
         final ArrayList<String> chunkSrc = new ArrayList<>();
         final HashMap<String, ArrayList<String>> chunkTr = new HashMap<>();   // lang -> ترجمه‌ی هر تکه ("" = در انتظار)
         int committedWords = 0;
+        TextView srcSpeakBtn;                                              // 🔊 کنار متن اصلی
+        final HashMap<String, TextView> rowSpeakBtn = new HashMap<>();     // 🔊 کنار ترجمه‌ی هر زبان
     }
 
     /** ScrollView with a max height that follows new text unless the user scrolled up to read older lines. */
@@ -799,6 +801,11 @@ public class BubbleService extends Service {
         header.addView(tvYt);
         tvSave = headerButton("\uD83D\uDCBE", v -> saveCurrent());
         header.addView(tvSave);
+        loadRepeatPref();
+        tvRepeat = headerButton("\uD83D\uDD01", v -> cycleRepeat());
+        tvRepeat.setPadding(dp(8), dp(6), dp(8), dp(6));
+        header.addView(tvRepeat);
+        updateRepeatButton();
         updateYtButton();
         TextView tvFont = headerButton("Aa", v -> cycleFont());
         tvFont.setTypeface(Typeface.DEFAULT_BOLD);
@@ -983,8 +990,13 @@ public class BubbleService extends Service {
         return (s == null || "auto".equals(s)) ? "en" : s;
     }
 
-    private TextView speakerButton(final Txt text,
-                                   final Txt lang) {
+    private TextView speakerButton(final Txt text, final Txt lang) {
+        return speakerButton(text, lang, null, null, null);
+    }
+
+    /** hl: متنی که هنگامِ خواندن جمله‌به‌جمله هایلایت می‌شود (null = بدونِ هایلایت). */
+    private TextView speakerButton(final Txt text, final Txt lang, final TextView hl,
+                                   final Entry ent, final String kind) {
         final TextView b = new TextView(this);
         b.setText("\uD83D\uDD0A");
         style(b, 18, false);
@@ -993,7 +1005,7 @@ public class BubbleService extends Service {
         b.setMinWidth(dp(44));
         b.setMinHeight(dp(40));
         b.setPadding(dp(6), dp(4), dp(6), dp(4));
-        b.setOnClickListener(v -> toggleSpeak(b, text.get(), lang.get()));
+        b.setOnClickListener(v -> toggleSpeak(b, text.get(), lang.get(), hl, ent, kind));
         return b;
     }
 
@@ -1004,29 +1016,235 @@ public class BubbleService extends Service {
         if (b != null) { b.setText("\u23F9"); b.setTextColor(COLOR_GOLD); }
     }
 
-    private void toggleSpeak(final TextView b, String text, String lang) {
-        if (text == null || text.trim().isEmpty() || text.equals("…")) return;
-        if (speakingBtn == b) { stopPanelSpeech(); return; }
-        setSpeaking(b);
-        final int my = ++speakToken;
-        panelSpeaking = true;
-        PanelTts.speak(this, text, lang, 1.0f, ok -> {
-            if (my != speakToken) return;               // پخشِ تازه‌تری شروع شده
-            panelSpeaking = false;
-            panelQuietUntil = SystemClock.uptimeMillis() + 1200;
-            if (speakingBtn == b) setSpeaking(null);
+    // ───────── 🔊 خواندنِ جمله‌به‌جمله با هایلایتِ بخشِ در حالِ خواندن (هم متنِ اصلی، هم ترجمه) ─────────
+
+    private TextView speakTv = null;      // متنی که الان بخش‌هایش هایلایت می‌شود
+    private static final java.util.regex.Pattern SENT_PAT = java.util.regex.Pattern.compile(
+            "[^.!?\\u061F\\u3002\\uFF01\\uFF1F\\u2026]+[.!?\\u061F\\u3002\\uFF01\\uFF1F\\u2026]*");
+
+    /** متن را به بخش‌های [start,end) می‌شکند: جمله‌ها؛ و جمله‌های بلند (مثلاً متنِ بدونِ نقطه‌گذاریِ تشخیصِ گفتار) در مرزِ ویرگول/حرفِ ربط. */
+    private static ArrayList<int[]> splitSegments(String text) {
+        ArrayList<int[]> out = new ArrayList<>();
+        java.util.regex.Matcher m = SENT_PAT.matcher(text);
+        while (m.find()) {
+            int a = m.start(), z = m.end();
+            while (a < z && Character.isWhitespace(text.charAt(a))) a++;
+            while (z > a && Character.isWhitespace(text.charAt(z - 1))) z--;
+            if (a >= z) continue;
+            boolean hasLetter = false;
+            for (int i = a; i < z && !hasLetter; i++) hasLetter = Character.isLetterOrDigit(text.charAt(i));
+            if (!hasLetter) continue;                                   // مثلاً «…» تنها
+            // جمله‌ی بلند → تکه‌های ~۸ تا ۱۲ کلمه‌ای
+            ArrayList<int[]> ws = new ArrayList<>();
+            java.util.regex.Matcher wm = java.util.regex.Pattern.compile("\\S+").matcher(text.substring(a, z));
+            while (wm.find()) ws.add(new int[]{a + wm.start(), a + wm.end()});
+            if (ws.size() <= CHUNK_MAX_WORDS + 2) { out.add(new int[]{a, z, 1}); continue; }
+            String[] w = new String[ws.size()];
+            for (int i = 0; i < w.length; i++) w[i] = text.substring(ws.get(i)[0], ws.get(i)[1]);
+            int from = 0;
+            while (from < w.length) {
+                int end = pickBreak(w, from, w.length, true);
+                if (end <= from) end = w.length;
+                out.add(new int[]{ws.get(from)[0], ws.get(end - 1)[1], end >= w.length ? 1 : 0});
+                from = end;
+            }
+        }
+        if (out.isEmpty() && !text.trim().isEmpty()) out.add(new int[]{0, text.length(), 1});
+        return out;
+    }
+
+    private void highlightSpeak(TextView tv, String expected, int a, int b) {
+        if (tv == null) return;
+        String plain = tv.getText().toString();
+        if (!plain.equals(expected) || a < 0 || b <= a || b > plain.length()) return;
+        SpannableString ss = new SpannableString(plain);
+        ss.setSpan(new BackgroundColorSpan(Color.parseColor("#88C9A227")), a, b, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        tv.setText(ss);
+        scrollToOffset(tv, a, b);
+    }
+
+    /** بخشِ در حالِ خواندن را داخلِ دیدِ لیست نگه می‌دارد. */
+    private void scrollToOffset(final TextView tv, final int a, final int b) {
+        if (scroll == null) return;
+        scroll.post(() -> {
+            android.text.Layout lay = tv.getLayout();
+            if (lay == null || scroll.getChildAt(0) == null) return;
+            int n = tv.getText().length();
+            int top = lay.getLineTop(lay.getLineForOffset(Math.min(a, Math.max(0, n - 1))));
+            int bottom = lay.getLineBottom(lay.getLineForOffset(Math.min(Math.max(a, b - 1), Math.max(0, n - 1))));
+            View v = tv;
+            int off = 0;
+            while (v != scroll.getChildAt(0) && v.getParent() instanceof View) { off += v.getTop(); v = (View) v.getParent(); }
+            int y0 = off + top, y1 = off + bottom;
+            int vis0 = scroll.getScrollY(), vis1 = vis0 + scroll.getHeight();
+            if (y0 < vis0 + dp(6) || y1 > vis1 - dp(6)) scroll.smoothScrollTo(0, Math.max(0, y0 - dp(28)));
         });
     }
 
+    private void clearSpeakHighlight() {
+        TextView t = speakTv;
+        speakTv = null;
+        if (t != null && t != cardSrcTv) clearHighlight(t);
+        updateScrollFreeze();
+        refreshRecentEntries();                 // متنی که حین خواندن فریز بود، به آخرین نسخه برمی‌گردد
+    }
+
+    // ───────── 🔁 تکرارِ هر جمله (مثلِ دکمه‌ی تکرارِ خودِ اپ): خاموش ← ۲ ← ۳ ← ∞ ─────────
+    // «N» یعنی کلاً N بار خوانده شود. «∞» تا وقتی جمله‌ی بعدی هست سقفِ ۴۰ بار دارد و بعد خودکار می‌رود سراغِ جمله‌ی بعد؛
+    // اگر جمله‌ی بعدی‌ای نباشد (آخرین جمله) واقعاً بی‌نهایت تکرار می‌شود تا خودت ⏹ بزنی.
+    private static final int REPEAT_INF = -1;
+    private static final int REPEAT_INF_CAP = 40;
+    private int repeatSetting = 0;                 // 0 خاموش | 2 | 3 | REPEAT_INF
+    private TextView tvRepeat;
+    private SpeakRun run;                          // پخشِ جاری (null = ساکت)
+
+    private final class SpeakRun {
+        Entry ent; String kind; TextView btn; TextView hl; String text; String lang;
+        ArrayList<int[]> segs; int unitStart = 0; int rep = 0; int my;
+    }
+
+    private void loadRepeatPref() {
+        int v = getSharedPreferences(PREFS, MODE_PRIVATE).getInt("repeatSetting", 0);
+        repeatSetting = (v == 2 || v == 3 || v == REPEAT_INF) ? v : 0;
+    }
+
+    private void cycleRepeat() {
+        repeatSetting = repeatSetting == 0 ? 2 : repeatSetting == 2 ? 3 : repeatSetting == 3 ? REPEAT_INF : 0;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("repeatSetting", repeatSetting).apply();
+        updateRepeatButton();
+        showNotice(repeatSetting == 0 ? msg("تکرار خاموش", "Repeat off")
+                : repeatSetting == REPEAT_INF ? msg("تکرار ∞ — هر جمله، بعد جمله‌ی بعدی", "Repeat ∞ — each sentence, then the next")
+                : msg("هر جمله " + repeatSetting + " بار، بعد جمله‌ی بعدی", "Each sentence " + repeatSetting + "×, then the next"));
+    }
+
+    private void updateRepeatButton() {
+        if (tvRepeat == null) return;
+        tvRepeat.setText(repeatSetting == 0 ? "\uD83D\uDD01"
+                : repeatSetting == REPEAT_INF ? "\uD83D\uDD01\u221E" : "\uD83D\uDD01" + repeatSetting);
+        tvRepeat.setTextColor(repeatSetting == 0 ? Color.WHITE : COLOR_GOLD);
+        tvRepeat.setAlpha(repeatSetting == 0 ? 0.6f : 1f);
+    }
+
+    private static String entryText(Entry n, String kind) {
+        if ("src".equals(kind)) return n.src == null ? "" : n.src;
+        TextView t = n.rowText.get(kind);
+        return t == null ? "" : t.getText().toString();
+    }
+
+    /** جمله‌ی بعدیِ همان نوع (متنِ اصلی یا همان زبانِ ترجمه) که الان روی صفحه دیده می‌شود. */
+    private Entry nextEntryFor(Entry ent, String kind) {
+        if (ent == null) return null;
+        int idx = history.indexOf(ent);
+        if (idx < 0) return null;
+        for (int j = idx + 1; j < history.size(); j++) {
+            Entry n = history.get(j);
+            if (n == live) continue;                                   // جمله‌ی نیمه‌کاره
+            View vis = "src".equals(kind) ? n.srcRow : n.rowBox.get(kind);
+            if (vis == null || vis.getVisibility() != View.VISIBLE) continue;
+            String t = entryText(n, kind).trim();
+            if (t.isEmpty() || t.equals("…")) continue;
+            return n;
+        }
+        return null;
+    }
+
+    private void toggleSpeak(final TextView b, final String text, final String lang, final TextView hl,
+                             final Entry ent, final String kind) {
+        if (text == null || text.trim().isEmpty() || text.equals("…")) return;
+        if (speakingBtn == b) { stopPanelSpeech(); return; }
+        if (speakTv != null) clearSpeakHighlight();
+        setSpeaking(b);
+        final int my = ++speakToken;
+        panelSpeaking = true;
+        final SpeakRun r = new SpeakRun();
+        r.ent = ent; r.kind = kind; r.btn = b; r.hl = hl; r.text = text; r.lang = lang; r.my = my;
+        if (hl != null) {
+            r.segs = splitSegments(text);
+            speakTv = hl;
+            updateScrollFreeze();
+        } else {
+            r.segs = new ArrayList<>();
+            r.segs.add(new int[]{0, text.length(), 1});
+        }
+        run = r;
+        speakSegment(r, 0);
+    }
+
+    private void speakSegment(final SpeakRun r, final int i) {
+        if (r.my != speakToken || run != r) return;                 // پخشِ تازه‌تری شروع شده
+        if (i >= r.segs.size()) { advanceOrFinish(r); return; }
+        final int[] sg = r.segs.get(i);
+        if (r.hl != null) highlightSpeak(r.hl, r.text, sg[0], sg[1]);
+        PanelTts.speak(this, r.text.substring(sg[0], sg[1]), r.lang, 1.0f, ok -> {
+            if (r.my != speakToken || run != r) return;
+            if (!ok) { finishSpeak(r.btn, r.my); return; }
+            boolean endOfSentence = sg.length < 3 || sg[2] == 1;
+            if (!endOfSentence) { speakSegment(r, i + 1); return; }  // وسطِ یک جمله‌ی بلند: بخشِ بعدی
+            // پایانِ یک «جمله»: تکرارِ همین جمله یا رفتن سراغِ بعدی
+            boolean moreInRun = i + 1 < r.segs.size() || nextEntryFor(r.ent, r.kind) != null;
+            int cap;
+            if (repeatSetting == REPEAT_INF) cap = moreInRun ? REPEAT_INF_CAP : Integer.MAX_VALUE;
+            else cap = repeatSetting == 0 ? 1 : repeatSetting;
+            if (r.rep + 1 < cap) {
+                r.rep++;
+                final int restart = r.unitStart;
+                main.postDelayed(() -> speakSegment(r, restart), repeatGapMs(r.text, sg));
+            } else {
+                r.rep = 0;
+                r.unitStart = i + 1;
+                speakSegment(r, i + 1);
+            }
+        });
+    }
+
+    private static long repeatGapMs(String text, int[] sg) {
+        int n = words(text.substring(sg[0], sg[1])).length;
+        return Math.min(1200, 350 + 30L * n);
+    }
+
+    /** بخش‌های این جمله تمام شد: اگر تکرار روشن است برو سراغِ جمله‌ی بعدیِ همان نوع، وگرنه تمام. */
+    private void advanceOrFinish(final SpeakRun r) {
+        Entry n = repeatSetting == 0 ? null : nextEntryFor(r.ent, r.kind);
+        if (n == null) { finishSpeak(r.btn, r.my); return; }
+        TextView nb = "src".equals(r.kind) ? n.srcSpeakBtn : n.rowSpeakBtn.get(r.kind);
+        TextView nh = "src".equals(r.kind) ? n.tvSrc : n.rowText.get(r.kind);
+        if (nb == null || nh == null) { finishSpeak(r.btn, r.my); return; }
+        TextView old = r.hl;
+        speakTv = null;                                             // هایلایتِ قبلی پاک و متنِ فریزشده به‌روز شود
+        if (old != null && old != cardSrcTv) clearHighlight(old);
+        refreshRecentEntries();
+        String t = entryText(n, r.kind);
+        if (t.trim().isEmpty()) { finishSpeak(r.btn, r.my); return; }
+        r.ent = n; r.btn = nb; r.hl = nh; r.text = t;
+        r.lang = "src".equals(r.kind) ? n.srcLang : r.kind;
+        r.segs = splitSegments(t);
+        r.unitStart = 0; r.rep = 0;
+        speakTv = nh;
+        updateScrollFreeze();
+        setSpeaking(nb);
+        speakSegment(r, 0);
+    }
+
+    private void finishSpeak(TextView b, int my) {
+        if (my != speakToken) return;
+        run = null;
+        panelSpeaking = false;
+        panelQuietUntil = SystemClock.uptimeMillis() + 1200;
+        if (speakingBtn == b) setSpeaking(null);
+        clearSpeakHighlight();
+    }
+
     private void stopPanelSpeech() {
-        if (speakingBtn == null && !panelSpeaking) return;
+        if (speakingBtn == null && !panelSpeaking && speakTv == null) return;
         speakToken++;
+        run = null;
         PanelTts.stop(this);
         panelSpeaking = false;
         panelQuietUntil = SystemClock.uptimeMillis() + 800;
         TextView b = speakingBtn;
         speakingBtn = null;
         if (b != null) { b.setText("\uD83D\uDD0A"); b.setTextColor(Color.WHITE); }
+        clearSpeakHighlight();
     }
 
     // ───────── انتخابِ لغت (تپ) یا محدوده (لانگ‌پرس + کشیدن) ─────────
@@ -1543,7 +1761,8 @@ public class BubbleService extends Service {
 
         e.srcLang = currentSrcLang();
         attachSelect(e.tvSrc, () -> e.srcLang);
-        TextView srcSpeak = speakerButton(() -> e.src, () -> e.srcLang);
+        TextView srcSpeak = speakerButton(() -> e.src, () -> e.srcLang, e.tvSrc, e, "src");
+        e.srcSpeakBtn = srcSpeak;
         e.srcRow = new LinearLayout(this);
         e.srcRow.setOrientation(LinearLayout.HORIZONTAL);
         e.srcRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
@@ -1613,7 +1832,8 @@ public class BubbleService extends Service {
         tv.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
 
         attachSelect(tv, () -> lang);
-        TextView rowSpeak = speakerButton(() -> tv.getText().toString(), () -> lang);
+        TextView rowSpeak = speakerButton(() -> tv.getText().toString(), () -> lang, tv, e, lang);
+        e.rowSpeakBtn.put(lang, rowSpeak);
         row.setBaselineAligned(false);
         row.addView(tag, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -1661,7 +1881,7 @@ public class BubbleService extends Service {
     /** متنِ بدونِ تغییر دوباره ست نمی‌شود، و متنی که کاربر دارد انتخابش می‌کند (یا کادرِ لغتش باز است) دست‌نخورده می‌ماند. */
     private void setTextIfChanged(TextView tv, String v) {
         if (tv == null || v == null) return;
-        if (tv == cardSrcTv || tv == selectingTv) return;
+        if (tv == cardSrcTv || tv == selectingTv || tv == speakTv) return;
         CharSequence cur = tv.getText();
         if (!(cur instanceof Spanned) && cur.toString().equals(v)) return;
         tv.setText(v);
@@ -1669,7 +1889,8 @@ public class BubbleService extends Service {
 
     private void updateScrollFreeze() {
         if (scroll == null) return;
-        scroll.frozen = selectingTv != null || (wordCard != null && wordCard.getVisibility() == View.VISIBLE);
+        scroll.frozen = selectingTv != null || speakTv != null
+                || (wordCard != null && wordCard.getVisibility() == View.VISIBLE);
     }
 
     private void refreshRecentEntries() {
