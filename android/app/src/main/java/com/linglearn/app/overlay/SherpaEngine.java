@@ -15,6 +15,8 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig;
 
 import java.io.File;
 import java.util.Locale;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 final class SherpaEngine implements PcmSink {
 
@@ -26,14 +28,19 @@ final class SherpaEngine implements PcmSink {
     private final Object lock = new Object();
     private OnlineRecognizer recognizer;
     private OnlineStream stream;
-    private boolean released = false;
-    private boolean failed = false;
+    private volatile boolean released = false;
+    private volatile boolean failed = false;
     private String lastPartial = "";
-    private float[] floats = new float[1600];
+    // صدا از thread ضبط فقط وارد صف می‌شود؛ رمزگشایی در thread جدا انجام می‌شود تا ضبط/UI هیچ‌وقت منتظر مدل نماند
+    private final LinkedBlockingQueue<float[]> queue = new LinkedBlockingQueue<>(500);
+    private Thread worker;
 
     private SherpaEngine(OnlineRecognizer r, OnlineStream s) {
         this.recognizer = r;
         this.stream = s;
+        worker = new Thread(this::runWorker, "sherpa-decode");
+        worker.setDaemon(true);
+        worker.start();
     }
 
     static boolean isAvailable(Context ctx, String lang) {
@@ -53,7 +60,7 @@ final class SherpaEngine implements PcmSink {
             OnlineModelConfig mc = new OnlineModelConfig();
             mc.setTransducer(tr);
             mc.setTokens(new File(dir, SherpaModelManager.tokensFile(lang)).getAbsolutePath());
-            mc.setNumThreads(Math.max(1, Math.min(2, Runtime.getRuntime().availableProcessors() / 2)));
+            mc.setNumThreads(Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors() / 2)));
             mc.setDebug(false);
             mc.setProvider("cpu");
 
@@ -81,40 +88,54 @@ final class SherpaEngine implements PcmSink {
 
     @Override
     public void accept(byte[] pcm16k, int len) {
-        if (pcm16k == null || len < 2) return;
-        String partialToSend = null, finalToSend = null;
-        boolean fail = false;
-        synchronized (lock) {
-            if (released || failed) return;
-            try {
-                int n = len / 2;
-                if (floats.length < n) floats = new float[n];
-                for (int i = 0; i < n; i++) {
-                    short s = (short) ((pcm16k[2 * i] & 0xff) | (pcm16k[2 * i + 1] << 8));
-                    floats[i] = s / 32768f;
-                }
-                float[] samples = (floats.length == n) ? floats : java.util.Arrays.copyOf(floats, n);
-                stream.acceptWaveform(samples, SAMPLE_RATE);
-                while (recognizer.isReady(stream)) recognizer.decode(stream);
-
-                String text = normalize(recognizer.getResult(stream).getText());
-                if (recognizer.isEndpoint(stream)) {
-                    if (!text.isEmpty()) finalToSend = text;
-                    recognizer.reset(stream);
-                    lastPartial = "";
-                } else if (!text.isEmpty() && !text.equals(lastPartial)) {
-                    lastPartial = text;
-                    partialToSend = text;
-                }
-            } catch (Throwable e) {
-                Log.e(TAG, "decode failed", e);
-                failed = true;
-                fail = true;
-            }
+        if (pcm16k == null || len < 2 || released || failed) return;
+        int n = len / 2;
+        float[] f = new float[n];
+        for (int i = 0; i < n; i++) {
+            short s = (short) ((pcm16k[2 * i] & 0xff) | (pcm16k[2 * i + 1] << 8));
+            f[i] = s / 32768f;
         }
-        if (finalToSend != null) { final String t = finalToSend; MAIN.post(() -> BubbleService.asrFinal(t)); }
-        else if (partialToSend != null) { final String t = partialToSend; MAIN.post(() -> BubbleService.asrPartial(t)); }
-        if (fail) MAIN.post(BubbleService::asrFallback);
+        if (!queue.offer(f)) { queue.poll(); queue.offer(f); }   // صف پر شد (مدل خیلی عقب است) → قدیمی‌ترین تکه دور ریخته می‌شود
+    }
+
+    private void runWorker() {
+        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO); } catch (Throwable ignored) {}
+        while (!released && !failed) {
+            float[] first;
+            try { first = queue.poll(100, TimeUnit.MILLISECONDS); }
+            catch (InterruptedException e) { return; }
+            if (first == null) continue;
+            String partialToSend = null, finalToSend = null;
+            boolean fail = false;
+            synchronized (lock) {
+                if (released || failed) return;
+                try {
+                    stream.acceptWaveform(first, SAMPLE_RATE);
+                    float[] nx;
+                    while ((nx = queue.poll()) != null) stream.acceptWaveform(nx, SAMPLE_RATE);   // هرچه عقب مانده یک‌جا برسد
+                    boolean decoded = false;
+                    while (recognizer.isReady(stream)) { recognizer.decode(stream); decoded = true; }
+                    if (decoded || recognizer.isEndpoint(stream)) {
+                        String text = normalize(recognizer.getResult(stream).getText());
+                        if (recognizer.isEndpoint(stream)) {
+                            if (!text.isEmpty()) finalToSend = text;
+                            recognizer.reset(stream);
+                            lastPartial = "";
+                        } else if (!text.isEmpty() && !text.equals(lastPartial)) {
+                            lastPartial = text;
+                            partialToSend = text;
+                        }
+                    }
+                } catch (Throwable e) {
+                    Log.e(TAG, "decode failed", e);
+                    failed = true;
+                    fail = true;
+                }
+            }
+            if (finalToSend != null) { final String t = finalToSend; MAIN.post(() -> BubbleService.asrFinal(t)); }
+            else if (partialToSend != null) { final String t = partialToSend; MAIN.post(() -> BubbleService.asrPartial(t)); }
+            if (fail) MAIN.post(BubbleService::asrFallback);
+        }
     }
 
     @Override
@@ -126,9 +147,11 @@ final class SherpaEngine implements PcmSink {
             try { if (recognizer != null) recognizer.release(); } catch (Throwable e) { Log.w(TAG, "recognizer release", e); }
             stream = null;
             recognizer = null;
-            floats = new float[0];
             lastPartial = "";
         }
+        queue.clear();
+        Thread w = worker;
+        if (w != null) w.interrupt();
     }
 
     private static String normalize(String t) {
