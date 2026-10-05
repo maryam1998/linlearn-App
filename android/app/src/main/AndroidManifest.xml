@@ -17,6 +17,11 @@
         <intent>
             <action android:name="android.intent.action.TTS_SERVICE" />
         </intent>
+        <!-- اندروید ۱۱+: برای نامِ برنامه‌ی پخش‌کننده و باز کردنش از «داستان‌های ذخیره‌شده» -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
     </queries>
 
     <application
