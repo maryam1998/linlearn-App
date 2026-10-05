@@ -308,6 +308,34 @@ public class BubbleService extends Service {
     private int reqCounter = 0;           // monotonically increasing translation request id
     private final Runnable hidePanel = this::removePanel;
 
+    // ── بستنِ خودکارِ کادر وقتی چیزی پخش نمی‌شه ──────────────────────────────
+    // ضبط ادامه پیدا می‌کنه؛ فقط کادر جمع می‌شه و با رسیدنِ متنِ تازه خودش برمی‌گرده.
+    private static final long IDLE_HIDE_MS = 7000;
+    private volatile long lastVoiceMs = 0;   // آخرین لحظه‌ای که صدایی از سیستم شنیده شد
+    private volatile long lastTextMs = 0;    // آخرین لحظه‌ای که متنِ تشخیص‌داده‌شده رسید
+    private boolean idleHidden = false;      // کادر را خودکار (نه کاربر) بسته‌ایم
+    private final Runnable idleRunnable = this::idleTick;
+
+    private void idleTick() {
+        if (!running || !recording) return;
+        long now = SystemClock.elapsedRealtime();
+        boolean silent = now - lastVoiceMs > IDLE_HIDE_MS && now - lastTextMs > IDLE_HIDE_MS;
+        boolean busy = (wordCard != null && wordCard.getVisibility() == View.VISIBLE)
+                || (scroll != null && (scroll.frozen || SystemClock.uptimeMillis() - scroll.lastUserTouch < 8000));
+        if (silent && panelShown && !userHidden && yt == null && !busy) {
+            idleHidden = true;
+            userHidden = true;
+            removePanel();
+        }
+        main.postDelayed(idleRunnable, 700);
+    }
+
+    /** متنِ تازه رسید: اگه کادر را خودکار بسته بودیم، دوباره اجازه‌ی نمایش می‌دیم. */
+    private void wakeFromIdle() {
+        lastTextMs = SystemClock.elapsedRealtime();
+        if (idleHidden) { idleHidden = false; userHidden = false; }
+    }
+
     private ObjectAnimator pulse;
     private boolean dragging = false;
 
@@ -628,7 +656,8 @@ public class BubbleService extends Service {
     }
 
     private void toggleHistoryFromBubble() {
-        if (panelShown) { userHidden = true; removePanel(); return; }
+        if (panelShown) { idleHidden = false; userHidden = true; removePanel(); return; }
+        idleHidden = false;
         userHidden = false;
         if (history.isEmpty()) {
             showNotice(isFa()
@@ -1066,7 +1095,7 @@ public class BubbleService extends Service {
         tvOpacity.setPadding(dp(8), dp(6), dp(8), dp(6));
         header.addView(tvOpacity);
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
-        header.addView(headerButton("\u25BE", v -> { userHidden = true; removePanel(); }));   // ▾ = فقط کادرِ تاریخچه را پنهان می‌کند (بستنِ حباب: ✕ روی خودِ حباب)
+        header.addView(headerButton("\u25BE", v -> { idleHidden = false; userHidden = true; removePanel(); }));   // ▾ = فقط کادرِ تاریخچه را پنهان می‌کند (بستنِ حباب: ✕ روی خودِ حباب)
         tvHeader.setPadding(0, dp(8), 0, dp(8));          // سطحِ لمسِ بزرگ‌تر برای کشیدنِ کادر
         final int dragSlop = ViewConfiguration.get(this).getScaledTouchSlop();
         header.setOnTouchListener(new View.OnTouchListener() {
@@ -1270,6 +1299,7 @@ public class BubbleService extends Service {
         if (wm == null || bubble == null) return;
         ensurePanel();
         boolean has = m != null && !m.isEmpty();
+        if (idleHidden && has && m.startsWith("⚠")) { idleHidden = false; userHidden = false; }
         tvStatus.setText(has ? m : "");
         applyStyle(tvStatus);
         tvStatus.setVisibility(has ? View.VISIBLE : View.GONE);
@@ -2583,6 +2613,7 @@ public class BubbleService extends Service {
     private void onPartialText(final String raw) {
         if (wm == null || bubble == null || raw == null || raw.isEmpty()) return;
         if (asrMuted()) return;
+        wakeFromIdle();
         final String text = stripConsumed(raw);          // بخشِ قبلاً‌بسته‌شده (خط‌های جدا) دوباره نمایش داده نشود
         if (text.isEmpty()) return;
         pendingHyp = text;
@@ -2894,6 +2925,7 @@ public class BubbleService extends Service {
     private void onFinalText(final String raw) {
         if (wm == null || bubble == null || raw == null || raw.trim().isEmpty()) return;
         if (asrMuted()) return;
+        wakeFromIdle();
         // the server sometimes returns the same final text several times - show it once
         if (raw.equals(lastFinalText)) {
             Log.d(TAG, "skipping duplicate final text");
@@ -3291,6 +3323,12 @@ public class BubbleService extends Service {
     private void setRecordingUi(boolean rec) {
         if (bubble == null) return;
         bubble.setRecording(rec);
+        main.removeCallbacks(idleRunnable);
+        if (rec) {
+            lastVoiceMs = lastTextMs = SystemClock.elapsedRealtime();
+            idleHidden = false;
+            main.postDelayed(idleRunnable, 700);
+        }
         // شروعِ ضبط → حباب جمع می‌شود و می‌رود گوشه؛ توقف → کامل به لبه می‌چسبد و بعد از چند ثانیه دوباره جمع می‌شود
         main.postDelayed(() -> dockBubble(rec), rec ? 350 : 0);
         if (!rec) scheduleIdleDock();
@@ -3386,7 +3424,7 @@ public class BubbleService extends Service {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION)
                     .putExtra(SpeechHostActivity.EXTRA_LANG_TAG, localeTag(src));
             startActivity(i);
-            showNotice(msg("🎙 گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
+            showNotice(msg("🎙 در حال اجرا…", "🎙 Running…"));
             return true;
         } catch (Exception e) {
             Log.w(TAG, "cannot start recognizer engine", e);
@@ -3417,7 +3455,7 @@ public class BubbleService extends Service {
             rec.startRecording();
             final AudioRecord fr = rec;
             new Thread(() -> runSherpa(fr, src, whisperModel), "bubble-feed").start();
-            showNotice(msg("🎙 گوش‌دادن به صدای سیستم (آفلاین)…", "🎙 Listening to system audio (offline)…"));
+            showNotice(msg("🎙 در حال اجرا…", "🎙 Running…"));
             return true;
         } catch (Exception e) {
             Log.w(TAG, "cannot start sherpa engine", e);
@@ -3518,8 +3556,10 @@ public class BubbleService extends Service {
                 } else {
                     PcmFeed.write(out, outBytes);
                 }
+                final boolean loud = rms16(in, n) > SILENCE_RMS;
+                if (loud) lastVoiceMs = SystemClock.elapsedRealtime();
                 if (!gotAsrText) {
-                    if (rms16(in, n) > SILENCE_RMS) voicedSinceText += 20;
+                    if (loud) voicedSinceText += 20;
                     // Whisper answers in ~10-30 s windows, so give it a much longer leash than the streaming engine
                     final int wd = (se instanceof WhisperEngine) ? ASR_WATCHDOG_VOICED_MS * 4 : ASR_WATCHDOG_VOICED_MS;
                     if (voicedSinceText >= wd) {
@@ -3642,7 +3682,7 @@ public class BubbleService extends Service {
             record = rec;
             recording = true;
             setRecordingUi(true);
-            showNotice(msg("🎙 در حال گوش‌دادن به صدای سیستم…", "🎙 Listening to system audio…"));
+            showNotice(msg("🎙 در حال اجرا…", "🎙 Running…"));
             new Thread(() -> captureLoop(rec), "bubble-capture").start();
         } catch (Exception e) {
             Log.e(TAG, "startCapture failed", e);
@@ -3674,7 +3714,7 @@ public class BubbleService extends Service {
                 seg.write(buf, 0, n);
                 int chunkMs = n * 1000 / (SAMPLE_RATE * 2);
                 segMs += chunkMs;
-                if (rms(buf, n) > SILENCE_RMS) { voicedMs += chunkMs; silentMs = 0; }
+                if (rms(buf, n) > SILENCE_RMS) { voicedMs += chunkMs; silentMs = 0; lastVoiceMs = SystemClock.elapsedRealtime(); }
                 else silentMs += chunkMs;
                 boolean cut = segMs >= MAX_SEG_MS || (segMs >= MIN_SEG_MS && silentMs >= SILENCE_CUT_MS);
                 if (cut) {
