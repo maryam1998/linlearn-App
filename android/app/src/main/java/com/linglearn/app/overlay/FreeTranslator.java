@@ -14,6 +14,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import okhttp3.MediaType;
@@ -49,6 +57,16 @@ final class FreeTranslator {
     };
     private static final long[] downUntil = new long[SERVICES];
 
+    /** اگر سرویسِ اول در این مدت جواب نداد، سرویسِ بعدی «هم‌زمان» شروع می‌شود (اولین جوابِ سالم برنده است). */
+    private static final long HEDGE_MS = 650;
+    private static final ExecutorService POOL = Executors.newCachedThreadPool(new ThreadFactory() {
+        @Override public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "free-translate");
+            t.setDaemon(true);
+            return t;
+        }
+    });
+
     /** Result that came back but is clearly not a translation (does not put the service in cool-down). */
     private static final class BadResult extends IOException {
         BadResult(String m) { super(m); }
@@ -72,29 +90,65 @@ final class FreeTranslator {
         // services not in cool-down first; if all are cooling down, try them all anyway
         final long now = SystemClock.elapsedRealtime();
         List<Integer> order = new ArrayList<>();
-        for (int i = 0; i < SERVICES; i++) if (downUntil[i] <= now) order.add(i);
+        synchronized (downUntil) {
+            for (int i = 0; i < SERVICES; i++) if (downUntil[i] <= now) order.add(i);
+        }
         if (order.isEmpty()) for (int i = 0; i < SERVICES; i++) order.add(i);
 
+        // موازیِ تدریجی (hedged): به‌جای این‌که منتظرِ تایم‌اوتِ یک سرویسِ کند بمانیم، اگر در HEDGE_MS جواب نیامد
+        // سرویسِ بعدی هم هم‌زمان شروع می‌شود؛ هر کدام زودتر جوابِ سالم داد همان نمایش داده می‌شود.
+        final ExecutorCompletionService<String> cs = new ExecutorCompletionService<>(POOL);
+        final List<Future<String>> started = new ArrayList<>();
+        int next = 0, pending = 0;
         Exception last = null;
-        for (int svc : order) {
+        while (next < order.size() || pending > 0) {
+            if (next < order.size() && pending == 0) {
+                started.add(cs.submit(task(http, order.get(next++), t, s, tgt)));
+                pending++;
+            }
+            Future<String> f = (next < order.size())
+                    ? cs.poll(HEDGE_MS, TimeUnit.MILLISECONDS)
+                    : cs.take();
+            if (f == null) {                                   // کند است → سرویسِ بعدی را هم‌زمان شروع کن
+                started.add(cs.submit(task(http, order.get(next++), t, s, tgt)));
+                pending++;
+                continue;
+            }
+            pending--;
             try {
-                String out = call(http, svc, t, s, tgt);
-                out = out == null ? "" : out.trim();
-                if (out.isEmpty()) throw new BadResult("empty result");
-                if (looksUntranslated(t, out, s, tgt)) throw new BadResult("not translated");
-                downUntil[svc] = 0;
+                String out = f.get();
+                for (Future<String> o : started) if (o != f) o.cancel(true);
                 synchronized (CACHE) { CACHE.put(key, out); }
                 return out;
-            } catch (BadResult e) {
-                last = e;
-                Log.d(TAG, "service " + svc + ": " + e.getMessage());
-            } catch (Exception e) {
-                last = e;
-                downUntil[svc] = SystemClock.elapsedRealtime() + COOLDOWN_MS;
-                Log.d(TAG, "service " + svc + " failed: " + e);
+            } catch (ExecutionException ee) {
+                Throwable c = ee.getCause();
+                last = c instanceof Exception ? (Exception) c : new IOException(String.valueOf(c));
             }
         }
         throw last != null ? last : new IOException("no translator available");
+    }
+
+    private static Callable<String> task(final OkHttpClient http, final int svc, final String t,
+                                         final String s, final String tgt) {
+        return new Callable<String>() {
+            @Override public String call() throws Exception {
+                try {
+                    String out = FreeTranslator.call(http, svc, t, s, tgt);
+                    out = out == null ? "" : out.trim();
+                    if (out.isEmpty()) throw new BadResult("empty result");
+                    if (looksUntranslated(t, out, s, tgt)) throw new BadResult("not translated");
+                    synchronized (downUntil) { downUntil[svc] = 0; }
+                    return out;
+                } catch (BadResult e) {
+                    Log.d(TAG, "service " + svc + ": " + e.getMessage());
+                    throw e;
+                } catch (Exception e) {
+                    synchronized (downUntil) { downUntil[svc] = SystemClock.elapsedRealtime() + COOLDOWN_MS; }
+                    Log.d(TAG, "service " + svc + " failed: " + e);
+                    throw e;
+                }
+            }
+        };
     }
 
     private static String call(OkHttpClient http, int svc, String text, String src, String tgt) throws Exception {

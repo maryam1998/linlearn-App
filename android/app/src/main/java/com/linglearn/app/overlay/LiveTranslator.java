@@ -5,28 +5,50 @@ import android.util.Log;
 
 import java.io.IOException;
 import java.util.Locale;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
 
 import okhttp3.OkHttpClient;
 
 /**
- * ترجمه‌ی زنده با همان سیستمِ کیفیتِ اپ (translateFree در app.jsx):
- *   کش → سرویس‌های رایگان → اگر مشکوک بود: بازبینی/اصلاح با AI → اگر هنوز مشکوک بود: ترجمه‌ی مستقیم با AI
- *   و فقط نتیجه‌ی تأییدشده کش می‌شود (همان‌جا که اپ در IndexedDB کش می‌کند).
+ * ترجمه‌ی زنده — سریع و بدونِ پرشِ دیدنی:
+ *   کش → سرویس‌های رایگان (موازیِ تدریجی، داخلِ FreeTranslator)
+ *   اگر نتیجه مشکوک بود (یا سرویس‌ها شکست خوردند یا کند بودند) → «مستقیم» ترجمه‌ی AI، بدونِ مرحله‌ی بازبینیِ جدا.
+ *   - اگر رایگان بیش از AI_HEDGE_MS طول کشید، AI «هم‌زمان» شروع می‌شود تا وقتی رایگان مشکوک درآمد، جوابِ AI
+ *     از قبل در راه یا آماده باشد (کاربر هیچ‌وقت متنِ مشکوک را نمی‌بیند؛ فقط ترجمه‌ی نهایی می‌آید).
+ *   - فقط نتیجه‌ی تأییدشده کش می‌شود (همان‌جا که اپ در IndexedDB کش می‌کند).
  */
 final class LiveTranslator {
     private static final String TAG = "LiveTranslator";
 
+    /** اگر ترجمه‌ی رایگان تا این مدت نیامد، ترجمه‌ی AI هم‌زمان شروع می‌شود. */
+    private static final long AI_HEDGE_MS = 900;
+
+    private static final ExecutorService POOL = Executors.newCachedThreadPool(new ThreadFactory() {
+        @Override public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "live-translate");
+            t.setDaemon(true);
+            return t;
+        }
+    });
+
     /** پشتیبانِ AI (ورکرِ خودِ اپ) — فقط وقتی لازم شود صدا زده می‌شود. */
     interface Ai {
         String translate(String text, String tgt) throws Exception;
-        /** متنِ اصلاح‌شده، یا null/"OK" اگر پیش‌نویس درست بود. */
+        /** (دیگر در مسیرِ زنده استفاده نمی‌شود؛ ترجمه‌ی مستقیمِ AI سریع‌تر است.) */
         String verify(String text, String tgt, String draft) throws Exception;
     }
 
     private LiveTranslator() {}
 
-    static String translate(Context ctx, OkHttpClient http, String text, String src, String tgt, Ai ai) throws Exception {
+    static String translate(Context ctx, OkHttpClient http, final String text, String src, final String tgt, final Ai ai) throws Exception {
         if (text == null) throw new IllegalArgumentException("no text");
         final String t = text.trim();
         if (t.isEmpty()) return "";
@@ -40,34 +62,39 @@ final class LiveTranslator {
             cache.remove(s, tgt, t);                       // کشِ قدیمیِ مشکوک: نادیده + پاک
         }
 
+        final OkHttpClient client = http;
+        final Future<String> freeF = POOL.submit(new Callable<String>() {
+            @Override public String call() throws Exception { return FreeTranslator.translate(client, t, s, tgt); }
+        });
+        Future<String> aiF = null;
         String out = null;
         Exception last = null;
+
         try {
-            out = FreeTranslator.translate(http, t, s, tgt);
-        } catch (Exception e) {
-            last = e;
-            Log.d(TAG, "free translators failed: " + e);
+            out = freeF.get(ai != null ? AI_HEDGE_MS : 60_000, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException te) {
+            // رایگان کند است → AI را هم‌زمان شروع کن و منتظرِ رایگان هم بمان
+            aiF = submitAi(ai, t, tgt);
+            try { out = freeF.get(); }
+            catch (ExecutionException ee) { last = asException(ee); }
+        } catch (ExecutionException ee) {
+            last = asException(ee);
+            Log.d(TAG, "free translators failed: " + last);
         }
 
-        if (out != null && ai != null && looksLikelyMistranslated(t, out, tgt, s)) {
-            try {
-                String v = ai.verify(t, tgt, out);
-                if (v != null) {
-                    v = v.trim();
-                    if (!v.isEmpty() && !v.matches("(?i)^OK\\.?$")) out = cleanQuotes(v);
-                }
-            } catch (Exception e) { last = e; }
-        }
         if (out != null && looksLikelyMistranslated(t, out, tgt, s)) out = null;   // غلط را نه نشان بده نه کش کن
 
         if (out == null && ai != null) {
+            if (aiF == null) aiF = submitAi(ai, t, tgt);
             try {
-                String r = ai.translate(t, tgt);
+                String r = aiF.get();
                 if (r != null) {
                     r = cleanQuotes(r.trim());
                     if (!r.isEmpty() && !looksLikelyMistranslated(t, r, tgt, s)) out = r;
                 }
-            } catch (Exception e) { last = e; }
+            } catch (ExecutionException ee) { last = asException(ee); }
+        } else if (aiF != null) {
+            aiF.cancel(true);                                // رایگانِ سالم رسید؛ AI لازم نیست
         }
 
         if (out == null) throw last != null ? last : new IOException("translation failed");
@@ -75,11 +102,27 @@ final class LiveTranslator {
         return out;
     }
 
+    private static Future<String> submitAi(final Ai ai, final String t, final String tgt) {
+        if (ai == null) return null;
+        return POOL.submit(new Callable<String>() {
+            @Override public String call() throws Exception { return ai.translate(t, tgt); }
+        });
+    }
+
+    private static Exception asException(ExecutionException ee) {
+        Throwable c = ee.getCause();
+        return c instanceof Exception ? (Exception) c : new IOException(String.valueOf(c));
+    }
+
     private static String cleanQuotes(String s) {
         return s.replaceAll("^[\"'«»]+|[\"'«».\\s]+$", "").trim();
     }
 
     // ───────── looksLikelyMistranslated (همتای app.jsx) ─────────
+
+    private static final Pattern REASONING = Pattern.compile(
+            "(thinking process|here'?s a thinking|analy[sz]e the (request|text|input)|\\*\\*\\s*analy[sz]e|\\bconstraint\\s*:|the user wants me to|let me (read|think|analy[sz]e|re-?read)|</?think(ing)?>)",
+            Pattern.CASE_INSENSITIVE);
 
     private static Pattern scriptRangeFor(String lang) {
         switch (lang) {
@@ -97,6 +140,8 @@ final class LiveTranslator {
         final String src = sourceText == null ? "" : sourceText.trim();
         final String out = draft == null ? "" : draft.trim();
         if (out.isEmpty()) return true;
+        // AI گاهی به‌جای ترجمه «فرایندِ فکر کردنش» را می‌نویسد؛ آن را ترجمه حساب نکن
+        if (REASONING.matcher(out).find()) return true;
         // مبدأ و مقصد فرق دارند ولی خروجی عیناً همان متنِ مبدأ است → ترجمه نشده
         if (sourceLang != null && !"auto".equals(sourceLang) && !sourceLang.equals(targetLang)
                 && out.toLowerCase(Locale.ROOT).equals(src.toLowerCase(Locale.ROOT))) return true;

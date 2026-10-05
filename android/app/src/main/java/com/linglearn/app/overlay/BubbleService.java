@@ -287,6 +287,8 @@ public class BubbleService extends Service {
     private TextView tvStatus;
     private WindowManager.LayoutParams panelLp;
     private boolean panelShown = false;
+    private boolean panelFree = false;    // کاربر کادر را با لمسِ سربرگ جابه‌جا کرده → دیگر به حباب چسبیده نیست
+    private int panelFreeX = 0, panelFreeY = 0;
     private boolean userHidden = false;   // user closed the panel with the X: do not pop it up again until tapped
     private final ArrayList<Entry> history = new ArrayList<>();   // every sentence heard in this session (main thread only)
     private Entry live;                   // sentence currently being spoken (partial result)
@@ -346,12 +348,21 @@ public class BubbleService extends Service {
     private static final java.util.Set<String> BREAK_BEFORE = new HashSet<>(Arrays.asList(
             "and", "but", "then", "that", "which", "when", "because", "so", "or", "while",
             "who", "where", "as", "if", "though", "until", "after", "before"));
+    private static final long SENT_PAUSE_MS = 800;       // مکثِ این‌قدری = پایانِ جمله → خطِ جدید (جمله‌به‌جمله)
+    private static final int MAX_LINE_WORDS = 16;        // جمله‌ی بدونِ مکث/نقطه از این بلندتر شد، سرِ یک ویرگول/حرفِ ربط شکسته می‌شود
+    private static final java.util.Set<String> ABBREVIATIONS = new HashSet<>(Arrays.asList(
+            "mr.", "mrs.", "ms.", "dr.", "st.", "prof.", "jr.", "sr.", "vs.", "mt.", "no.", "gen.", "col.",
+            "capt.", "lt.", "sgt.", "rev.", "hon.", "messrs.", "etc.", "e.g.", "i.e."));
+    private int consumedWords = 0;                       // چند کلمه‌ی اولِ گفتارِ جاری قبلاً به‌صورتِ خطِ جدا بسته شده (تشخیصِ گفتار تجمعی است)
     private String pendingHyp = "";
     private long lastSrcRenderAt = 0;
     private boolean srcRenderScheduled = false;
     private TextView selectingTv = null;                 // متنی که الان انگشتِ کاربر رویش است (بازنویسی نشود)
     private final Runnable srcRenderRunnable = () -> { srcRenderScheduled = false; flushPartial(false); };
-    private final Runnable pauseCommitRunnable = () -> flushPartial(true);
+    private final Runnable pauseCommitRunnable = () -> {
+        if (cumulativeAsr() && words(pendingHyp).length >= 2) endSentenceByPause();
+        else flushPartial(true);
+    };
 
     private int speechHostRestarts = 0;
     private static final int MAX_SPEECH_HOST_RESTARTS = 40;
@@ -567,6 +578,7 @@ public class BubbleService extends Service {
                             bubbleLp.x = clamp(Math.round(startX + dx), 0, screenW() - bubbleSize);
                             bubbleLp.y = clamp(Math.round(startY + dy), 0, screenH() - bubbleSize);
                             try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
+                            panelFree = false;                       // کشیدنِ حباب، کادر را دوباره کنارِ حباب می‌آورد
                             movePanel();
                         }
                         return true;
@@ -746,6 +758,7 @@ public class BubbleService extends Service {
         final ArrayList<String> chunkSrc = new ArrayList<>();
         final HashMap<String, ArrayList<String>> chunkTr = new HashMap<>();   // lang -> ترجمه‌ی هر تکه ("" = در انتظار)
         int committedWords = 0;
+        long mediaPosMs = -1;                                              // موقعیتِ پلیرِ بیرونی (ms) وقتی این جمله شروع شد؛ -1 = نامشخص
         TextView srcSpeakBtn;                                              // 🔊 کنار متن اصلی
         TextView ytReplayBtn;                                              // ↺ پخش دوباره‌ی جمله با صدای پلیر یوتیوب
         final HashMap<String, TextView> rowSpeakBtn = new HashMap<>();     // 🔊 کنار ترجمه‌ی هر زبان
@@ -839,6 +852,41 @@ public class BubbleService extends Service {
         header.addView(tvOpacity);
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
         header.addView(headerButton("\u2715", v -> { userHidden = true; removePanel(); }));
+        tvHeader.setPadding(0, dp(8), 0, dp(8));          // سطحِ لمسِ بزرگ‌تر برای کشیدنِ کادر
+        final int dragSlop = ViewConfiguration.get(this).getScaledTouchSlop();
+        header.setOnTouchListener(new View.OnTouchListener() {
+            float downX, downY;
+            int startX, startY;
+            boolean moved;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN: {
+                        int[] loc = new int[2];
+                        panel.getLocationOnScreen(loc);
+                        startX = loc[0]; startY = loc[1];
+                        downX = e.getRawX(); downY = e.getRawY();
+                        moved = false;
+                        main.removeCallbacks(hidePanel);
+                        return true;
+                    }
+                    case MotionEvent.ACTION_MOVE: {
+                        float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
+                        if (!moved && (Math.abs(dx) > dragSlop || Math.abs(dy) > dragSlop)) moved = true;
+                        if (moved) {
+                            panelFree = true;
+                            panelFreeX = Math.round(startX + dx);
+                            panelFreeY = Math.round(startY + dy);
+                            refreshLayout();
+                        }
+                        return true;
+                    }
+                    default:
+                        return true;
+                }
+            }
+        });
         panel.addView(header, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -935,6 +983,14 @@ public class BubbleService extends Service {
 
     private void computePanelPos() {
         panelLp.width = panelWidthPx();
+        if (panelFree) {                       // جای دلخواهِ کاربر؛ دستگیره‌ی تغییر اندازه پایین است
+            panelLp.gravity = Gravity.TOP | Gravity.START;
+            panelLp.x = clamp(panelFreeX, 0, Math.max(0, screenW() - panelLp.width));
+            panelLp.y = clamp(panelFreeY, 0, Math.max(0, screenH() - dp(120)));
+            if (gripBottom != null) gripBottom.setVisibility(View.VISIBLE);
+            if (gripTop != null) gripTop.setVisibility(View.GONE);
+            return;
+        }
         panelLp.x = (screenW() - panelLp.width) / 2;
         int sh = screenH();
         boolean below = bubbleLp.y + bubbleSize / 2 < sh / 2;
@@ -983,6 +1039,7 @@ public class BubbleService extends Service {
             try { wm.removeView(panel); } catch (Exception ignored) {}
         }
         panelShown = false;
+        panelFree = false;
         if (tvStatus != null) { tvStatus.setText(""); tvStatus.setVisibility(View.GONE); }
     }
 
@@ -1011,6 +1068,7 @@ public class BubbleService extends Service {
         history.clear();
         liveKey = null;
         live = null;
+        consumedWords = 0;
         if (listBox != null) listBox.removeAllViews();
         lastFinalText = "";
         prevFinalText = "";
@@ -2012,10 +2070,30 @@ public class BubbleService extends Service {
     }
 
     private void setTranslation(Entry e, String lang, String text, String fromSrc) {
+        final String before = e.tr.get(lang);
         e.tr.put(lang, text == null ? "" : text);
         e.trSrc.put(lang, fromSrc == null ? "" : fromSrc);
         renderEntry(e);
         afterChange();
+        softSwap(e, lang, before, text);
+    }
+
+    private static String stripDots(String v) {
+        if (v == null) return "";
+        v = v.trim();
+        return v.endsWith("…") ? v.substring(0, v.length() - 1).trim() : v;
+    }
+
+    /** وقتی ترجمه‌ی نمایش‌داده‌شده واقعاً «بازنویسی» می‌شود (نه فقط ادامه‌دار)، نرم محو/ظاهر می‌شود تا ناگهان نپرد. */
+    private void softSwap(Entry e, String lang, String before, String after) {
+        try {
+            final String b = stripDots(before), a = stripDots(after);
+            if (b.isEmpty() || a.isEmpty() || a.equals(b) || a.startsWith(b) || b.startsWith(a)) return;
+            final TextView tv = e.rowText.get(lang);
+            if (tv == null || tv.getVisibility() != View.VISIBLE || tv == selectingTv || tv == cardSrcTv) return;
+            tv.setAlpha(0.2f);
+            tv.animate().alpha(1f).setDuration(280).start();
+        } catch (Throwable ignored) {}
     }
 
     private void setTranslationSeq(Entry e, String lang, String text, String fromSrc, int id) {
@@ -2048,11 +2126,13 @@ public class BubbleService extends Service {
     }
 
     /** هر تکانِ تشخیصِ گفتار فقط «آخرین فرضیه» را ذخیره می‌کند؛ نمایش با ریتمِ ثابت و نرم به‌روز می‌شود. */
-    private void onPartialText(final String text) {
-        if (wm == null || bubble == null || text == null || text.isEmpty()) return;
+    private void onPartialText(final String raw) {
+        if (wm == null || bubble == null || raw == null || raw.isEmpty()) return;
         if (asrMuted()) return;
+        final String text = stripConsumed(raw);          // بخشِ قبلاً‌بسته‌شده (خط‌های جدا) دوباره نمایش داده نشود
+        if (text.isEmpty()) return;
         pendingHyp = text;
-        if (live == null) live = newEntry();
+        if (live == null) live = newLiveEntry();
         clearStatus();
         long wait = lastSrcRenderAt + SRC_RENDER_MS - SystemClock.uptimeMillis();
         if (wait <= 0) {
@@ -2065,7 +2145,125 @@ public class BubbleService extends Service {
         }
         main.removeCallbacks(pauseCommitRunnable);
         main.postDelayed(pauseCommitRunnable,
-                (sherpaEngine instanceof WhisperEngine) ? PAUSE_COMMIT_SONG_MS : PAUSE_COMMIT_MS);
+                (sherpaEngine instanceof WhisperEngine) ? PAUSE_COMMIT_SONG_MS : SENT_PAUSE_MS);
+    }
+
+    /** تشخیصِ گفتارِ زنده (Sherpa/Google) متنِ «کلِ گفتارِ جاری» را می‌دهد؛ حالتِ آهنگ (Whisper) پنجره‌ای است و تجمعی نیست. */
+    private boolean cumulativeAsr() {
+        return !(sherpaEngine instanceof WhisperEngine);
+    }
+
+    private String stripConsumed(String raw) {
+        if (consumedWords <= 0 || !cumulativeAsr()) return raw;
+        String[] w = words(raw);
+        if (w.length <= consumedWords) return "";
+        return joinWords(w, consumedWords, w.length);
+    }
+
+    private Entry newLiveEntry() {
+        Entry e = newEntry();
+        try {
+            YtMedia.Now n = YtMedia.nowPlaying(this);
+            if (n != null && n.posMs >= 0) e.mediaPosMs = Math.max(0, n.posMs - 800);   // ~تأخیرِ تشخیصِ گفتار
+        } catch (Throwable ignored) {}
+        return e;
+    }
+
+    // ───────── جمله‌به‌جمله ─────────
+
+    private static boolean endsSentence(String word) {
+        if (word == null || word.isEmpty()) return false;
+        int n = word.length();
+        while (n > 0 && "\"'\u201D\u2019)\u00BB]".indexOf(word.charAt(n - 1)) >= 0) n--;
+        if (n == 0) return false;
+        char c = word.charAt(n - 1);
+        if (c == '!' || c == '?' || c == '\u061F' || c == '\u2026') return true;
+        if (c != '.') return false;
+        String low = word.substring(0, n).toLowerCase(Locale.ROOT);
+        if (ABBREVIATIONS.contains(low)) return false;
+        if (n == 2 && Character.isUpperCase(word.charAt(0))) return false;        // initials: J.
+        return true;
+    }
+
+    /** اولین پایانِ جمله در w[from, limit): اندیسِ «بعد از» کلمه‌ی پایانی، یا -1. */
+    private static int sentenceEnd(String[] w, int from, int limit) {
+        for (int i = from; i < limit && i < w.length; i++) if (endsSentence(w[i])) return i + 1;
+        return -1;
+    }
+
+    /** برای جمله‌ی بلندِ بدونِ نقطه: نزدیک‌ترین ویرگول/نقطه، بعد حرفِ ربط، در بازه‌ی [from+6, from+maxLen]. */
+    private static int pickLineBreak(String[] w, int from, int maxLen) {
+        int hi = Math.min(w.length, from + maxLen);
+        int lo = Math.min(hi, from + 6);
+        for (int i = hi; i >= lo; i--) {
+            String x = w[i - 1];
+            char c = x.isEmpty() ? ' ' : x.charAt(x.length() - 1);
+            if (",;:\u060C".indexOf(c) >= 0 || endsSentence(x)) return i;
+        }
+        for (int i = hi - 1; i >= lo; i--) {
+            if (BREAK_BEFORE.contains(w[i].toLowerCase(Locale.ROOT))) return i;
+        }
+        return hi;
+    }
+
+    /** متنِ چندجمله‌ای/بلند را به خط‌هایی (هر کدام یک جمله) می‌شکند. */
+    private static List<String> splitSentences(String text) {
+        final ArrayList<String> out = new ArrayList<>();
+        final String[] w = words(text);
+        int from = 0;
+        while (from < w.length) {
+            int end = sentenceEnd(w, from, w.length);
+            if (end < 0) break;
+            out.add(joinWords(w, from, end));
+            from = end;
+        }
+        while (w.length - from > MAX_LINE_WORDS + 4) {
+            int end = pickLineBreak(w, from, MAX_LINE_WORDS);
+            if (end <= from) break;
+            out.add(joinWords(w, from, end));
+            from = end;
+        }
+        if (from < w.length) out.add(joinWords(w, from, w.length));
+        if (out.isEmpty()) out.add(text == null ? "" : text.trim());
+        return out;
+    }
+
+    private void commitSentences(String text) {
+        for (String part : splitSentences(text)) {
+            if (!part.trim().isEmpty()) commitSentence(part);
+        }
+    }
+
+    /** مکثِ بلند: جمله‌ی جاری همین‌جا بسته می‌شود و گفتارِ بعدی در خطِ تازه می‌آید. */
+    private void endSentenceByPause() {
+        final String hyp = pendingHyp;
+        if (hyp == null || hyp.isEmpty()) return;
+        final int n = words(hyp).length;
+        consumedWords += n;
+        commitSentences(hyp);
+    }
+
+    /** وسطِ گفتار: اگر نقطه/علامتِ پایانی در متنِ زنده آمد یا خط خیلی بلند شد، بخشِ اول به خطِ جدا بسته می‌شود. */
+    private boolean splitLiveIfNeeded(String next) {
+        final String[] w = words(next);
+        final int n = w.length;
+        int end = sentenceEnd(w, 0, n - 2);                   // علامتِ پایان در دو کلمه‌ی آخر هنوز ممکن است عوض شود
+        if (end < 0 && n >= MAX_LINE_WORDS + TAIL_GUARD_WORDS) end = pickLineBreak(w, 0, MAX_LINE_WORDS);
+        if (end <= 0 || end >= n) return false;
+        final String head = joinWords(w, 0, end);
+        final String tail = joinWords(w, end, n);
+        consumedWords += end;
+        commitSentences(head);                                // live = null؛ تایمرها هم پاک می‌شوند
+        live = newLiveEntry();
+        live.src = tail;
+        pendingHyp = tail;
+        lastSrcRenderAt = SystemClock.uptimeMillis();
+        renderEntry(live);
+        afterChange();
+        main.postDelayed(pauseCommitRunnable, SENT_PAUSE_MS);
+        if (!activeTargets().isEmpty()) commitChunks(live, false);
+        flushPartial(false);                                  // ممکن است باقیِ متن هم جمله‌ی کامل داشته باشد
+        return true;
     }
 
     private void flushPartial(boolean pause) {
@@ -2073,6 +2271,7 @@ public class BubbleService extends Service {
         if (e == null || pendingHyp.isEmpty()) return;
         final String next = smoothHyp(e.src, pendingHyp);
         lastSrcRenderAt = SystemClock.uptimeMillis();
+        if (cumulativeAsr() && splitLiveIfNeeded(next)) return;
         if (!next.equals(e.src)) {
             e.src = next;
             renderEntry(e);
@@ -2238,15 +2437,29 @@ public class BubbleService extends Service {
         }
     };
 
-    private void onFinalText(final String text) {
-        if (wm == null || bubble == null || text == null || text.trim().isEmpty()) return;
+    private void onFinalText(final String raw) {
+        if (wm == null || bubble == null || raw == null || raw.trim().isEmpty()) return;
         if (asrMuted()) return;
         // the server sometimes returns the same final text several times - show it once
-        if (text.equals(lastFinalText)) {
+        if (raw.equals(lastFinalText)) {
             Log.d(TAG, "skipping duplicate final text");
             return;
         }
-        lastFinalText = text;
+        lastFinalText = raw;
+        final String text = stripConsumed(raw);           // قسمت‌هایی که با مکث قبلاً خطِ جدا شده‌اند تکرار نشود
+        consumedWords = 0;                                // گفتارِ جاری تمام شد
+        if (text.trim().isEmpty()) {
+            final Entry le = live;
+            cancelLivePending();
+            if (le != null && le.src != null && !le.src.trim().isEmpty()) commitSentences(le.src);
+            return;
+        }
+        commitSentences(text);
+    }
+
+    /** یک جمله‌ی کامل: خطِ زنده بسته و ترجمه‌ی نهایی‌اش گرفته می‌شود. */
+    private void commitSentence(final String text) {
+        if (wm == null || bubble == null || text == null || text.trim().isEmpty()) return;
 
         cancelLivePending();
         lastPartialSrc = "";
@@ -2254,7 +2467,7 @@ public class BubbleService extends Service {
         prevFinalText = text;
         clearStatus();
 
-        final Entry e = live != null ? live : newEntry();
+        final Entry e = live != null ? live : newLiveEntry();
         live = null;                      // this sentence is finished; the next partial starts a new line
         e.src = text;
 
@@ -2350,7 +2563,11 @@ public class BubbleService extends Service {
         else saveLive();
     }
 
-    /** 💾 ترجمه‌ی زنده (صوتِ پخش‌شده از هر پلیر/برنامه): همه‌ی جمله‌های تاریخچه + ترجمه‌ها → «داستان‌های ذخیره‌شده». */
+    /**
+     * 💾 ترجمه‌ی زنده (صوتِ پخش‌شده از هر پلیر/برنامه): همه‌ی جمله‌های تاریخچه + ترجمه‌ها → «داستان‌های ذخیره‌شده».
+     * اگر دسترسیِ اعلان‌ها روشن باشد، منبعِ صدا (برنامه، عنوانِ فایل، لینک) و «موقعیتِ زمانیِ» هر جمله در همان فایل هم
+     * ذخیره می‌شود (مثل زیرنویسِ ذخیره‌شده‌ی یوتیوب)، و ذخیره‌ی دوباره‌ی همان فایل خط‌ها را ادغام می‌کند.
+     */
     private void saveLive() {
         try {
             final String offFa = "ترجمه در دسترس نیست (آفلاین)", offEn = "No translation (offline)";
@@ -2360,8 +2577,20 @@ public class BubbleService extends Service {
                 liveStartMs = history.get(0).createdAt;
                 liveKey = "live-" + liveStartMs;
             }
+            final ArrayList<Entry> snap = new ArrayList<>(history);
+            int counted = 0, withPos = 0;
+            for (Entry e : snap) {
+                if (e == live || e.src == null || e.src.trim().isEmpty()) continue;
+                counted++;
+                if (e.mediaPosMs >= 0) withPos++;
+            }
+            YtMedia.Now np = null;
+            try { np = YtMedia.nowPlaying(this); } catch (Throwable ignored) {}
+            final boolean hasSource = np != null && np.title != null && !np.title.isEmpty();
+            final boolean useMedia = hasSource && counted > 0 && withPos * 5 >= counted * 4;   // ≥۸۰٪ جمله‌ها موقعیتِ پلیر دارند
+
             JSONArray lines = new JSONArray();
-            for (Entry e : new ArrayList<>(history)) {
+            for (Entry e : snap) {
                 if (e == live || e.src == null || e.src.trim().isEmpty()) continue;   // جمله‌ی نیمه‌کاره/خالی
                 JSONObject tr = new JSONObject();
                 for (String t : ts) {
@@ -2369,8 +2598,10 @@ public class BubbleService extends Service {
                     if (v == null || v.trim().isEmpty() || v.equals("…") || v.equals(offFa) || v.equals(offEn)) continue;
                     tr.put(t, v);
                 }
-                lines.put(new JSONObject().put("t", Math.max(0, e.createdAt - liveStartMs) / 1000.0)
-                        .put("s", e.src.trim()).put("tr", tr));
+                double t = (useMedia && e.mediaPosMs >= 0)
+                        ? e.mediaPosMs / 1000.0
+                        : Math.max(0, e.createdAt - liveStartMs) / 1000.0;
+                lines.put(new JSONObject().put("t", t).put("s", e.src.trim()).put("tr", tr));
             }
             if (lines.length() == 0) { showNotice(msg("هنوز چیزی برای ذخیره نیست", "Nothing to save yet")); return; }
             long now = System.currentTimeMillis();
@@ -2386,6 +2617,23 @@ public class BubbleService extends Service {
                     .put("rev", now)
                     .put("savedAt", fmt.format(new java.util.Date(now)))
                     .put("lines", lines);
+            if (hasSource) {
+                JSONObject so = new JSONObject()
+                        .put("app", np.app == null ? "" : np.app)
+                        .put("pkg", np.pkg == null ? "" : np.pkg)
+                        .put("title", np.title)
+                        .put("artist", np.artist == null ? "" : np.artist)
+                        .put("url", np.url == null ? "" : np.url)
+                        .put("inApp", np.inApp)
+                        .put("timed", useMedia);
+                item.put("source", so);
+                item.put("title", np.title);
+                item.put("channel", (np.artist != null && !np.artist.isEmpty()) ? np.artist : (np.app == null ? "" : np.app));
+                if (np.url != null && !np.url.isEmpty()) item.put("url", np.url);
+                if (useMedia) {   // همان فایل = همان ردیف (مثل videoId در یوتیوب) تا ذخیره‌ی دوباره خط‌ها را ادغام کند
+                    item.put("key", "live-" + Integer.toHexString((np.pkg + "|" + np.title + "|" + np.artist).hashCode()));
+                }
+            }
             boolean ok = YtSaved.add(this, item);
             showNotice(ok
                     ? msg("ذخیره شد ✓ (" + lines.length() + " خط) — در «داستان‌های ذخیره‌شده» اپ", "Saved ✓ (" + lines.length() + " lines) — see Saved stories in the app")
@@ -2643,7 +2891,7 @@ public class BubbleService extends Service {
         lastFinalText = "";
         partialBusy = false;
         shownPartialSeq = partialSeq;
-        lastPartialSrc = ""; live = null;
+        lastPartialSrc = ""; live = null; consumedWords = 0;
         cancelLivePending();
         speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
@@ -3018,6 +3266,7 @@ public class BubbleService extends Service {
         s.flushPartial(true);
         s.cancelLivePending();
         s.live = null;
+        s.consumedWords = 0;
     }
 
     static void asrFallback() {
@@ -3158,9 +3407,16 @@ public class BubbleService extends Service {
     private static String extractText(String raw) {
         try {
             String r = dig(new JSONTokener(raw).nextValue());
-            if (r != null && !r.trim().isEmpty()) return r.trim();
+            if (r != null && !r.trim().isEmpty()) return stripThink(r);
         } catch (Exception ignored) {}
-        return raw.trim();
+        return stripThink(raw);
+    }
+
+    /** بلوکِ <think>…</think> (فکرِ مدل) را حذف می‌کند و فقط پاسخ را نگه می‌دارد. */
+    private static String stripThink(String s) {
+        if (s == null) return "";
+        return s.replaceAll("(?is)<think(ing)?>.*?</think(ing)?>", "")
+                .replaceAll("(?is)<think(ing)?>.*$", "").trim();
     }
 
     private static String dig(Object o) {

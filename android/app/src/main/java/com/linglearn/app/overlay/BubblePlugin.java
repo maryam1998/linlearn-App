@@ -113,6 +113,22 @@ public class BubblePlugin extends Plugin {
         }
     }
 
+    // openApp({ pkg }) — باز کردنِ برنامه‌ی منبعِ صدا (مثلاً پلیری که فایل در آن پخش می‌شد)
+    @PluginMethod
+    public void openApp(PluginCall call) {
+        String pkg = call.getString("pkg");
+        if (pkg == null || pkg.isEmpty()) { call.reject("invalid package"); return; }
+        try {
+            Intent i = getContext().getPackageManager().getLaunchIntentForPackage(pkg);
+            if (i == null) { call.reject("app not found"); return; }
+            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            getContext().startActivity(i);
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("cannot open app: " + e.getMessage());
+        }
+    }
+
     @PluginMethod
     public void checkPermission(PluginCall call) {
         JSObject ret = new JSObject();

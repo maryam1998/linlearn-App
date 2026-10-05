@@ -310,6 +310,133 @@ public class YtMedia extends NotificationListenerService {
         }
     }
 
+    // ───────── 🎙 «الان چه چیزی پخش می‌شود؟» (برای ذخیره‌ی ترجمه‌ی زنده با منبعِ صدا) ─────────
+
+    /** عکسِ فوریِ پلیرِ بیرونی (هر برنامه‌ای که MediaSession دارد: پلیر موسیقی/کتاب صوتی/پادکست/یوتیوب…). */
+    public static final class Now {
+        public String pkg = "";
+        public String app = "";          // نامِ برنامه (مثلاً «Poweramp»)
+        public String title = "";
+        public String artist = "";
+        public String url = "";          // اگر در متادیتا لینک بود (یا ویدیوی یوتیوب بود)
+        public long posMs = -1;          // موقعیتِ پخش (ms)، -1 = نامشخص
+        public boolean playing;
+        public boolean inApp;            // صدا از خودِ همین اپ است
+    }
+
+    private static final Pattern URL_IN_TEXT = Pattern.compile("(?i)\\b((?:https?://|www\\.)[^\\s\"'<>]+)");
+    private static volatile Now cachedNow;
+    private static volatile long cachedNowAt = 0;
+    private static volatile long noAccessUntil = 0;
+
+    /** null = دسترسیِ اعلان‌ها داده نشده یا چیزی در حال پخش نیست. نتیجه ~۶۰۰ms کش می‌شود. */
+    public static Now nowPlaying(Context ctx) {
+        final long t = SystemClock.elapsedRealtime();
+        if (t < noAccessUntil) return null;
+        if (t - cachedNowAt < 600) return adjust(cachedNow, t - cachedNowAt);
+        Now n = null;
+        try {
+            Context app = ctx.getApplicationContext();
+            MediaSessionManager msm = (MediaSessionManager) app.getSystemService(Context.MEDIA_SESSION_SERVICE);
+            if (msm != null) {
+                List<MediaController> list = msm.getActiveSessions(new ComponentName(app, YtMedia.class));
+                MediaController best = null;
+                if (list != null) {
+                    for (MediaController c : list) {
+                        PlaybackState ps = c.getPlaybackState();
+                        if (ps != null && ps.getState() == PlaybackState.STATE_PLAYING) { best = c; break; }
+                    }
+                    if (best == null) {                       // هیچ‌کدام در حالِ پخش نیست → اولین sessionِ دارایِ عنوان
+                        for (MediaController c : list) {
+                            MediaMetadata md = c.getMetadata();
+                            if (md != null && md.getString(MediaMetadata.METADATA_KEY_TITLE) != null) { best = c; break; }
+                        }
+                    }
+                }
+                if (best != null) n = describe(app, best);
+            }
+        } catch (SecurityException e) {
+            noAccessUntil = t + 30_000;                       // دسترسی نیست؛ هر لحظه binder را صدا نزن
+        } catch (Throwable e) {
+            Log.d(TAG, "nowPlaying failed: " + e);
+        }
+        cachedNow = n;
+        cachedNowAt = t;
+        return n;
+    }
+
+    private static Now adjust(Now n, long ageMs) {
+        if (n == null) return null;
+        Now c = new Now();
+        c.pkg = n.pkg; c.app = n.app; c.title = n.title; c.artist = n.artist; c.url = n.url;
+        c.playing = n.playing; c.inApp = n.inApp;
+        c.posMs = (n.posMs >= 0 && n.playing) ? n.posMs + ageMs : n.posMs;
+        return c;
+    }
+
+    private static Now describe(Context app, MediaController c) {
+        Now n = new Now();
+        n.pkg = c.getPackageName() == null ? "" : c.getPackageName();
+        n.inApp = n.pkg.equals(app.getPackageName());
+        try {
+            android.content.pm.PackageManager pm = app.getPackageManager();
+            n.app = String.valueOf(pm.getApplicationLabel(pm.getApplicationInfo(n.pkg, 0)));
+        } catch (Throwable e) {
+            n.app = n.pkg;
+        }
+        try {
+            MediaMetadata md = c.getMetadata();
+            if (md != null) {
+                String title = md.getString(MediaMetadata.METADATA_KEY_TITLE);
+                if (title == null) title = md.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE);
+                n.title = title == null ? "" : title.trim();
+                String ar = md.getString(MediaMetadata.METADATA_KEY_ARTIST);
+                if (ar == null) ar = md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST);
+                if (ar == null) ar = md.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE);
+                n.artist = ar == null ? "" : ar.trim();
+                String vid = null;
+                for (String k : md.keySet()) {
+                    String v;
+                    try { v = md.getString(k); } catch (Throwable e) { continue; }
+                    if (v == null || v.isEmpty()) continue;
+                    if (vid == null && YT_PKG.equals(n.pkg)) {
+                        String id = isValidYouTubeVideoId(v.trim()) && MediaMetadata.METADATA_KEY_MEDIA_ID.equals(k)
+                                ? v.trim() : idFromText(v);
+                        if (id != null) vid = id;
+                    }
+                    if (n.url.isEmpty()) {
+                        Matcher m = URL_IN_TEXT.matcher(v);
+                        if (m.find()) {
+                            String u = m.group(1);
+                            n.url = u.toLowerCase(java.util.Locale.ROOT).startsWith("www.") ? "https://" + u : u;
+                        }
+                    }
+                }
+                if (vid != null) n.url = "https://youtu.be/" + vid;
+            }
+        } catch (Throwable e) {
+            Log.d(TAG, "now metadata failed: " + e);
+        }
+        try {
+            PlaybackState ps = c.getPlaybackState();
+            if (ps != null) {
+                n.playing = ps.getState() == PlaybackState.STATE_PLAYING;
+                long pos = ps.getPosition();
+                if (pos >= 0) {
+                    if (n.playing) {
+                        long upd = ps.getLastPositionUpdateTime();
+                        float sp = ps.getPlaybackSpeed() <= 0f ? 1f : ps.getPlaybackSpeed();
+                        if (upd > 0) pos += (long) ((SystemClock.elapsedRealtime() - upd) * sp);
+                    }
+                    n.posMs = pos;
+                }
+            }
+        } catch (Throwable e) {
+            Log.d(TAG, "now playback failed: " + e);
+        }
+        return n;
+    }
+
     // seek از بیرون (متدِ ytSeek در BubblePlugin) — روی tracker فعالِ BubbleService
     private static volatile Tracker active;
     static void setActive(Tracker t) { active = t; }
