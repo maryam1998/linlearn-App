@@ -1,5 +1,16 @@
 package com.linglearn.app.overlay;
 
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
+import android.webkit.CookieManager;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -10,6 +21,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
@@ -50,7 +62,8 @@ final class YtCaptionFetcher {
     }
 
     private static final MediaType JSON_MT = MediaType.get("application/json; charset=utf-8");
-    private static final long OVERALL_MS = 15000;
+    private static final long OVERALL_MS = 26000;
+    private static final long WEBVIEW_MS = 22000;
 
     // ═════════════════════════ زیرنویس ═════════════════════════
 
@@ -69,9 +82,10 @@ final class YtCaptionFetcher {
 
         submit(ecs, 0, new Callable<Out>() { public Out call() throws Exception { return viaClient(http, "ANDROID", videoId, wantLang); } });
         submit(ecs, 0, new Callable<Out>() { public Out call() throws Exception { return viaWorker(http, workerBase, videoId, wantLang); } });
-        submit(ecs, 600, new Callable<Out>() { public Out call() throws Exception { return viaClient(http, "ANDROID_VR", videoId, wantLang); } });
-        submit(ecs, 1200, new Callable<Out>() { public Out call() throws Exception { return viaClient(http, "IOS", videoId, wantLang); } });
-        submit(ecs, 1800, new Callable<Out>() { public Out call() throws Exception { return viaClient(http, "TVE", videoId, wantLang); } });
+        submit(ecs, 300, new Callable<Out>() { public Out call() throws Exception { return viaClient(http, "ANDROID_VR", videoId, wantLang); } });
+        submit(ecs, 600, new Callable<Out>() { public Out call() throws Exception { return viaClient(http, "IOS", videoId, wantLang); } });
+        // کلاینت TV-embed دیگر از طرف یوتیوب پشتیبانی نمی‌شود؛ جایش یک مرورگرِ واقعی (WebView) است
+        submit(ecs, 1200, new Callable<Out>() { public Out call() throws Exception { return viaWebView(videoId, wantLang); } });
 
         final long deadline = System.currentTimeMillis() + OVERALL_MS;
         try {
@@ -97,7 +111,11 @@ final class YtCaptionFetcher {
         } finally {
             pool.shutdownNow();
         }
-        throw new Fail(join(reasons), noCapVotes >= 2);
+        String all = join(reasons);
+        boolean blocked = all.contains("LOGIN_REQUIRED") || all.contains("not a bot") || all.contains("HTTP 429") || all.contains("HTTP 403");
+        throw new Fail(blocked && noCapVotes < 2
+                ? "یوتیوب این IP را مسدود کرده؛ VPN/شبکه را عوض کن (YouTube bot-check) · " + brief(all, 120)
+                : all, noCapVotes >= 2);
     }
 
     private static <T> void submit(ExecutorCompletionService<T> ecs, final long delayMs, final Callable<T> job) {
@@ -134,6 +152,167 @@ final class YtCaptionFetcher {
             if (out.isEmpty()) throw new Fail("worker: empty captions", false);
             return new Out(normLang(j.optString("lang", wantLang)), j.optBoolean("isAuto", false), out);
         }
+    }
+
+    // ───────── مسیرِ مرورگرِ واقعی (WebView) ─────────
+    //  صفحه‌ی watch را مثلِ کروم باز می‌کند، فهرستِ زیرنویس را از ytInitialPlayerResponse می‌خواند و متنِ آن را
+    //  از داخلِ خودِ صفحه (با کوکی‌ها) می‌گیرد. اگر یوتیوب بدونِ pot جواب خالی داد، از پلیرِ خودِ صفحه می‌خواهیم
+    //  زیرنویس را روشن کند و درخواستِ timedtext (که pot دارد) را شنود و همان را دوباره می‌گیریم.
+    //  صدایی پخش نمی‌شود (autoplay خاموش است).
+
+    private static final class Bridge {
+        final CountDownLatch latch = new CountDownLatch(1);
+        volatile Out out;
+        volatile Fail failure;
+        volatile String potUrl = "";
+
+        @JavascriptInterface public void ok(String lang, boolean auto, String body) {
+            try {
+                List<YtSubtitles.Cue> cues = parseCues(body == null ? "" : body);
+                if (cues.isEmpty()) failure = new Fail("webview: unparsable captions", false);
+                else out = new Out(normLang(lang), auto, cues);
+            } catch (Throwable t) {
+                failure = new Fail("webview: parse " + t.getClass().getSimpleName(), false);
+            }
+            latch.countDown();
+        }
+
+        @JavascriptInterface public void fail(String reason, boolean noCaptions) {
+            failWith(reason, noCaptions);
+        }
+
+        @JavascriptInterface public String pot() { return potUrl; }
+
+        void failWith(String reason, boolean noCaptions) {
+            if (out == null && failure == null) failure = new Fail(brief(reason, 100), noCaptions);
+            latch.countDown();
+        }
+    }
+
+    private static Context appCtx() {
+        try {
+            Object a = Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null);
+            if (a instanceof Context) return ((Context) a).getApplicationContext();
+        } catch (Throwable ignored) { /* بعدی */ }
+        try {
+            Object a = Class.forName("android.app.AppGlobals").getMethod("getInitialApplication").invoke(null);
+            if (a instanceof Context) return ((Context) a).getApplicationContext();
+        } catch (Throwable ignored) { /* هیچ */ }
+        return null;
+    }
+
+    private static String webJs(String wantLang) {
+        String want = normLang(wantLang).replace("\\", "").replace("'", "");
+        return "(function(){if(window.__llRun)return;window.__llRun=1;"
+            + "var WANT='" + want + "';"
+            + "function sl(ms){return new Promise(function(r){setTimeout(r,ms);});}"
+            + "function fail(m,nc){try{LL.fail(String(m),!!nc);}catch(e){}}"
+            + "function pick(tr){var best=null,any=null,asr=null;"
+            +   "for(var i=0;i<tr.length;i++){var t=tr[i];var lc=String(t.languageCode||'').toLowerCase().split('-')[0];"
+            +     "if(!any)any=t;"
+            +     "if(lc===WANT){if(t.kind!=='asr')return t;if(!asr)asr=t;}"
+            +     "else if(t.kind!=='asr'&&!best)best=t;}"
+            +   "return asr||best||any;}"
+            + "async function get(u){var r=await fetch(u,{credentials:'include'});"
+            +   "if(!r.ok)return '';return await r.text();}"
+            + "function good(x){return x&&x.trim().length>2;}"
+            + "(async function(){try{"
+            +   "var pr=null;"
+            +   "for(var i=0;i<50;i++){pr=window.ytInitialPlayerResponse;if(pr&&pr.playabilityStatus)break;await sl(200);}"
+            +   "if(!pr){fail('webview: no player response');return;}"
+            +   "var ps=pr.playabilityStatus||{};"
+            +   "if(ps.status!=='OK'){fail('webview: '+(ps.status||'?')+(ps.reason?' ('+String(ps.reason).slice(0,50)+')':''));return;}"
+            +   "var tl=pr.captions&&pr.captions.playerCaptionsTracklistRenderer;"
+            +   "var tracks=tl&&tl.captionTracks;"
+            +   "if(!tracks||!tracks.length){fail('webview: no caption tracks',true);return;}"
+            +   "var t=pick(tracks);"
+            +   "var u=new URL(t.baseUrl,location.href);u.searchParams.set('fmt','json3');"
+            +   "var x=await get(u.toString());"
+            +   "if(good(x)){LL.ok(t.languageCode||WANT,t.kind==='asr',x);return;}"
+            +   "var p=document.getElementById('movie_player');"
+            +   "for(var k=0;k<24&&!p;k++){await sl(250);p=document.getElementById('movie_player');}"
+            +   "if(!p){fail('webview: timedtext empty, player not ready');return;}"
+            +   "try{if(p.toggleSubtitlesOn)p.toggleSubtitlesOn();}catch(e){}"
+            +   "try{var list=p.getOption('captions','tracklist')||[];var m=null;"
+            +     "for(var j=0;j<list.length;j++){var lc=String(list[j].languageCode||'').toLowerCase().split('-')[0];"
+            +       "if(lc===WANT&&(!m||list[j].kind!=='asr'))m=list[j];}"
+            +     "p.setOption('captions','track',m||{languageCode:t.languageCode});}catch(e){}"
+            +   "var pu='';"
+            +   "for(var k=0;k<40&&!pu;k++){await sl(250);pu=LL.pot();}"
+            +   "if(!pu){fail('webview: timedtext empty (no pot)');return;}"
+            +   "var u2=new URL(pu,location.href);u2.searchParams.set('fmt','json3');"
+            +   "var y=await get(u2.toString());"
+            +   "if(good(y)){LL.ok(u2.searchParams.get('lang')||t.languageCode||WANT,u2.searchParams.get('kind')==='asr',y);return;}"
+            +   "fail('webview: timedtext empty even with pot');"
+            + "}catch(e){fail('webview: '+e);}})();"
+            + "})();";
+    }
+
+    private static Out viaWebView(final String videoId, final String wantLang) throws Exception {
+        final Context ctx = appCtx();
+        if (ctx == null) throw new Fail("webview: no context", false);
+        final Bridge br = new Bridge();
+        final Handler main = new Handler(Looper.getMainLooper());
+        final WebView[] holder = new WebView[1];
+        final String js = webJs(wantLang);
+
+        main.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    CookieManager cm = CookieManager.getInstance();
+                    cm.setAcceptCookie(true);
+                    cm.setCookie("https://www.youtube.com", "SOCS=CAI; Domain=.youtube.com; Path=/; Secure");
+                    WebView wv = new WebView(ctx);
+                    holder[0] = wv;
+                    WebSettings st = wv.getSettings();
+                    st.setJavaScriptEnabled(true);
+                    st.setDomStorageEnabled(true);
+                    st.setMediaPlaybackRequiresUserGesture(true);
+                    st.setLoadsImagesAutomatically(false);
+                    st.setUserAgentString(st.getUserAgentString().replace("; wv", "").replace("Version/4.0 ", ""));
+                    wv.addJavascriptInterface(br, "LL");
+                    wv.setWebViewClient(new WebViewClient() {
+                        @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
+                            try {
+                                String u = r.getUrl().toString();
+                                if (u.contains("/api/timedtext") && u.contains("pot=")) br.potUrl = u;
+                            } catch (Throwable ignored) { /* نادیده */ }
+                            return null;
+                        }
+                        @Override public void onPageFinished(WebView v, String url) {
+                            if (url != null && url.contains("consent.")) { br.failWith("webview: consent page", false); return; }
+                            v.evaluateJavascript(js, null);
+                        }
+                        @Override public void onReceivedError(WebView v, WebResourceRequest r, android.webkit.WebResourceError e) {
+                            if (r != null && r.isForMainFrame()) {
+                                br.failWith("webview: load error " + (e == null ? "" : e.getErrorCode()), false);
+                            }
+                        }
+                    });
+                    wv.loadUrl("https://m.youtube.com/watch?v=" + videoId);
+                } catch (Throwable t) {
+                    br.failWith("webview: " + t.getClass().getSimpleName(), false);
+                }
+            }
+        });
+
+        try {
+            if (!br.latch.await(WEBVIEW_MS, TimeUnit.MILLISECONDS)) throw new Fail("webview: timeout", false);
+        } finally {
+            main.post(new Runnable() {
+                @Override public void run() {
+                    WebView wv = holder[0];
+                    if (wv == null) return;
+                    try {
+                        wv.stopLoading();
+                        wv.removeJavascriptInterface("LL");
+                        wv.destroy();
+                    } catch (Throwable ignored) { /* نادیده */ }
+                }
+            });
+        }
+        if (br.out != null) return br.out;
+        throw br.failure != null ? br.failure : new Fail("webview: unknown", false);
     }
 
     // ───────── مسیرِ مستقیم از گوشی ─────────
