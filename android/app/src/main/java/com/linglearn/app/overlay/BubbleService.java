@@ -118,13 +118,13 @@ public class BubbleService extends Service {
     private static final int CHUNK_MS = 100;
     private static final int CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS / 1000;
     private static final int MIN_SEG_MS = 800;
-    private static final int MAX_SEG_MS = 3500;
+    private static final int MAX_SEG_MS = 8000;           // قبلاً ۳۵۰۰: صدا وسطِ جمله بریده می‌شد؛ حالا فقط در جمله‌های خیلی بلند
     private static final int SRV_PARTIAL_EVERY_MS = 500;     // حالت سرور: هر ۵۰۰ms صدای جمع‌شده برای پیش‌نمایشِ زنده فرستاده می‌شود
     private static final int SRV_PARTIAL_MIN_VOICED_MS = 350;
     private static final long SRV_PAUSE_COMMIT_MS = 1600;
     private static final long TAIL_MIN_MS = 220;            // ترجمه‌ی زنده‌ی انتهای جمله حداکثر هر ~۲۲۰ms
     // ✅ تغییر ۴: از 300 به 1400 (جمله‌های کامل‌تر، متنِ باکیفیت‌تر)
-    private static final int SILENCE_CUT_MS = 800;
+    private static final int SILENCE_CUT_MS = 1000;       // مکثِ کوتاهِ نفس‌گیری قطعه را نبُرد
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
@@ -408,8 +408,9 @@ public class BubbleService extends Service {
     private static final java.util.Set<String> BREAK_BEFORE = new HashSet<>(Arrays.asList(
             "and", "but", "then", "that", "which", "when", "because", "so", "or", "while",
             "who", "where", "as", "if", "though", "until", "after", "before"));
-    private static final long SENT_PAUSE_MS = 500;       // مکثِ این‌قدری = پایانِ جمله → خطِ جدید (جمله‌به‌جمله)
-    private static final int MAX_LINE_WORDS = 14;        // جمله‌ی بدونِ مکث/نقطه از این بلندتر شد، سرِ یک ویرگول/حرفِ ربط شکسته می‌شود
+    private static final long SENT_PAUSE_MS = 800;       // مکثِ این‌قدری = پایانِ جمله → خطِ جدید (قبلاً ۵۰۰ و وسطِ جمله می‌شکست)
+    private static final long SENT_PAUSE_INCOMPLETE_MS = 2000;   // جمله ناتمام به‌نظر می‌رسد (آخرش «the/to/and/…» است یا خیلی کوتاه است) → بیشتر صبر کن
+    private static final int MAX_LINE_WORDS = 22;        // جمله‌ی بدونِ مکث/نقطه از این بلندتر شد، سرِ یک ویرگول/حرفِ ربط شکسته می‌شود
     private static final java.util.Set<String> ABBREVIATIONS = new HashSet<>(Arrays.asList(
             "mr.", "mrs.", "ms.", "dr.", "st.", "prof.", "jr.", "sr.", "vs.", "mt.", "no.", "gen.", "col.",
             "capt.", "lt.", "sgt.", "rev.", "hon.", "messrs.", "etc.", "e.g.", "i.e."));
@@ -420,7 +421,7 @@ public class BubbleService extends Service {
     private TextView selectingTv = null;                 // متنی که الان انگشتِ کاربر رویش است (بازنویسی نشود)
     private final Runnable srcRenderRunnable = () -> { srcRenderScheduled = false; flushPartial(false); };
     private final Runnable pauseCommitRunnable = () -> {
-        if (cumulativeAsr() && words(pendingHyp).length >= 2) endSentenceByPause();
+        if (cumulativeAsr() && words(pendingHyp).length >= 4) endSentenceByPause();
         else flushPartial(true);
     };
 
@@ -2680,7 +2681,7 @@ public class BubbleService extends Service {
     private long pauseMs() {
         if (sherpaEngine instanceof WhisperEngine) return PAUSE_COMMIT_SONG_MS;
         if (!micEngine) return SRV_PAUSE_COMMIT_MS;       // حالت سرور: پیش‌نمایش‌ها فاصله دارند
-        return SENT_PAUSE_MS;
+        return looksIncomplete(pendingHyp) ? SENT_PAUSE_INCOMPLETE_MS : SENT_PAUSE_MS;
     }
 
     /** تشخیصِ گفتارِ زنده (Sherpa/Google) متنِ «کلِ گفتارِ جاری» را می‌دهد؛ حالتِ آهنگ (Whisper) پنجره‌ای است و تجمعی نیست. */
@@ -2738,7 +2739,37 @@ public class BubbleService extends Service {
         for (int i = hi - 1; i >= lo; i--) {
             if (BREAK_BEFORE.contains(w[i].toLowerCase(Locale.ROOT))) return i;
         }
+        for (int i = hi; i >= lo; i--) {                               // برشِ اجباری: هرگز بعد از «the/of/to/and…» نه
+            if (!endsDangling(w[i - 1])) return i;
+        }
         return hi;
+    }
+
+    /** کلماتی که یک جمله با آن‌ها «تمام نمی‌شود»؛ اگر آخرِ متن بودند یعنی گوینده هنوز ادامه می‌دهد. */
+    private static final java.util.Set<String> DANGLING = new HashSet<>(Arrays.asList(
+            "a", "an", "the", "and", "but", "or", "so", "because", "that's", "which", "who", "whom", "whose",
+            "when", "where", "while", "if", "though", "although", "until", "unless", "as", "than", "of", "to",
+            "in", "on", "at", "by", "for", "with", "from", "into", "about", "over", "under", "between",
+            "through", "during", "before", "after", "is", "are", "was", "were", "am", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "can", "could", "should", "shall",
+            "may", "might", "must", "not", "my", "your", "his", "our", "their", "its", "some", "any", "very",
+            "i", "we", "they", "he", "she", "i'm", "i've", "i'll", "i'd", "we're", "they're", "you're",
+            "he's", "she's", "it's", "there's", "what", "how", "why", "also", "just", "even", "then"));
+
+    private static boolean endsDangling(String word) {
+        if (word == null || word.isEmpty()) return false;
+        char last = word.charAt(word.length() - 1);
+        if (",.;:!?\u061F\u060C\u2026".indexOf(last) >= 0) return false;       // علامتِ پایان/ویرگول دارد
+        String low = word.toLowerCase(Locale.ROOT).replace('\u2019', '\'');
+        low = low.replaceAll("^[\"'(\\[]+|[\"')\\]]+$", "");
+        return DANGLING.contains(low);
+    }
+
+    /** آیا متنِ زنده هنوز ناتمام به‌نظر می‌رسد؟ (خیلی کوتاه یا آخرش کلمه‌ی «آویزان») */
+    private static boolean looksIncomplete(String text) {
+        String[] w = words(text);
+        if (w.length == 0) return false;
+        return w.length < 4 || endsDangling(w[w.length - 1]);
     }
 
     /** متنِ چندجمله‌ای/بلند را به خط‌هایی (هر کدام یک جمله) می‌شکند. */
@@ -2862,13 +2893,19 @@ public class BubbleService extends Service {
         for (int i = maxEnd - 1; i >= from + 4; i--) {                 // بعد: قبل از حرفِ ربط
             if (BREAK_BEFORE.contains(w[i].toLowerCase(Locale.ROOT))) return i;
         }
+        for (int i = maxEnd; i >= from + CHUNK_MIN_WORDS; i--) {       // تکه را به «the/of/to/and…» ختم نکن
+            if (!endsDangling(w[i - 1])) return i;
+        }
         return maxEnd;
     }
 
     private void commitChunks(Entry e, boolean flushAll) {
         final String[] w = words(e.src);
         reconcileChunks(e, w);
-        final int limit = flushAll ? w.length : w.length - TAIL_GUARD_WORDS;
+        int limit = flushAll ? w.length : w.length - TAIL_GUARD_WORDS;
+        if (flushAll) {                                           // مکثِ کوتاه وسطِ جمله: کلماتِ آویزانِ آخر قفل/ترجمه نشوند
+            while (limit > e.committedWords + 1 && endsDangling(w[limit - 1])) limit--;
+        }
         while (true) {
             int from = e.committedWords;
             if (limit - from < (flushAll ? 1 : CHUNK_MIN_WORDS)) break;
