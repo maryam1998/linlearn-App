@@ -29,7 +29,7 @@ final class LiveTranslator {
     private static final String TAG = "LiveTranslator";
 
     /** اگر ترجمه‌ی رایگان تا این مدت نیامد، ترجمه‌ی AI هم‌زمان شروع می‌شود. */
-    private static final long AI_HEDGE_MS = 900;
+    private static final long AI_HEDGE_MS = 600;
 
     private static final ExecutorService POOL = Executors.newCachedThreadPool(new ThreadFactory() {
         @Override public Thread newThread(Runnable r) {

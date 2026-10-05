@@ -58,7 +58,7 @@ final class FreeTranslator {
     private static final long[] downUntil = new long[SERVICES];
 
     /** اگر سرویسِ اول در این مدت جواب نداد، سرویسِ بعدی «هم‌زمان» شروع می‌شود (اولین جوابِ سالم برنده است). */
-    private static final long HEDGE_MS = 650;
+    private static final long HEDGE_MS = 400;
     private static final ExecutorService POOL = Executors.newCachedThreadPool(new ThreadFactory() {
         @Override public Thread newThread(Runnable r) {
             Thread t = new Thread(r, "free-translate");

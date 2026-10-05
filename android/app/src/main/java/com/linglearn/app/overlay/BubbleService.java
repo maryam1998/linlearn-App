@@ -120,7 +120,7 @@ public class BubbleService extends Service {
     private static final int MIN_SEG_MS = 800;
     private static final int MAX_SEG_MS = 2000;
     // ✅ تغییر ۴: از 300 به 1400 (جمله‌های کامل‌تر، متنِ باکیفیت‌تر)
-    private static final int SILENCE_CUT_MS = 1400;
+    private static final int SILENCE_CUT_MS = 800;
     private static final int MIN_VOICED_MS = 600;
     private static final double SILENCE_RMS = 250.0;
     private static final int MAX_PENDING = 3;
@@ -271,7 +271,7 @@ public class BubbleService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService net = Executors.newSingleThreadExecutor();
     private final ExecutorService netTr = Executors.newFixedThreadPool(3);
-    private final ExecutorService netPartial = Executors.newFixedThreadPool(2);
+    private final ExecutorService netPartial = Executors.newFixedThreadPool(4);
     private final AtomicInteger pending = new AtomicInteger(0);
     private final AtomicInteger textPending = new AtomicInteger(0);
 
@@ -391,17 +391,17 @@ public class BubbleService extends Service {
     // ✅ تغییر ۱: آخرین متن نهایی — برای جلوگیری از تکرار
     private volatile String lastFinalText = "";
     // ── ترجمه‌ی زنده‌ی نرم و پایدار ──
-    private static final long SRC_RENDER_MS = 220;       // متنِ اصلی حداکثر هر ۲۲۰ms به‌روز می‌شود (نه با هر تکانِ تشخیص)
+    private static final long SRC_RENDER_MS = 100;       // متنِ اصلی حداکثر هر ۲۲۰ms به‌روز می‌شود (نه با هر تکانِ تشخیص)
     private static final long PAUSE_COMMIT_MS = 700;     // با ۷۰۰ms سکوت، باقیِ جمله هم ترجمه می‌شود
     private static final long PAUSE_COMMIT_SONG_MS = 6000;   // حالت آهنگ: پیش‌نمایش‌ها هر چند ثانیه می‌آن، پس زود commit نکن
-    private static final int TAIL_GUARD_WORDS = 3;       // ۳ کلمه‌ی آخر هنوز ممکن است توسطِ تشخیص عوض شوند
-    private static final int CHUNK_MIN_WORDS = 7;
-    private static final int CHUNK_MAX_WORDS = 12;
+    private static final int TAIL_GUARD_WORDS = 2;       // ۳ کلمه‌ی آخر هنوز ممکن است توسطِ تشخیص عوض شوند
+    private static final int CHUNK_MIN_WORDS = 4;
+    private static final int CHUNK_MAX_WORDS = 9;
     private static final String CHUNK_FAIL = "\u0000";
     private static final java.util.Set<String> BREAK_BEFORE = new HashSet<>(Arrays.asList(
             "and", "but", "then", "that", "which", "when", "because", "so", "or", "while",
             "who", "where", "as", "if", "though", "until", "after", "before"));
-    private static final long SENT_PAUSE_MS = 800;       // مکثِ این‌قدری = پایانِ جمله → خطِ جدید (جمله‌به‌جمله)
+    private static final long SENT_PAUSE_MS = 600;       // مکثِ این‌قدری = پایانِ جمله → خطِ جدید (جمله‌به‌جمله)
     private static final int MAX_LINE_WORDS = 16;        // جمله‌ی بدونِ مکث/نقطه از این بلندتر شد، سرِ یک ویرگول/حرفِ ربط شکسته می‌شود
     private static final java.util.Set<String> ABBREVIATIONS = new HashSet<>(Arrays.asList(
             "mr.", "mrs.", "ms.", "dr.", "st.", "prof.", "jr.", "sr.", "vs.", "mt.", "no.", "gen.", "col.",
