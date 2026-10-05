@@ -118,7 +118,11 @@ public class BubbleService extends Service {
     private static final int CHUNK_MS = 100;
     private static final int CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS / 1000;
     private static final int MIN_SEG_MS = 800;
-    private static final int MAX_SEG_MS = 2000;
+    private static final int MAX_SEG_MS = 3500;
+    private static final int SRV_PARTIAL_EVERY_MS = 500;     // حالت سرور: هر ۵۰۰ms صدای جمع‌شده برای پیش‌نمایشِ زنده فرستاده می‌شود
+    private static final int SRV_PARTIAL_MIN_VOICED_MS = 350;
+    private static final long SRV_PAUSE_COMMIT_MS = 1600;
+    private static final long TAIL_MIN_MS = 220;            // ترجمه‌ی زنده‌ی انتهای جمله حداکثر هر ~۲۲۰ms
     // ✅ تغییر ۴: از 300 به 1400 (جمله‌های کامل‌تر، متنِ باکیفیت‌تر)
     private static final int SILENCE_CUT_MS = 800;
     private static final int MIN_VOICED_MS = 600;
@@ -272,6 +276,9 @@ public class BubbleService extends Service {
     private final ExecutorService net = Executors.newSingleThreadExecutor();
     private final ExecutorService netTr = Executors.newFixedThreadPool(3);
     private final ExecutorService netPartial = Executors.newFixedThreadPool(4);
+    private final ExecutorService sttPartialEx = Executors.newSingleThreadExecutor();
+    private final java.util.concurrent.atomic.AtomicBoolean srvPartialBusy = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private volatile int srvSegId = 0;
     private final AtomicInteger pending = new AtomicInteger(0);
     private final AtomicInteger textPending = new AtomicInteger(0);
 
@@ -1033,6 +1040,13 @@ public class BubbleService extends Service {
         final ArrayList<String> chunkSrc = new ArrayList<>();
         final HashMap<String, ArrayList<String>> chunkTr = new HashMap<>();   // lang -> ترجمه‌ی هر تکه ("" = در انتظار)
         int committedWords = 0;
+        // ترجمه‌ی زنده‌ی «دنباله‌ی» جمله (کلمه‌هایی که هنوز در تکه‌ی قفل‌شده نیستند) — فوری و کلمه‌به‌کلمه
+        final HashMap<String, String> tailTr = new HashMap<>();
+        final HashMap<String, Integer> tailTrFrom = new HashMap<>();
+        final HashMap<String, String> tailAsked = new HashMap<>();
+        final HashMap<String, Boolean> tailBusy = new HashMap<>();
+        long tailLastAt = 0;
+        boolean tailScheduled = false;
         long mediaPosMs = -1;                                              // موقعیتِ پلیرِ بیرونی (ms) وقتی این جمله شروع شد؛ -1 = نامشخص
         TextView srcSpeakBtn;                                              // 🔊 کنار متن اصلی
         TextView ytReplayBtn;                                              // ↺ پخش دوباره‌ی جمله با صدای پلیر یوتیوب
@@ -2660,8 +2674,13 @@ public class BubbleService extends Service {
             main.postDelayed(srcRenderRunnable, wait);
         }
         main.removeCallbacks(pauseCommitRunnable);
-        main.postDelayed(pauseCommitRunnable,
-                (sherpaEngine instanceof WhisperEngine) ? PAUSE_COMMIT_SONG_MS : SENT_PAUSE_MS);
+        main.postDelayed(pauseCommitRunnable, pauseMs());
+    }
+
+    private long pauseMs() {
+        if (sherpaEngine instanceof WhisperEngine) return PAUSE_COMMIT_SONG_MS;
+        if (!micEngine) return SRV_PAUSE_COMMIT_MS;       // حالت سرور: پیش‌نمایش‌ها فاصله دارند
+        return SENT_PAUSE_MS;
     }
 
     /** تشخیصِ گفتارِ زنده (Sherpa/Google) متنِ «کلِ گفتارِ جاری» را می‌دهد؛ حالتِ آهنگ (Whisper) پنجره‌ای است و تجمعی نیست. */
@@ -2776,7 +2795,7 @@ public class BubbleService extends Service {
         lastSrcRenderAt = SystemClock.uptimeMillis();
         renderEntry(live);
         afterChange();
-        main.postDelayed(pauseCommitRunnable, SENT_PAUSE_MS);
+        main.postDelayed(pauseCommitRunnable, pauseMs());
         if (!activeTargets().isEmpty()) commitChunks(live, false);
         flushPartial(false);                                  // ممکن است باقیِ متن هم جمله‌ی کامل داشته باشد
         return true;
@@ -2793,7 +2812,7 @@ public class BubbleService extends Service {
             renderEntry(e);
             afterChange();
         }
-        if (!activeTargets().isEmpty()) commitChunks(e, pause);
+        if (!activeTargets().isEmpty()) { commitChunks(e, pause); requestTail(e); }
     }
 
     /** اصلاحِ کوچکِ انتهای جمله (مثلاً beings↔being) متنِ روی صفحه را عقب‌وجلو نمی‌کند. */
@@ -2912,11 +2931,107 @@ public class BubbleService extends Service {
         ArrayList<String> l = e.chunkTr.get(lang);
         if (l == null || idx >= l.size()) return;
         l.set(idx, (out == null || out.trim().isEmpty()) ? CHUNK_FAIL : out.trim());
+        refreshLiveTr(e, lang);
+        if (e == live) requestTail(e);
+    }
+
+    /** ترجمه‌ی نمایش‌داده‌شده = تکه‌های قفل‌شده + ترجمه‌ی زنده‌ی دنباله‌ی جمله. */
+    private void refreshLiveTr(Entry e, String lang) {
         String ts = e.trSrc.get(lang);
         if (ts != null && !ts.isEmpty()) return;          // ترجمه‌ی کاملِ جمله قبلاً نشسته؛ تکه‌ها بازنویسی‌اش نکنند
-        String joined = joinChunks(e, lang, false);
-        if (joined == null || joined.isEmpty()) return;
-        setTranslation(e, lang, e == live ? joined + " …" : joined, "");
+        ArrayList<String> l = e.chunkTr.get(lang);
+        StringBuilder sb = new StringBuilder();
+        boolean pending = false;
+        if (l != null) {
+            for (String v : l) {
+                if (v.isEmpty()) { pending = true; break; }
+                if (v.equals(CHUNK_FAIL)) continue;
+                if (sb.length() > 0) sb.append(' ');
+                sb.append(v);
+            }
+        }
+        String shown = e.tr.get(lang);
+        boolean hasShown = shown != null && !shown.isEmpty() && !shown.equals("…");
+        if (pending && hasShown) return;                  // تکه‌ی بعدی در راه است؛ ترجمه‌ی روی صفحه کوتاه نشود
+        if (!pending) {
+            String tt = e.tailTr.get(lang);
+            Integer tf = e.tailTrFrom.get(lang);
+            if (e == live && tt != null && !tt.isEmpty() && tf != null && tf == e.committedWords) {
+                if (sb.length() > 0) sb.append(' ');
+                sb.append(tt);
+            }
+        }
+        if (sb.length() == 0) return;
+        String out = e == live ? sb + " …" : sb.toString();
+        if (out.equals(shown)) return;
+        e.tr.put(lang, out);
+        e.trSrc.put(lang, "");
+        renderEntry(e);
+        afterChange();
+    }
+
+    /** ترجمه‌ی فوریِ «دنباله‌ی» جمله‌ی زنده (بدونِ منتظر ماندن برای تکمیلِ تکه‌ها). */
+    private void requestTail(final Entry e) {
+        if (e == null || e != live) return;
+        final List<String> ts = activeTargets();
+        if (ts.isEmpty()) return;
+        final String[] w = words(e.src);
+        final int from = e.committedWords;
+        if (from >= w.length) { e.tailTr.clear(); e.tailAsked.clear(); return; }
+        final String tail = joinWords(w, from, w.length);
+        final long now = SystemClock.uptimeMillis();
+        if (now - e.tailLastAt < TAIL_MIN_MS) {
+            if (!e.tailScheduled) {
+                e.tailScheduled = true;
+                main.postDelayed(() -> { e.tailScheduled = false; if (e == live) requestTail(e); },
+                        TAIL_MIN_MS - (now - e.tailLastAt) + 10);
+            }
+            return;
+        }
+        final String srcLang = effectiveSource();
+        for (final String lang : ts) {
+            Integer askedFrom = e.tailTrFrom.get(lang);
+            if (tail.equals(e.tailAsked.get(lang)) && askedFrom != null && askedFrom == from) continue;
+            if (Boolean.TRUE.equals(e.tailBusy.get(lang))) continue;     // وقتی جوابِ قبلی رسید، دوباره بررسی می‌شود
+            e.tailLastAt = now;
+            e.tailAsked.put(lang, tail);
+            final boolean first = lang.equals(primaryTarget());
+            String hit = TransCache.get(this).get(srcLang, lang, tail);
+            if (hit != null && !LiveTranslator.looksLikelyMistranslated(tail, hit, lang, srcLang)) {
+                applyTail(e, lang, from, hit);
+                continue;
+            }
+            e.tailBusy.put(lang, true);
+            if (!hasInternet()) {
+                final Translator tr = localTr;
+                if (first && localReady && tr != null) {
+                    tr.translate(tail)
+                            .addOnSuccessListener(o -> { e.tailBusy.put(lang, false); applyTail(e, lang, from, o); })
+                            .addOnFailureListener(x -> e.tailBusy.put(lang, false));
+                } else e.tailBusy.put(lang, false);
+                continue;
+            }
+            try {
+                netPartial.execute(() -> {
+                    String out = null;
+                    try { out = LiveTranslator.translate(this, HTTP_FAST, tail, srcLang, lang, aiBackend); }
+                    catch (Exception ex) { Log.d(TAG, "tail translate failed: " + ex); }
+                    final String res = out;
+                    main.post(() -> {
+                        e.tailBusy.put(lang, false);
+                        if (res != null) applyTail(e, lang, from, res);
+                        if (e == live) requestTail(e);
+                    });
+                });
+            } catch (Exception ex) { e.tailBusy.put(lang, false); }
+        }
+    }
+
+    private void applyTail(Entry e, String lang, int from, String out) {
+        if (out == null || out.trim().isEmpty()) return;
+        e.tailTr.put(lang, out.trim());
+        e.tailTrFrom.put(lang, from);
+        refreshLiveTr(e, lang);
     }
 
     /** ترجمه‌ی تکه‌های آماده‌ی پشتِ‌سرهم. completeOnly=true: اگر حتی یک تکه آماده/موفق نباشد null. */
@@ -3737,7 +3852,7 @@ public class BubbleService extends Service {
     private void captureLoop(AudioRecord rec) {
         byte[] buf = new byte[CHUNK_BYTES];
         ByteArrayOutputStream seg = new ByteArrayOutputStream();
-        int segMs = 0, voicedMs = 0, silentMs = 0;
+        int segMs = 0, voicedMs = 0, silentMs = 0, sincePartialMs = 0;
         try {
             while (recording) {
                 int n = rec.read(buf, 0, buf.length);
@@ -3746,14 +3861,20 @@ public class BubbleService extends Service {
                 seg.write(buf, 0, n);
                 int chunkMs = n * 1000 / (SAMPLE_RATE * 2);
                 segMs += chunkMs;
+                sincePartialMs += chunkMs;
                 if (rms(buf, n) > SILENCE_RMS) { voicedMs += chunkMs; silentMs = 0; lastVoiceMs = SystemClock.elapsedRealtime(); }
                 else silentMs += chunkMs;
                 boolean cut = segMs >= MAX_SEG_MS || (segMs >= MIN_SEG_MS && silentMs >= SILENCE_CUT_MS);
                 if (cut) {
+                    srvSegId++;                                   // پیش‌نمایش‌های دیرِ این قطعه دور ریخته شوند
                     if (voicedMs >= MIN_VOICED_MS) submit(seg.toByteArray());
-                    seg.reset(); segMs = voicedMs = silentMs = 0;
+                    seg.reset(); segMs = voicedMs = silentMs = 0; sincePartialMs = 0;
                 } else if (voicedMs == 0 && segMs >= 1000) {
-                    seg.reset(); segMs = silentMs = 0;
+                    seg.reset(); segMs = silentMs = 0; sincePartialMs = 0;
+                } else if (voicedMs >= SRV_PARTIAL_MIN_VOICED_MS && sincePartialMs >= SRV_PARTIAL_EVERY_MS
+                        && silentMs < SILENCE_CUT_MS) {
+                    sincePartialMs = 0;
+                    submitServerPartial(seg.toByteArray(), srvSegId);
                 }
             }
             if (voicedMs >= MIN_VOICED_MS) submit(seg.toByteArray());
@@ -3882,6 +4003,23 @@ public class BubbleService extends Service {
         } catch (Exception e) { pending.decrementAndGet(); }
     }
 
+
+    /** حالت سرور: متنِ نیمه‌کاره‌ی قطعه‌ی جاری را هر چند صد میلی‌ثانیه نشان بده (بدونِ منتظر ماندن برای پایانِ جمله). */
+    private void submitServerPartial(final byte[] pcm, final int id) {
+        if (!srvPartialBusy.compareAndSet(false, true)) return;
+        try {
+            sttPartialEx.execute(() -> {
+                String t = "";
+                try { t = transcribe(pcm); } catch (Exception ex) { Log.d(TAG, "partial transcribe failed: " + ex); }
+                srvPartialBusy.set(false);
+                final String text = t;
+                if (text.isEmpty()) return;
+                main.post(() -> {
+                    if (id == srvSegId && recording && !micEngine) onPartialText(text);
+                });
+            });
+        } catch (Exception ex) { srvPartialBusy.set(false); }
+    }
 
     private void processSegment(byte[] pcm) {
         try {
@@ -4063,5 +4201,6 @@ public class BubbleService extends Service {
         net.shutdownNow();
         netTr.shutdownNow();
         netPartial.shutdownNow();
+        sttPartialEx.shutdownNow();
     }
 }
