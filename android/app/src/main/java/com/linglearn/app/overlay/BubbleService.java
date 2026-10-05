@@ -308,26 +308,52 @@ public class BubbleService extends Service {
     private int reqCounter = 0;           // monotonically increasing translation request id
     private final Runnable hidePanel = this::removePanel;
 
-    // ── بستنِ خودکارِ کادر وقتی چیزی پخش نمی‌شه ──────────────────────────────
-    // ضبط ادامه پیدا می‌کنه؛ فقط کادر جمع می‌شه و با رسیدنِ متنِ تازه خودش برمی‌گرده.
+    // ── نمایش/پنهان‌شدنِ خودکارِ کادر ───────────────────────────────────────
+    // وقتی چیزی پخش نمی‌شه (ویدیو pause، صدا قطع، یا ضبط متوقف شد) کادر خودش جمع می‌شه و
+    // با شروعِ دوباره‌ی پخش خودش برمی‌گرده. بستنِ دستی با ▾ همچنان تا لمسِ حباب پنهان می‌مونه.
     private static final long IDLE_HIDE_MS = 7000;
     private volatile long lastVoiceMs = 0;   // آخرین لحظه‌ای که صدایی از سیستم شنیده شد
     private volatile long lastTextMs = 0;    // آخرین لحظه‌ای که متنِ تشخیص‌داده‌شده رسید
+    private volatile long lastActiveMs = 0;  // آخرین لحظه‌ای که «چیزی در حالِ پخش» یا کاربر مشغول بود
     private boolean idleHidden = false;      // کادر را خودکار (نه کاربر) بسته‌ایم
     private final Runnable idleRunnable = this::idleTick;
 
+    private boolean somethingPlaying(long now) {
+        YtSubtitles y = yt;
+        if (y != null && y.isPlaying()) return true;
+        return recording && (now - lastVoiceMs < 2000 || now - lastTextMs < 3000);
+    }
+
     private void idleTick() {
-        if (!running || !recording) return;
+        main.removeCallbacks(idleRunnable);
+        if (!running) return;
         long now = SystemClock.elapsedRealtime();
-        boolean silent = now - lastVoiceMs > IDLE_HIDE_MS && now - lastTextMs > IDLE_HIDE_MS;
+        boolean active = somethingPlaying(now);
         boolean busy = (wordCard != null && wordCard.getVisibility() == View.VISIBLE)
-                || (scroll != null && (scroll.frozen || SystemClock.uptimeMillis() - scroll.lastUserTouch < 8000));
-        if (silent && panelShown && !userHidden && yt == null && !busy) {
+                || (scroll != null && (scroll.frozen || SystemClock.uptimeMillis() - scroll.lastUserTouch < 6000));
+        if (active || busy) lastActiveMs = now;
+        if (active && idleHidden) {
+            reopenFromIdle();
+        } else if (!active && !busy && panelShown && !userHidden && now - lastActiveMs > IDLE_HIDE_MS) {
             idleHidden = true;
             userHidden = true;
+            final boolean wasFree = panelFree;   // جای دستیِ کادر با بسته‌شدنِ خودکار گم نشه
             removePanel();
+            panelFree = wasFree;
         }
         main.postDelayed(idleRunnable, 700);
+    }
+
+    /** کادری که خودکار بسته شده بود دوباره باز می‌شه و (در حالتِ یوتیوب) سرِ جمله‌ی در حالِ پخش می‌ره. */
+    private void reopenFromIdle() {
+        idleHidden = false;
+        userHidden = false;
+        lastActiveMs = SystemClock.elapsedRealtime();
+        showPanel();
+        if (yt != null && ytCur >= 0) {
+            ytWantedForce = true;
+            main.postDelayed(() -> applyYtCurrent(false), 250);
+        }
     }
 
     /** متنِ تازه رسید: اگه کادر را خودکار بسته بودیم، دوباره اجازه‌ی نمایش می‌دیم. */
@@ -415,6 +441,9 @@ public class BubbleService extends Service {
             showNotice(isFa() ? "مجوز ضبط صدا داده نشد" : "Audio capture permission denied");
         } else {
             running = true;
+            lastActiveMs = SystemClock.elapsedRealtime();
+            main.removeCallbacks(idleRunnable);
+            main.postDelayed(idleRunnable, 700);
             addBubbleIfNeeded();
             prepareLocalTranslator();
             if (pendingYt) { pendingYt = false; main.post(() -> startYoutube(true)); }
@@ -639,6 +668,7 @@ public class BubbleService extends Service {
                             } else {
                                 bubble.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                                 if (bubble.collapseAmount() > 0.5f) dockBubble(false);   // لمسِ اولِ حبابِ نیمه‌پنهان: فقط بیرون می‌آید (کلیکِ ناخواسته ضبط را شروع نکند)
+                                else if (idleHidden && recording) reopenFromIdle();   // کادر خودکار بسته شده بود: لمس فقط بازش می‌کنه، ضبط را قطع نمی‌کنه
                                 else toggleRecording();
                             }
                         }
@@ -659,6 +689,7 @@ public class BubbleService extends Service {
         if (panelShown) { idleHidden = false; userHidden = true; removePanel(); return; }
         idleHidden = false;
         userHidden = false;
+        lastActiveMs = SystemClock.elapsedRealtime() + 8000;   // بازکردنِ دستیِ تاریخچه: کادر چند ثانیه‌ی بیشتر می‌مونه
         if (history.isEmpty()) {
             showNotice(isFa()
                     ? "لمس: شروع/توقف ضبط  ·  نگه‌داشتن: تاریخچه  ·  ✕ یا کشیدن به پایین: بستن"
@@ -3323,12 +3354,12 @@ public class BubbleService extends Service {
     private void setRecordingUi(boolean rec) {
         if (bubble == null) return;
         bubble.setRecording(rec);
-        main.removeCallbacks(idleRunnable);
         if (rec) {
-            lastVoiceMs = lastTextMs = SystemClock.elapsedRealtime();
+            lastVoiceMs = lastTextMs = lastActiveMs = SystemClock.elapsedRealtime();
             idleHidden = false;
-            main.postDelayed(idleRunnable, 700);
         }
+        main.removeCallbacks(idleRunnable);
+        main.postDelayed(idleRunnable, 700);
         // شروعِ ضبط → حباب جمع می‌شود و می‌رود گوشه؛ توقف → کامل به لبه می‌چسبد و بعد از چند ثانیه دوباره جمع می‌شود
         main.postDelayed(() -> dockBubble(rec), rec ? 350 : 0);
         if (!rec) scheduleIdleDock();
@@ -3700,6 +3731,7 @@ public class BubbleService extends Service {
         if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
         setRecordingUi(false);
         showNotice(msg("ضبط متوقف شد", "Stopped"));
+        lastActiveMs = SystemClock.elapsedRealtime() - IDLE_HIDE_MS + 1800;   // پیامِ توقف ~۲ ثانیه دیده می‌شه، بعد کادر خودش جمع می‌شه
     }
 
     private void captureLoop(AudioRecord rec) {
