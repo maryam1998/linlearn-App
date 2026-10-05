@@ -44,7 +44,6 @@ import android.text.style.BackgroundColorSpan;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.TypedValue;
-import android.view.GestureDetector;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
@@ -53,6 +52,7 @@ import android.view.ViewConfiguration;
 import android.view.WindowManager;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
+import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
@@ -309,7 +309,6 @@ public class BubbleService extends Service {
     private final Runnable hidePanel = this::removePanel;
 
     private ObjectAnimator pulse;
-    private GestureDetector gestures;
     private boolean dragging = false;
 
     private MediaProjection mediaProjection;
@@ -508,9 +507,10 @@ public class BubbleService extends Service {
         if (bubble != null) return;
         if (!Settings.canDrawOverlays(this)) { shutdown(); return; }
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        bubbleSize = dp(56);
+        bubbleSize = dp(60);
 
         bubble = new BubbleView(this);
+        bubble.setContentDescription("LingoLearn");
 
         bubbleLp = new WindowManager.LayoutParams(
                 bubbleSize, bubbleSize,
@@ -525,68 +525,98 @@ public class BubbleService extends Service {
         bubbleLp.y = dp(200);
 
         final int slop = ViewConfiguration.get(this).getScaledTouchSlop();
+        final long longMs = ViewConfiguration.getLongPressTimeout();
 
-        gestures = new GestureDetector(this, new GestureDetector.SimpleOnGestureListener() {
-            @Override public boolean onDown(MotionEvent e) { return true; }
-
-            @Override
-            public boolean onSingleTapConfirmed(MotionEvent e) {
-                // ✅ یک لمسِ معمولی = شروع/توقفِ ضبط (بدون نیاز به نگه‌داشتن)
-                bubble.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-                toggleRecording();
-                return true;
-            }
-
-            @Override public boolean onDoubleTap(MotionEvent e) { shutdown(); return true; }
-
-            @Override
-            public void onLongPress(MotionEvent e) {
-                if (dragging) return;
-                bubble.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
-                // نگه‌داشتن = نمایش/پنهان‌کردنِ تاریخچه
-                if (panelShown) { userHidden = true; removePanel(); }
-                else {
-                    userHidden = false;
-                    if (history.isEmpty()) {
-                        showNotice(isFa()
-                                ? "لمس: شروع/توقف ضبط  ·  نگه‌داشتن: تاریخچه  ·  دوبار لمس: بستن"
-                                : "Tap: start/stop  ·  Long-press: history  ·  Double-tap: close");
-                    } else showPanel();
-                }
-            }
-        });
-
+        // لمس = شروع/توقفِ ضبط ، نگه‌داشتن = تاریخچه ، ✕ روی حباب = بستنِ کامل ،
+        // کشیدنِ حباب روی دایره‌ی ✕ پایینِ صفحه (مثل مسنجر) = بستنِ کامل ، لمسِ حبابِ نیمه‌پنهان فقط آن را بیرون می‌آورد.
         bubble.setOnTouchListener(new View.OnTouchListener() {
             float downX, downY;
             int startX, startY;
+            boolean longDone = false, onBadge = false;
+            final Runnable longRun = new Runnable() {
+                @Override public void run() {
+                    if (dragging || onBadge || bubble == null) return;
+                    longDone = true;
+                    bubble.setPressedLook(false);
+                    bubble.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+                    toggleHistoryFromBubble();
+                }
+            };
 
             @Override
             public boolean onTouch(View v, MotionEvent e) {
-                gestures.onTouchEvent(e);
+                if (bubble == null) return false;
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
                         main.removeCallbacks(idleDockRun);
+                        main.removeCallbacks(longRun);
+                        if (dockAnim != null) { dockAnim.cancel(); dockAnim = null; }
                         downX = e.getRawX(); downY = e.getRawY();
                         startX = bubbleLp.x; startY = bubbleLp.y;
-                        dragging = false;
+                        dragging = false; longDone = false;
+                        onBadge = bubble.hitBadge(e.getX(), e.getY());
+                        bubble.setPressedLook(true);
+                        if (!onBadge) main.postDelayed(longRun, longMs);
                         return true;
-                    case MotionEvent.ACTION_MOVE:
+
+                    case MotionEvent.ACTION_MOVE: {
                         float dx = e.getRawX() - downX;
                         float dy = e.getRawY() - downY;
-                        if (!dragging && (Math.abs(dx) > slop || Math.abs(dy) > slop)) dragging = true;
+                        if (!dragging && (Math.abs(dx) > slop || Math.abs(dy) > slop)) {
+                            dragging = true; onBadge = false;
+                            main.removeCallbacks(longRun);
+                            bubble.setPressedLook(false);
+                            bubble.setDragging(true);
+                            showCloseTarget();
+                        }
                         if (dragging) {
-                            bubbleLp.x = clamp(Math.round(startX + dx), 0, screenW() - bubbleSize);
-                            bubbleLp.y = clamp(Math.round(startY + dy), 0, screenH() - bubbleSize);
+                            int nx = clamp(Math.round(startX + dx), 0, screenW() - bubbleSize);
+                            int ny = clamp(Math.round(startY + dy), 0, screenH() - bubbleSize);
+                            boolean hot = closeView != null
+                                    && Math.hypot(nx + bubbleSize / 2f - tgtCx, ny + bubbleSize / 2f - tgtCy) < dp(84);
+                            if (hot != overTarget) {
+                                overTarget = hot;
+                                if (closeView != null) closeView.setHot(hot);
+                                bubble.setHot(hot);
+                                if (hot) bubble.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+                            }
+                            if (hot) { nx = tgtCx - bubbleSize / 2; ny = tgtCy - bubbleSize / 2; }   // می‌نشیند روی ✕
+                            bubbleLp.x = nx; bubbleLp.y = ny;
                             try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
                             panelFree = false;                       // کشیدنِ حباب، کادر را دوباره کنارِ حباب می‌آورد
                             movePanel();
                         }
                         return true;
+                    }
+
                     case MotionEvent.ACTION_UP:
-                    case MotionEvent.ACTION_CANCEL:
-                        if (dragging) dockBubble(recording);       // مغناطیس: بعد از رها کردن به نزدیک‌ترین لبه می‌چسبد
-                        scheduleIdleDock();                        // چند ثانیه بی‌کاری → نیمه‌پنهان کنار لبه
+                    case MotionEvent.ACTION_CANCEL: {
+                        main.removeCallbacks(longRun);
+                        bubble.setPressedLook(false);
+                        boolean up = e.getActionMasked() == MotionEvent.ACTION_UP;
+                        if (dragging) {
+                            dragging = false;
+                            bubble.setDragging(false);
+                            if (up && overTarget) { closeBubbleAnimated(); return true; }
+                            hideCloseTarget();
+                            bubble.setHot(false);
+                            dockBubble(recording);                   // مغناطیس: بعد از رها کردن به نزدیک‌ترین لبه می‌چسبد
+                        } else if (up && !longDone) {
+                            if (onBadge) {
+                                if (bubble.hitBadge(e.getX(), e.getY())) {
+                                    bubble.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                                    shutdown();
+                                    return true;
+                                }
+                            } else {
+                                bubble.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+                                if (bubble.collapseAmount() > 0.5f) dockBubble(false);   // لمسِ اولِ حبابِ نیمه‌پنهان: فقط بیرون می‌آید (کلیکِ ناخواسته ضبط را شروع نکند)
+                                else toggleRecording();
+                            }
+                        }
+                        scheduleIdleDock();                          // چند ثانیه بی‌کاری → نیمه‌پنهان کنار لبه
                         return true;
+                    }
                 }
                 return true;
             }
@@ -597,15 +627,25 @@ public class BubbleService extends Service {
         scheduleIdleDock();
     }
 
+    private void toggleHistoryFromBubble() {
+        if (panelShown) { userHidden = true; removePanel(); return; }
+        userHidden = false;
+        if (history.isEmpty()) {
+            showNotice(isFa()
+                    ? "لمس: شروع/توقف ضبط  ·  نگه‌داشتن: تاریخچه  ·  ✕ یا کشیدن به پایین: بستن"
+                    : "Tap: start/stop  ·  Hold: history  ·  ✕ or drag down: close");
+        } else showPanel();
+    }
+
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 
     private ValueAnimator dockAnim;
     private final Runnable idleDockRun = () -> { if (!dragging) dockBubble(true); };
 
-    /** چند ثانیه بعد از آخرین لمس، حباب خودش کنار لبه جمع می‌شود تا مزاحمِ محتوا نباشد. */
+    /** چند ثانیه بعد از آخرین لمس، حباب خودش کنار لبه جمع می‌شود (کم‌رنگ‌تر و نیمه‌پنهان) تا مزاحمِ محتوا نباشد. */
     private void scheduleIdleDock() {
         main.removeCallbacks(idleDockRun);
-        main.postDelayed(idleDockRun, 2500);
+        main.postDelayed(idleDockRun, 3500);
     }
 
     /** حباب را به نزدیک‌ترین لبه‌ی چپ/راست می‌چسباند؛ collapse=true یعنی نیمی از آن بیرون از صفحه می‌رود (آیکون در نیمه‌ی دیدنی می‌ماند). */
@@ -632,7 +672,115 @@ public class BubbleService extends Service {
         dockAnim.start();
     }
 
-    /** حبابِ طراحی‌شده: دایره‌ی گرادیانی + حلقه‌ی طلایی + میکروفونِ برداری؛ هنگامِ ضبط حلقه‌ی قرمز + موجِ تپنده. */
+    // ── دایره‌ی ✕ پایینِ صفحه: فقط هنگامِ کشیدنِ حباب دیده می‌شود (مثل مسنجر) ──
+    private CloseTargetView closeView;
+    private WindowManager.LayoutParams closeLp;
+    private boolean overTarget = false;
+    private int tgtCx, tgtCy;
+
+    private void showCloseTarget() {
+        if (wm == null || closeView != null) return;
+        int sz = dp(84);
+        closeView = new CloseTargetView(this);
+        closeLp = new WindowManager.LayoutParams(
+                sz, sz,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT);
+        closeLp.gravity = Gravity.TOP | Gravity.START;
+        tgtCx = screenW() / 2;
+        tgtCy = screenH() - dp(120);
+        closeLp.x = tgtCx - sz / 2;
+        closeLp.y = tgtCy - sz / 2;
+        closeView.setAlpha(0f); closeView.setScaleX(0.6f); closeView.setScaleY(0.6f);
+        try {
+            wm.addView(closeView, closeLp);
+            closeView.animate().alpha(1f).scaleX(1f).scaleY(1f).setDuration(160).start();
+        } catch (Exception ex) { closeView = null; }
+    }
+
+    private void hideCloseTarget() {
+        overTarget = false;
+        final CloseTargetView v = closeView;
+        closeView = null;
+        if (v == null || wm == null) return;
+        v.animate().alpha(0f).scaleX(0.6f).scaleY(0.6f).setDuration(120)
+                .withEndAction(() -> { try { wm.removeView(v); } catch (Exception ignored) {} }).start();
+    }
+
+    private void removeCloseTargetNow() {
+        overTarget = false;
+        CloseTargetView v = closeView;
+        closeView = null;
+        if (v != null && wm != null) { try { wm.removeView(v); } catch (Exception ignored) {} }
+    }
+
+    /** رها کردنِ حباب روی ✕: کوچک و محو می‌شود و سرویس کاملاً بسته می‌شود. */
+    private void closeBubbleAnimated() {
+        final BubbleView b = bubble;
+        hideCloseTarget();
+        if (b == null) { shutdown(); return; }
+        b.animate().scaleX(0f).scaleY(0f).alpha(0f).setDuration(150)
+                .withEndAction(this::shutdown).start();
+    }
+
+    /** دایره‌ی تیره‌ی ✕؛ وقتی حباب نزدیک می‌شود بزرگ و قرمز می‌شود. */
+    private static final class CloseTargetView extends View {
+        private final float d;
+        private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint cross = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final android.animation.ArgbEvaluator argb = new android.animation.ArgbEvaluator();
+        private float hot = 0f;
+        private ValueAnimator hotAnim;
+
+        CloseTargetView(Context c) {
+            super(c);
+            d = c.getResources().getDisplayMetrics().density;
+            setLayerType(LAYER_TYPE_SOFTWARE, null);
+            ring.setStyle(Paint.Style.STROKE);
+            ring.setStrokeWidth(1.5f * d);
+            ring.setColor(0xE6FFFFFF);
+            cross.setStyle(Paint.Style.STROKE);
+            cross.setStrokeCap(Paint.Cap.ROUND);
+            cross.setStrokeWidth(2.4f * d);
+            cross.setColor(Color.WHITE);
+        }
+
+        void setHot(boolean h) {
+            if (hotAnim != null) hotAnim.cancel();
+            hotAnim = ValueAnimator.ofFloat(hot, h ? 1f : 0f);
+            hotAnim.setDuration(140);
+            hotAnim.addUpdateListener(a -> { hot = (Float) a.getAnimatedValue(); invalidate(); });
+            hotAnim.start();
+        }
+
+        @Override protected void onDetachedFromWindow() {
+            super.onDetachedFromWindow();
+            if (hotAnim != null) { hotAnim.cancel(); hotAnim = null; }
+        }
+
+        @Override protected void onDraw(Canvas cv) {
+            float cx = getWidth() / 2f, cy = getHeight() / 2f;
+            float sc = 1f + 0.22f * hot;
+            cv.save();
+            cv.scale(sc, sc, cx, cy);
+            fill.setColor((Integer) argb.evaluate(hot, 0xE61C2541, COLOR_REC));
+            fill.setShadowLayer(8f * d, 0f, 2f * d, 0x66000000);
+            cv.drawCircle(cx, cy, 26f * d, fill);
+            cv.drawCircle(cx, cy, 25f * d, ring);
+            float k = 7.5f * d;
+            cv.drawLine(cx - k, cy - k, cx + k, cy + k, cross);
+            cv.drawLine(cx - k, cy + k, cx + k, cy - k, cross);
+            cv.restore();
+        }
+    }
+
+    /** حبابِ طراحی‌شده: دایره‌ی گرادیانی + حلقه‌ی طلایی + میکروفونِ برداری؛ هنگامِ ضبط حلقه‌ی قرمز + موجِ تپنده.
+     *  حالتِ آرام: کم‌رنگ و نیمه‌پنهان کنارِ لبه. نشانِ ✕ (بستنِ کامل) فقط وقتی حباب بیرون است دیده می‌شود. */
     private static final class BubbleView extends View {
         private final float d;
         private final Paint body = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -640,11 +788,14 @@ public class BubbleService extends Service {
         private final Paint wave = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint line = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint shine = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint badge = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint badgeX = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF rf = new RectF();
-        private boolean rec = false;
+        private boolean rec = false, dragMode = false;
         private int side = 1;
-        private float collapse = 0f, ripple = 0f;
-        private ValueAnimator rippleAnim;
+        private float collapse = 0f, ripple = 0f, press = 0f, hot = 0f;
+        private ValueAnimator rippleAnim, pressAnim, hotAnim;
 
         BubbleView(Context c) {
             super(c);
@@ -657,11 +808,38 @@ public class BubbleService extends Service {
             line.setStrokeCap(Paint.Cap.ROUND);
             line.setColor(Color.WHITE);
             fill.setColor(Color.WHITE);
+            shine.setStyle(Paint.Style.STROKE);
+            shine.setStrokeCap(Paint.Cap.ROUND);
+            shine.setStrokeWidth(1.4f * d);
+            shine.setColor(0x38FFFFFF);
+            badge.setColor(0xF2FFFFFF);
+            badgeX.setStyle(Paint.Style.STROKE);
+            badgeX.setStrokeCap(Paint.Cap.ROUND);
+            badgeX.setStrokeWidth(1.7f * d);
+            badgeX.setColor(0xFF1C2541);
         }
 
         float collapseAmount() { return collapse; }
 
         void setDock(int s, float c) { side = s; collapse = c; applyAlpha(); invalidate(); }
+
+        void setDragging(boolean g) { dragMode = g; invalidate(); }
+
+        void setPressedLook(boolean p) {
+            if (pressAnim != null) pressAnim.cancel();
+            pressAnim = ValueAnimator.ofFloat(press, p ? 1f : 0f);
+            pressAnim.setDuration(p ? 90 : 170);
+            pressAnim.addUpdateListener(a -> { press = (Float) a.getAnimatedValue(); invalidate(); });
+            pressAnim.start();
+        }
+
+        void setHot(boolean h) {
+            if (hotAnim != null) hotAnim.cancel();
+            hotAnim = ValueAnimator.ofFloat(hot, h ? 1f : 0f);
+            hotAnim.setDuration(140);
+            hotAnim.addUpdateListener(a -> { hot = (Float) a.getAnimatedValue(); invalidate(); });
+            hotAnim.start();
+        }
 
         void setRecording(boolean r) {
             if (rec == r) return;
@@ -670,7 +848,7 @@ public class BubbleService extends Service {
             ripple = 0f;
             if (r) {
                 rippleAnim = ValueAnimator.ofFloat(0f, 1f);
-                rippleAnim.setDuration(1400);
+                rippleAnim.setDuration(1600);
                 rippleAnim.setRepeatCount(ValueAnimator.INFINITE);
                 rippleAnim.addUpdateListener(a -> { ripple = (Float) a.getAnimatedValue(); invalidate(); });
                 rippleAnim.start();
@@ -679,23 +857,40 @@ public class BubbleService extends Service {
             invalidate();
         }
 
-        private void applyAlpha() { setAlpha(rec ? 1f : 1f - 0.22f * collapse); }
+        private void applyAlpha() { setAlpha(rec ? 1f : 1f - 0.38f * collapse); }
+
+        private float discR() { return Math.min(getWidth(), getHeight()) / 2f - 8f * d; }
+
+        private float badgeAlpha() { return dragMode ? 0f : Math.max(0f, 1f - collapse * 2f); }
+
+        private float badgeCx() { return getWidth() / 2f - side * discR() * 0.80f; }
+
+        private float badgeCy() { return getHeight() / 2f - discR() * 0.80f; }
+
+        /** آیا لمس روی نشانِ ✕ است؟ (ناحیه‌ی لمس کمی بزرگ‌تر از ظاهرِ آن) */
+        boolean hitBadge(float x, float y) {
+            if (badgeAlpha() < 0.5f) return false;
+            float dx = x - badgeCx(), dy = y - badgeCy();
+            return dx * dx + dy * dy <= (16f * d) * (16f * d);
+        }
 
         @Override protected void onSizeChanged(int w, int h, int ow, int oh) {
             super.onSizeChanged(w, h, ow, oh);
-            float r = Math.min(w, h) / 2f - 5f * d;
+            float r = discR();
             body.setShader(new LinearGradient(w / 2f, h / 2f - r, w / 2f, h / 2f + r, 0xFF34498A, 0xFF121A33, Shader.TileMode.CLAMP));
         }
 
         @Override protected void onDetachedFromWindow() {
             super.onDetachedFromWindow();
             if (rippleAnim != null) { rippleAnim.cancel(); rippleAnim = null; }
+            if (pressAnim != null) { pressAnim.cancel(); pressAnim = null; }
+            if (hotAnim != null) { hotAnim.cancel(); hotAnim = null; }
         }
 
         @Override protected void onDraw(Canvas cv) {
             float w = getWidth(), h = getHeight();
             float cx = w / 2f, cy = h / 2f;
-            float r = Math.min(w, h) / 2f - 5f * d;          // ۵dp حاشیه برای سایه و موج
+            float r = discR();                                // ۸dp حاشیه برای سایه، موج و نشانِ ✕
             int accent = rec ? COLOR_REC : COLOR_GOLD;
 
             if (rec) {                                        // موجِ تپنده‌ی ضبط
@@ -705,12 +900,19 @@ public class BubbleService extends Service {
                 cv.drawCircle(cx, cy, rr, wave);
             }
 
-            body.setShadowLayer(4f * d, 0f, 1.5f * d, 0x73000000);
+            float sc = (1f - 0.07f * press) * (1f - 0.22f * hot);
+            cv.save();
+            cv.scale(sc, sc, cx, cy);
+
+            body.setShadowLayer(6f * d, 0f, 2f * d, 0x66000000);
             cv.drawCircle(cx, cy, r, body);
 
             ring.setColor(accent);
-            ring.setStrokeWidth((rec ? 2.6f : 2f) * d);
+            ring.setStrokeWidth((rec ? 2.4f : 1.6f) * d);
             cv.drawCircle(cx, cy, r - 1f * d, ring);
+
+            rf.set(cx - r + 3.5f * d, cy - r + 3.5f * d, cx + r - 3.5f * d, cy + r - 3.5f * d);
+            cv.drawArc(rf, 205f, 130f, false, shine);         // درخشِ ظریفِ نیمه‌ی بالا
 
             // آیکونِ میکروفون؛ هنگامِ جمع‌شدن به سمتِ نیمه‌ی دیدنی می‌رود
             float ix = cx - side * collapse * (w * 0.22f);
@@ -723,13 +925,26 @@ public class BubbleService extends Service {
             cv.drawLine(ix, cy + 7f * k, ix, cy + 11f * k, line);
             cv.drawLine(ix - 4f * k, cy + 11f * k, ix + 4f * k, cy + 11f * k, line);
 
-            if (rec) {                                        // نقطه‌ی قرمزِ «در حال ضبط»
-                float bx = cx + r * 0.72f, by = cy - r * 0.72f;
+            if (rec) {                                        // نقطه‌ی قرمزِ «در حال ضبط»؛ سمتِ داخلیِ صفحه تا در حالتِ نیمه‌پنهان دیده شود
+                float bx = cx - side * r * 0.72f, by = cy + r * 0.72f;
                 fill.setColor(Color.WHITE);
                 cv.drawCircle(bx, by, 5.2f * d, fill);
                 fill.setColor(COLOR_REC);
                 cv.drawCircle(bx, by, 3.6f * d, fill);
                 fill.setColor(Color.WHITE);
+            }
+            cv.restore();
+
+            float ba = badgeAlpha();                          // ✕ بستنِ کامل (سمتِ داخلیِ صفحه)
+            if (ba > 0.02f) {
+                float bx = badgeCx(), by = badgeCy(), br = 8.5f * d;
+                badge.setShadowLayer(3f * d, 0f, 1f * d, ((int) (90 * ba) << 24));
+                badge.setAlpha((int) (242 * ba));
+                cv.drawCircle(bx, by, br, badge);
+                badgeX.setAlpha((int) (255 * ba));
+                float q = 3.1f * d;
+                cv.drawLine(bx - q, by - q, bx + q, by + q, badgeX);
+                cv.drawLine(bx - q, by + q, bx + q, by - q, badgeX);
             }
         }
     }
@@ -843,7 +1058,7 @@ public class BubbleService extends Service {
         header.addView(tvRepeat);
         updateRepeatButton();
         updateYtButton();
-        TextView tvFont = headerButton("Aa", v -> cycleFont());
+        TextView tvFont = headerButton("Aa", v -> toggleFontRow());
         tvFont.setTypeface(Typeface.DEFAULT_BOLD);
         tvFont.setOnLongClickListener(v -> { resetView(); return true; });
         header.addView(tvFont);
@@ -851,7 +1066,7 @@ public class BubbleService extends Service {
         tvOpacity.setPadding(dp(8), dp(6), dp(8), dp(6));
         header.addView(tvOpacity);
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
-        header.addView(headerButton("\u2715", v -> { userHidden = true; removePanel(); }));
+        header.addView(headerButton("\u25BE", v -> { userHidden = true; removePanel(); }));   // ▾ = فقط کادرِ تاریخچه را پنهان می‌کند (بستنِ حباب: ✕ روی خودِ حباب)
         tvHeader.setPadding(0, dp(8), 0, dp(8));          // سطحِ لمسِ بزرگ‌تر برای کشیدنِ کادر
         final int dragSlop = ViewConfiguration.get(this).getScaledTouchSlop();
         header.setOnTouchListener(new View.OnTouchListener() {
@@ -920,6 +1135,9 @@ public class BubbleService extends Service {
         panel.addView(opacityRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        panel.addView(buildFontRow(), new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         buildWordCard();
         panel.addView(wordCard);   // LayoutParams (با margin) داخلِ buildWordCard ست شده
 
@@ -936,7 +1154,7 @@ public class BubbleService extends Service {
 
         tvStatus = new TextView(this);
         tvStatus.setTextColor(Color.parseColor("#C8CCD8"));
-        style(tvStatus, 13, false);
+        styleC(tvStatus, 13, false);
         tvStatus.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         tvStatus.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
         tvStatus.setPadding(0, dp(4), 0, 0);
@@ -1053,6 +1271,7 @@ public class BubbleService extends Service {
         ensurePanel();
         boolean has = m != null && !m.isEmpty();
         tvStatus.setText(has ? m : "");
+        applyStyle(tvStatus);
         tvStatus.setVisibility(has ? View.VISIBLE : View.GONE);
         if (!userHidden) showPanel();
     }
@@ -1555,7 +1774,7 @@ public class BubbleService extends Service {
         top.setGravity(Gravity.CENTER_VERTICAL);
         cardTerm = new TextView(this);
         cardTerm.setTextColor(Color.WHITE);
-        style(cardTerm, 17, true);
+        styleC(cardTerm, 17, true);
         cardTerm.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         cardTerm.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
         top.addView(cardTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
@@ -1572,7 +1791,7 @@ public class BubbleService extends Service {
 
         cardMeaningTv = new TextView(this);
         cardMeaningTv.setTextColor(Color.parseColor("#E8EAF2"));
-        style(cardMeaningTv, 15, false);
+        styleC(cardMeaningTv, 15, false);
         cardMeaningTv.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         cardMeaningTv.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
         cardMeaningTv.setPadding(0, dp(2), 0, dp(6));
@@ -1638,6 +1857,8 @@ public class BubbleService extends Service {
 
         cardTerm.setText(word);
         cardMeaningTv.setText("…");
+        applyStyle(cardTerm);
+        applyStyle(cardMeaningTv);
         refreshCardButtons();
         wordCard.setVisibility(View.VISIBLE);
         updateScrollFreeze();
@@ -1672,10 +1893,12 @@ public class BubbleService extends Service {
         if (meaning == null || meaning.isEmpty()) {
             cardMeaningTv.setText(msg("ترجمه در دسترس نیست — ذخیره بدون معنی هم کار می‌کند",
                     "No translation — saving still works"));
+            applyStyle(cardMeaningTv);
             return;
         }
         cardMeaning = meaning;
         cardMeaningTv.setText(meaning);
+        applyStyle(cardMeaningTv);
         // اگر قبل از رسیدنِ معنی دکمه‌ای زده شده بود، همان ردیف با معنی به‌روز می‌شود (گرامر یک‌بار ثبت می‌شود)
         if (cardStoryDone) queueWord("story");
         if (cardLeitnerDone) queueWord("leitner");
@@ -1712,18 +1935,55 @@ public class BubbleService extends Service {
     // ════════════════════════════════════════════════════════════════════════════
 
     private static final float FONT_MIN = 0.7f, FONT_MAX = 2.4f;
-    private static final String[] FONT_FAMILIES = {null, "serif", "monospace", "sans-serif-condensed", "casual"};
-    private static final String[][] FONT_NAMES = {
-            {"فونت: پیش‌فرض", "Font: Default"}, {"فونت: سریف", "Font: Serif"},
-            {"فونت: تک‌فاصله", "Font: Monospace"}, {"فونت: فشرده", "Font: Condensed"},
-            {"فونت: دستی", "Font: Casual"}};
+
+    /** یک گزینه‌ی فونت. keys == null → فونتِ سیستم (sys؛ null = پیش‌فرض).
+     *  وگرنه فایلِ فونت از assets/fonts پیدا می‌شود؛ نامِ دقیقِ فایل مهم نیست، وجودِ کلیدواژه در نام کافی است
+     *  (مثلاً BNazanin.ttf ، B Nazanin.ttf ، BNazaninBd.ttf). فونت‌های optional فقط وقتی فایلشان باشد در لیست می‌آیند. */
+    private static final class FontOpt {
+        final String id, faLabel, enLabel, sys;
+        final String[] keys;
+        final boolean noBold, tall, optional;
+        final float sizeMul;
+        boolean resolved;
+        Typeface reg, bold;
+
+        FontOpt(String id, String faLabel, String enLabel, String sys, String[] keys,
+                boolean noBold, boolean tall, float sizeMul, boolean optional) {
+            this.id = id; this.faLabel = faLabel; this.enLabel = enLabel; this.sys = sys; this.keys = keys;
+            this.noBold = noBold; this.tall = tall; this.sizeMul = sizeMul; this.optional = optional;
+        }
+    }
+
+    private static final FontOpt[] FA_FONTS = {
+            new FontOpt("fa_default", "پیش‌فرض", "Default", null, null, false, false, 1f, false),
+            new FontOpt("fa_bzar", "بی‌زر", "B Zar", null, new String[]{"bzar"}, false, false, 1.08f, false),
+            new FontOpt("fa_bnazanin", "بی‌نازنین", "B Nazanin", null, new String[]{"bnazanin", "nazanin"}, false, false, 1.12f, false),
+            new FontOpt("fa_btitr", "بی‌تیتر", "B Titr", null, new String[]{"btitr", "titr"}, true, false, 1f, false),
+            new FontOpt("fa_nastaliq", "نستعلیق", "Nastaliq", null, new String[]{"nastaliq", "nastaleeq"}, true, true, 1.1f, false),
+            new FontOpt("fa_vazir", "وزیرمتن", "Vazirmatn", null, new String[]{"vazir"}, false, false, 1f, true),
+    };
+
+    private static final FontOpt[] EN_FONTS = {
+            new FontOpt("en_default", "پیش‌فرض", "Default", null, null, false, false, 1f, false),
+            new FontOpt("en_medium", "متوسط", "Medium", "sans-serif-medium", null, false, false, 1f, false),
+            new FontOpt("en_light", "نازک", "Light", "sans-serif-light", null, false, false, 1f, false),
+            new FontOpt("en_serif", "سریف", "Serif", "serif", null, false, false, 1f, false),
+            new FontOpt("en_cond", "فشرده", "Condensed", "sans-serif-condensed", null, false, false, 1f, false),
+            new FontOpt("en_mono", "تک‌فاصله", "Mono", "monospace", null, false, false, 1f, false),
+            new FontOpt("en_inter", "Inter", "Inter", null, new String[]{"inter"}, false, false, 1f, true),
+            new FontOpt("en_lora", "Lora", "Lora", null, new String[]{"lora"}, false, false, 1f, true),
+    };
 
     private float fontScale = 1f;
-    private int fontIdx = 0;
+    private String fontFaId = "fa_default";    // فونتِ متنِ فارسی/عربی
+    private String fontEnId = "en_default";    // فونتِ متنِ انگلیسی/لاتین
     private float panelHFrac = 0.42f;
     private float panelWFrac = -1f;            // -1 = تمام‌عرض
     private float panelAlpha = 1f;             // شفافیتِ پس‌زمینه‌ی کادر: ۱ = کاملاً مات (solid)، ۰ = کاملاً شفاف
     private LinearLayout opacityRow;
+    private LinearLayout fontRow;
+    private final ArrayList<TextView> faChips = new ArrayList<>();
+    private final ArrayList<TextView> enChips = new ArrayList<>();
     private SeekBar opacityBar;
     private GradientDrawable panelBgDrawable;
     private View gripTop, gripBottom;
@@ -1731,7 +1991,8 @@ public class BubbleService extends Service {
     private void loadViewPrefs() {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         fontScale = Math.max(FONT_MIN, Math.min(FONT_MAX, sp.getFloat("fontScale", 1f)));
-        fontIdx = Math.max(0, Math.min(FONT_FAMILIES.length - 1, sp.getInt("fontIdx", 0)));
+        fontFaId = sp.getString("fontFa", "fa_default");
+        fontEnId = sp.getString("fontEn", "en_default");
         panelHFrac = Math.max(0.12f, Math.min(0.85f, sp.getFloat("panelHFrac", 0.42f)));
         panelWFrac = sp.getFloat("panelWFrac", -1f);
         panelAlpha = Math.max(0f, Math.min(1f, sp.getFloat("panelAlphaV2", 1f)));
@@ -1739,7 +2000,8 @@ public class BubbleService extends Service {
 
     private void saveViewPrefs() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putFloat("fontScale", fontScale).putInt("fontIdx", fontIdx)
+                .putFloat("fontScale", fontScale)
+                .putString("fontFa", fontFaId).putString("fontEn", fontEnId)
                 .putFloat("panelHFrac", panelHFrac).putFloat("panelWFrac", panelWFrac)
                 .putFloat("panelAlphaV2", panelAlpha).apply();
     }
@@ -1754,7 +2016,18 @@ public class BubbleService extends Service {
     /** 🌓 نوارِ تنظیمِ شفافیت (۰ تا ۱۰۰٪) را باز/بسته می‌کند. */
     private void toggleOpacityRow() {
         if (opacityRow == null) return;
-        opacityRow.setVisibility(opacityRow.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
+        boolean show = opacityRow.getVisibility() != View.VISIBLE;
+        opacityRow.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show && fontRow != null) fontRow.setVisibility(View.GONE);
+        refreshLayout();
+    }
+
+    /** Aa → انتخابِ فونتِ فارسی و فونتِ انگلیسی (جدا از هم). */
+    private void toggleFontRow() {
+        if (fontRow == null) return;
+        boolean show = fontRow.getVisibility() != View.VISIBLE;
+        fontRow.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show && opacityRow != null) opacityRow.setVisibility(View.GONE);
         refreshLayout();
     }
 
@@ -1773,9 +2046,88 @@ public class BubbleService extends Service {
         scroll.requestLayout();
     }
 
+    // ── فونت: فارسی و انگلیسی جدا؛ نوعِ فونتِ هر متن از خودِ حروفش تشخیص داده می‌شود ──
+
+    private String[] fontAssets;
+
+    private String[] fontAssetList() {
+        if (fontAssets == null) {
+            try { fontAssets = getAssets().list("fonts"); } catch (IOException ex) { fontAssets = null; }
+            if (fontAssets == null) fontAssets = new String[0];
+        }
+        return fontAssets;
+    }
+
+    private static String normName(String s) {
+        return s.toLowerCase(Locale.ROOT).replaceAll("\\.(ttf|otf)$", "").replaceAll("[^a-z0-9]", "");
+    }
+
+    private void resolveFont(FontOpt o) {
+        if (o.resolved) return;
+        o.resolved = true;
+        if (o.keys == null) return;
+        String regFile = null, boldFile = null;
+        for (String f : fontAssetList()) {
+            String lf = f.toLowerCase(Locale.ROOT);
+            if (!lf.endsWith(".ttf") && !lf.endsWith(".otf")) continue;
+            String n = normName(f);
+            boolean hit = false;
+            for (String k : o.keys) if (n.contains(k)) { hit = true; break; }
+            if (!hit) continue;
+            boolean isBold = n.endsWith("bd") || n.contains("bold");
+            if (isBold) { if (boldFile == null) boldFile = f; }
+            else if (regFile == null) regFile = f;
+        }
+        if (regFile == null) regFile = boldFile;            // مثلاً BTitrBd.ttf تنها فایلِ موجود است
+        if (regFile == null) { Log.w(TAG, "font file not found in assets/fonts for " + o.id); return; }
+        try {
+            o.reg = Typeface.createFromAsset(getAssets(), "fonts/" + regFile);
+            if (boldFile != null && !boldFile.equals(regFile)) o.bold = Typeface.createFromAsset(getAssets(), "fonts/" + boldFile);
+            else o.bold = o.noBold ? o.reg : Typeface.create(o.reg, Typeface.BOLD);
+        } catch (Throwable t) {
+            Log.w(TAG, "font load failed: " + regFile, t);
+            o.reg = null; o.bold = null;
+        }
+    }
+
+    private boolean fontAvailable(FontOpt o) {
+        if (o.keys == null) return true;                    // فونتِ سیستم
+        resolveFont(o);
+        return o.reg != null;
+    }
+
+    private Typeface typefaceOf(FontOpt o, boolean bold) {
+        if (o.keys != null) {
+            resolveFont(o);
+            if (o.reg != null) return bold && o.bold != null ? o.bold : o.reg;
+        }
+        return Typeface.create(o.sys, bold ? Typeface.BOLD : Typeface.NORMAL);
+    }
+
+    private static FontOpt fontById(FontOpt[] arr, String id) {
+        for (FontOpt o : arr) if (o.id.equals(id)) return o;
+        return arr[0];
+    }
+
+    private static boolean hasArabicScript(CharSequence s) {
+        if (s == null) return false;
+        for (int i = 0, n = s.length(); i < n; i++) {
+            char c = s.charAt(i);
+            if ((c >= 0x0600 && c <= 0x06FF) || (c >= 0x0750 && c <= 0x077F)
+                    || (c >= 0xFB50 && c <= 0xFDFF) || (c >= 0xFE70 && c <= 0xFEFF)) return true;
+        }
+        return false;
+    }
+
     /** اندازه + نوعِ فونتِ یک TextView را ثبت و اعمال می‌کند (برای تغییرِ بعدیِ یک‌جا). */
     private void style(TextView t, float baseSp, boolean bold) {
-        t.setTag(new float[]{baseSp, bold ? 1f : 0f});
+        t.setTag(new float[]{baseSp, bold ? 1f : 0f, 0f});
+        applyStyle(t);
+    }
+
+    /** مثلِ style، ولی برای «متنِ محتوا» (جمله، ترجمه، لغت، معنی): فونتِ انتخابی‌ی فارسی/انگلیسی روی آن اعمال می‌شود. */
+    private void styleC(TextView t, float baseSp, boolean bold) {
+        t.setTag(new float[]{baseSp, bold ? 1f : 0f, 1f});
         applyStyle(t);
     }
 
@@ -1783,8 +2135,18 @@ public class BubbleService extends Service {
         Object tag = t.getTag();
         if (!(tag instanceof float[])) return;
         float[] st = (float[]) tag;
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, st[0] * fontScale);
-        t.setTypeface(Typeface.create(FONT_FAMILIES[fontIdx], st[1] > 0 ? Typeface.BOLD : Typeface.NORMAL));
+        boolean bold = st[1] > 0;
+        FontOpt o = null;
+        if (st.length > 2 && st[2] > 0) {
+            o = hasArabicScript(t.getText()) ? fontById(FA_FONTS, fontFaId) : fontById(EN_FONTS, fontEnId);
+        }
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, st[0] * fontScale * (o != null ? o.sizeMul : 1f));
+        if (o == null) {
+            t.setTypeface(Typeface.create((String) null, bold ? Typeface.BOLD : Typeface.NORMAL));
+            return;
+        }
+        t.setTypeface(typefaceOf(o, bold && !o.noBold));
+        t.setLineSpacing(0f, o.tall ? 1.3f : 1f);           // نستعلیق بلند است؛ بدونِ این، بالا/پایینِ حروف بریده می‌شود
     }
 
     private void restyle(View v) {
@@ -1810,18 +2172,109 @@ public class BubbleService extends Service {
         if (persist) saveViewPrefs();
     }
 
-    private void cycleFont() {
-        fontIdx = (fontIdx + 1) % FONT_FAMILIES.length;
+    // ── ردیفِ انتخابِ فونت (زیرِ هدرِ پنل) ──
+
+    private View buildFontRow() {
+        fontRow = new LinearLayout(this);
+        fontRow.setOrientation(LinearLayout.VERTICAL);
+        fontRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        fontRow.setVisibility(View.GONE);
+        fontRow.setPadding(0, dp(2), 0, dp(6));
+        faChips.clear(); enChips.clear();
+        fontRow.addView(fontLine("فارسی", FA_FONTS, true));
+        fontRow.addView(fontLine("English", EN_FONTS, false));
+        refreshFontChips();
+        return fontRow;
+    }
+
+    private View fontLine(String label, FontOpt[] opts, boolean fa) {
+        LinearLayout line = new LinearLayout(this);
+        line.setOrientation(LinearLayout.HORIZONTAL);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        line.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        line.setPadding(0, dp(2), 0, dp(2));
+
+        TextView lb = new TextView(this);
+        lb.setText(label);
+        lb.setTextColor(COLOR_GOLD);
+        lb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        lb.setTypeface(Typeface.DEFAULT_BOLD);
+        lb.setMinWidth(dp(50));
+        line.addView(lb, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        hs.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        LinearLayout chips = new LinearLayout(this);
+        chips.setOrientation(LinearLayout.HORIZONTAL);
+        chips.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        for (FontOpt o : opts) {
+            if (o.optional && !fontAvailable(o)) continue;
+            TextView c = fontChip(o, fa);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMarginEnd(dp(6));
+            chips.addView(c, lp);
+            (fa ? faChips : enChips).add(c);
+        }
+        hs.addView(chips, new ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        line.addView(hs, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        return line;
+    }
+
+    private TextView fontChip(final FontOpt o, final boolean fa) {
+        TextView c = new TextView(this);
+        c.setTag(o);
+        c.setText(fa ? o.faLabel : o.enLabel);
+        c.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13 * (fa ? o.sizeMul : 1f));
+        c.setGravity(Gravity.CENTER);
+        c.setSingleLine(true);
+        c.setPadding(dp(12), dp(o.tall ? 8 : 5), dp(12), dp(o.tall ? 8 : 5));
+        c.setLineSpacing(0f, o.tall ? 1.25f : 1f);
+        c.setTypeface(typefaceOf(o, false));                 // پیش‌نمایش: نامِ هر فونت با خودِ همان فونت
+        c.setOnClickListener(v -> pickFont(o, fa));
+        return c;
+    }
+
+    private void refreshFontChips() {
+        paintChips(faChips, fontFaId);
+        paintChips(enChips, fontEnId);
+    }
+
+    private void paintChips(ArrayList<TextView> chips, String sel) {
+        for (TextView c : chips) {
+            FontOpt o = (FontOpt) c.getTag();
+            boolean on = o.id.equals(sel);
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(14));
+            g.setColor(on ? COLOR_GOLD : Color.parseColor("#26FFFFFF"));
+            c.setBackground(g);
+            c.setTextColor(on ? Color.parseColor("#1C2541") : Color.WHITE);
+            c.setAlpha(fontAvailable(o) ? 1f : 0.4f);
+        }
+    }
+
+    private void pickFont(FontOpt o, boolean fa) {
+        if (!fontAvailable(o)) {
+            showNotice(msg("فایلِ فونتِ «" + o.faLabel + "» داخل assets/fonts پیدا نشد",
+                    "Font file for " + o.enLabel + " not found in assets/fonts"));
+            return;
+        }
+        if (fa) fontFaId = o.id; else fontEnId = o.id;
+        refreshFontChips();
         relayoutAfterStyle();
         saveViewPrefs();
-        showNotice(msg(FONT_NAMES[fontIdx][0], FONT_NAMES[fontIdx][1]));
     }
 
     private void resetView() {
-        fontScale = 1f; fontIdx = 0; panelHFrac = 0.42f; panelWFrac = -1f; panelAlpha = 1f;
+        fontScale = 1f; fontFaId = "fa_default"; fontEnId = "en_default";
+        panelHFrac = 0.42f; panelWFrac = -1f; panelAlpha = 1f;
         if (opacityBar != null) opacityBar.setProgress(100);
         applyPanelAlpha();
         applyScrollMax();
+        refreshFontChips();
         relayoutAfterStyle();
         saveViewPrefs();
         showNotice(msg("اندازه و فونت به حالت اولیه برگشت", "Size and font reset"));
@@ -1906,7 +2359,7 @@ public class BubbleService extends Service {
 
         e.tvSrc = new TextView(this);
         e.tvSrc.setTextColor(Color.parseColor("#C8CCD8"));
-        style(e.tvSrc, 13, false);
+        styleC(e.tvSrc, 13, false);
         e.tvSrc.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         e.tvSrc.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
 
@@ -1999,7 +2452,7 @@ public class BubbleService extends Service {
 
         TextView tv = new TextView(this);
         tv.setTextColor(Color.WHITE);
-        style(tv, 16, true);
+        styleC(tv, 16, true);
         tv.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
         tv.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
 
@@ -2057,6 +2510,7 @@ public class BubbleService extends Service {
         CharSequence cur = tv.getText();
         if (!(cur instanceof Spanned) && cur.toString().equals(v)) return;
         tv.setText(v);
+        applyStyle(tv);
     }
 
     private void updateScrollFreeze() {
@@ -3529,6 +3983,7 @@ public class BubbleService extends Service {
         MediaProjection mp = mediaProjection; mediaProjection = null;
         if (mp != null) { try { mp.stop(); } catch (Exception ignored) {} }
         removePanel();
+        removeCloseTargetNow();
         if (bubble != null && wm != null) {
             try { wm.removeView(bubble); } catch (Exception ignored) {}
         }
