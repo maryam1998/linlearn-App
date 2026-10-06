@@ -4322,4 +4322,62 @@ public class BubbleService extends Service {
             ResponseBody rb = r.body();
             String resp = rb == null ? "" : rb.string();
             if (!r.isSuccessful()) throw new HttpStatusException(r.code(), resp);
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
+        return resp;
+        }
+    }
+
+    /** پیامِ کوتاه و قابل‌فهم از یک خطا برای نمایش در کادر. */
+    private static String briefErr(Throwable e) {
+        if (e == null) return "error";
+        if (e instanceof HttpStatusException) return "HTTP " + ((HttpStatusException) e).code;
+        if (e instanceof UnknownHostException) return "no internet";
+        if (e instanceof SocketTimeoutException) return "timeout";
+        String m = e.getMessage();
+        if (m == null || m.isEmpty()) m = e.getClass().getSimpleName();
+        m = m.replace('\n', ' ').trim();
+        return m.length() > 80 ? m.substring(0, 80) + "…" : m;
+    }
+
+    /** بستنِ کاملِ سرویس (✕ روی حباب / ACTION_HIDE). */
+    private void shutdown() {
+        running = false;
+        main.removeCallbacks(idleRunnable);
+        try { stopForeground(true); } catch (Exception ignored) {}
+        stopSelf();
+    }
+
+    /** آزاد کردنِ همه‌ی منابع؛ از onDestroy صدا زده می‌شود. */
+    private void cleanup() {
+        running = false;
+        if (instance == this) instance = null;
+        main.removeCallbacksAndMessages(null);
+
+        try { stopYoutube(false); } catch (Throwable ignored) {}
+
+        recording = false;
+        if (micEngine) {
+            micEngine = false;
+            try { SpeechHostActivity.finishIfRunning(); } catch (Throwable ignored) {}
+            try { PcmFeed.close(); } catch (Throwable ignored) {}
+        }
+        releaseSherpa();
+        AudioRecord r = record; record = null;
+        if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
+        MediaProjection mp = mediaProjection; mediaProjection = null;
+        if (mp != null) { try { mp.stop(); } catch (Exception ignored) {} }
+
+        try { PanelTts.stop(this); } catch (Throwable ignored) {}
+        if (pulse != null) { try { pulse.cancel(); } catch (Exception ignored) {} pulse = null; }
+
+        removePanel();
+        removeCloseTargetNow();
+        if (bubble != null && wm != null) { try { wm.removeView(bubble); } catch (Exception ignored) {} }
+        bubble = null;
+
+        closeLocalTranslator();
+        net.shutdownNow();
+        netTr.shutdownNow();
+        netPartial.shutdownNow();
+        sttPartialEx.shutdownNow();
+    }
+}
