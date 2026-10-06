@@ -3386,21 +3386,13 @@ public class BubbleService extends Service {
             final boolean hasSource = np != null && np.title != null && !np.title.isEmpty();
             final boolean useMedia = hasSource && counted > 0 && withPos * 5 >= counted * 4;   // ≥۸۰٪ جمله‌ها موقعیتِ پلیر دارند
 
+            // 🔒 کپی‌رایت: متنِ صدا/ویدیو (و ترجمه‌اش) ذخیره نمی‌شود؛ فقط منبع (برنامه + عنوان + لینک) تا
+            //    کاربر بعداً همان برنامه/لینک را دوباره باز کند.
             JSONArray lines = new JSONArray();
-            for (Entry e : snap) {
-                if (e == live || e.src == null || e.src.trim().isEmpty()) continue;   // جمله‌ی نیمه‌کاره/خالی
-                JSONObject tr = new JSONObject();
-                for (String t : ts) {
-                    String v = e.tr.get(t);
-                    if (v == null || v.trim().isEmpty() || v.equals("…") || v.equals(offFa) || v.equals(offEn)) continue;
-                    tr.put(t, v);
-                }
-                double t = (useMedia && e.mediaPosMs >= 0)
-                        ? e.mediaPosMs / 1000.0
-                        : Math.max(0, e.createdAt - liveStartMs) / 1000.0;
-                lines.put(new JSONObject().put("t", t).put("s", e.src.trim()).put("tr", tr));
+            if (!hasSource) {
+                showNotice(msg("منبعی (برنامه/لینک) برای ذخیره پیدا نشد", "No source (app/link) found to save"));
+                return;
             }
-            if (lines.length() == 0) { showNotice(msg("هنوز چیزی برای ذخیره نیست", "Nothing to save yet")); return; }
             long now = System.currentTimeMillis();
             java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
             fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
@@ -3433,7 +3425,7 @@ public class BubbleService extends Service {
             }
             boolean ok = YtSaved.add(this, item);
             showNotice(ok
-                    ? msg("ذخیره شد ✓ (" + lines.length() + " خط) — در «داستان‌های ذخیره‌شده» اپ", "Saved ✓ (" + lines.length() + " lines) — see Saved stories in the app")
+                    ? msg("منبع ذخیره شد ✓ — در «داستان‌های ذخیره‌شده» اپ", "Source saved ✓ — see Saved stories in the app")
                     : msg("ذخیره نشد", "Save failed"));
         } catch (Throwable t) {
             showNotice(msg("ذخیره نشد", "Save failed"));
@@ -3450,10 +3442,9 @@ public class BubbleService extends Service {
                 showNotice(msg("هنوز زیرنویسی برای ذخیره نیست", "Nothing to save yet"));
                 return;
             }
-            int n = snap.getJSONArray("lines").length();
             boolean ok = YtSaved.add(this, snap);
             showNotice(ok
-                    ? msg("ذخیره شد ✓ (" + n + " خط) — در «داستان‌های ذخیره‌شده» اپ", "Saved ✓ (" + n + " lines) — see Saved stories in the app")
+                    ? msg("لینکِ ویدیو ذخیره شد ✓ — در «داستان‌های ذخیره‌شده» اپ", "Video link saved ✓ — see Saved stories in the app")
                     : msg("ذخیره نشد", "Save failed"));
         } catch (Throwable t) {
             showNotice(msg("ذخیره نشد", "Save failed"));

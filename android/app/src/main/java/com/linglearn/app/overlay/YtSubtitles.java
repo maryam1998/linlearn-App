@@ -160,25 +160,13 @@ final class YtSubtitles {
     void setOffsetMs(long ms) { offsetMs = ms; }
 
     /**
-     * 💾 عکسِ فوریِ جلسه برای ذخیره در «داستان‌های ذخیره‌شده»: «کلِ» زیرنویسِ ویدیو (حتی خط‌هایی که هنوز
-     * نخوانده/پخش نشده‌اند، به ترتیبِ زمان) + ترجمه‌هایی که تا الان رسیده + لینکِ ویدیو. null = هنوز چیزی برای ذخیره نیست.
-     * فقط روی main thread صدا بزن.
+     * 💾 ذخیره در «داستان‌های ذخیره‌شده»: فقط «لینکِ ویدیو + عنوان + کانال» (بدونِ هیچ متن/زیرنویس/ترجمه‌ای،
+     * برای رعایتِ کپی‌رایت). null = هنوز ویدیویی تشخیص داده نشده. فقط روی main thread صدا بزن.
      */
     JSONObject snapshot() throws Exception {
-        if (cues.isEmpty() || curVideoId.isEmpty()) return null;
+        if (curVideoId.isEmpty()) return null;
         List<String> ls = langs();
-        JSONArray lines = new JSONArray();
-        for (int idx = 0; idx < cues.size(); idx++) {
-            Cue c = cues.get(idx);
-            if (c.text == null || c.text.trim().isEmpty()) continue;
-            JSONObject tr = new JSONObject();
-            for (String lang : ls) {
-                String[] a = trs.get(lang);
-                if (a != null && idx < a.length && a[idx] != null && !a[idx].trim().isEmpty()) tr.put(lang, a[idx]);
-            }
-            lines.put(new JSONObject().put("t", c.startMs / 1000.0).put("s", c.text).put("tr", tr));
-        }
-        if (lines.length() == 0) return null;
+        JSONArray lines = new JSONArray();     // عمداً خالی: متنِ زیرنویس ذخیره نمی‌شود
         long now = System.currentTimeMillis();
         java.text.SimpleDateFormat fmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
         fmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
