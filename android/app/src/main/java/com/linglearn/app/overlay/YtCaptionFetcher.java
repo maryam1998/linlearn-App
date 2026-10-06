@@ -207,7 +207,12 @@ final class YtCaptionFetcher {
             + "var WANT='" + want + "';"
             + "function sl(ms){return new Promise(function(r){setTimeout(r,ms);});}"
             + "function fail(m,nc){try{LL.fail(String(m),!!nc);}catch(e){}}"
-            + "function pick(tr){var best=null,any=null,asr=null;"
+            + "function lcOf(t){return String(t.languageCode||'').toLowerCase().split('-')[0];}"
+            + "function pickAuto(tr){var a=null,m=null,f=null;"
+            +   "for(var i=0;i<tr.length;i++){var t=tr[i];if(!f)f=t;if(t.kind==='asr'){if(!a)a=t;}else if(!m)m=t;}"
+            +   "if(a){var al=lcOf(a);for(var j=0;j<tr.length;j++){if(tr[j].kind!=='asr'&&lcOf(tr[j])===al)return tr[j];}return a;}"
+            +   "return m||f;}"
+            + "function pick(tr){if(WANT==='auto')return pickAuto(tr);var best=null,any=null,asr=null;"
             +   "for(var i=0;i<tr.length;i++){var t=tr[i];var lc=String(t.languageCode||'').toLowerCase().split('-')[0];"
             +     "if(!any)any=t;"
             +     "if(lc===WANT){if(t.kind!=='asr')return t;if(!asr)asr=t;}"
@@ -225,7 +230,7 @@ final class YtCaptionFetcher {
             +   "var tl=pr.captions&&pr.captions.playerCaptionsTracklistRenderer;"
             +   "var tracks=tl&&tl.captionTracks;"
             +   "if(!tracks||!tracks.length){fail('webview: no caption tracks',true);return;}"
-            +   "var t=pick(tracks);"
+            +   "var t=pick(tracks);if(WANT==='auto')WANT=lcOf(t);"
             +   "var u=new URL(t.baseUrl,location.href);u.searchParams.set('fmt','json3');"
             +   "var x=await get(u.toString());"
             +   "if(good(x)){LL.ok(t.languageCode||WANT,t.kind==='asr',x);return;}"
@@ -425,8 +430,36 @@ final class YtCaptionFetcher {
         return new Out(lang, auto, cues);
     }
 
+    /**
+     * 🌍 زبانِ اصلیِ ویدیو (وقتی wantLang = "auto"): یوتیوب زیرنویسِ خودکار (asr) را همیشه به زبانِ گفتارِ ویدیو
+     * می‌سازد؛ پس زبانِ گفتار = زبانِ ترکِ asr. اگر یک ترکِ دستی هم به همان زبان بود، آن را (باکیفیت‌تر) برمی‌داریم.
+     * اگر ترکِ asr نبود، اولین ترکِ دستی (زبانِ آپلودکننده) انتخاب می‌شود.
+     */
+    private static JSONObject pickOriginal(JSONArray tracks) {
+        JSONObject asr = null, firstManual = null, first = null;
+        for (int i = 0; i < tracks.length(); i++) {
+            JSONObject t = tracks.optJSONObject(i);
+            if (t == null) continue;
+            if (first == null) first = t;
+            boolean isAsr = "asr".equals(t.optString("kind", ""));
+            if (isAsr && asr == null) asr = t;
+            if (!isAsr && firstManual == null) firstManual = t;
+        }
+        if (asr != null) {
+            String spoken = normLang(asr.optString("languageCode", ""));
+            for (int i = 0; i < tracks.length(); i++) {
+                JSONObject t = tracks.optJSONObject(i);
+                if (t != null && !"asr".equals(t.optString("kind", ""))
+                        && normLang(t.optString("languageCode", "")).equals(spoken)) return t;
+            }
+            return asr;
+        }
+        return firstManual != null ? firstManual : first;
+    }
+
     private static JSONObject pickTrack(JSONArray tracks, String wantLang) {
         String want = normLang(wantLang);
+        if ("auto".equals(want)) return pickOriginal(tracks);
         JSONObject manualAny = null, first = null;
         for (int i = 0; i < tracks.length(); i++) {
             JSONObject t = tracks.optJSONObject(i);

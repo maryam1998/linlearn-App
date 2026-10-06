@@ -360,9 +360,9 @@ final class YtSubtitles {
         curTitle = title == null ? "" : title;
         curVideoId = videoId;
         final int g = gen;
-        String want = host.requestedSource();
-        if (want == null || want.isEmpty() || "auto".equals(want)) want = "en";
-        final String wantLang = want;
+        // 🌍 زبانِ زیرنویس همیشه از خودِ ویدیو تشخیص داده می‌شود ("auto")؛ «زبان صدا»ی تنظیمات فقط برای
+        //    تشخیصِ گفتار (STT) است و نباید ترکِ زیرنویسِ یوتیوب را به انگلیسی قفل کند.
+        final String wantLang = "auto";
         final String cacheKey = videoId + "|" + wantLang;
         netCaps.execute(() -> {
             YtCaptionFetcher.Out got = capCache.get(cacheKey);

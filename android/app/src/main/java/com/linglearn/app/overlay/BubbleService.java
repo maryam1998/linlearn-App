@@ -557,7 +557,9 @@ public class BubbleService extends Service {
             }
         }
         if (out.isEmpty()) out.add(targetLang());
-        String src = effectiveSource();
+        // در حالتِ یوتیوب، «زبانِ مبدأ» = زبانِ زیرنویسِ همان ویدیو (مثلاً es)، نه زبانِ صدای تنظیمات؛
+        // وگرنه برای ویدیوی غیرانگلیسی، «انگلیسی» به‌اشتباه از ترجمه‌ها حذف می‌شد.
+        String src = (yt != null && yt.isActive()) ? yt.trackLang() : effectiveSource();
         if (src != null && !"auto".equals(src)) out.remove(src);
         return out;
     }
@@ -3514,6 +3516,7 @@ public class BubbleService extends Service {
         @Override public void loadAll(final List<String> sentences, final Map<String, String[]> tr, final int cur) {
             if (wm == null || bubble == null) return;
             clearStatus();
+            refreshHeader();     // زبانِ زیرنویسِ ویدیو معلوم شد → فهرستِ زبان‌های مقصدِ هدر را تازه کن
             final int g = ++ytListGen;
             clearHistory();
             ytEntries.clear();
