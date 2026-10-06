@@ -3383,6 +3383,15 @@ public class BubbleService extends Service {
             }
             YtMedia.Now np = null;
             try { np = YtMedia.nowPlaying(this); } catch (Throwable ignored) {}
+            // برنامه‌هایی مثلِ اینستاگرام/تیک‌تاک/تلگرام معمولاً MediaSession (عنوان) نمی‌دهند؛ اگر چیزی «در حالِ پخش»
+            // نبود، برنامه‌ی مبدأ را از روی آخرین برنامه‌ی جلوی صفحه می‌گیریم (فقط نامِ برنامه، نه محتوا).
+            if (np == null || !np.playing) {
+                try {
+                    YtMedia.Now fg = YtMedia.foregroundApp(this);
+                    if (fg != null && (np == null || !fg.pkg.equals(np.pkg))) np = fg;
+                } catch (Throwable ignored) {}
+            }
+            if (np != null && (np.title == null || np.title.isEmpty())) np.title = (np.app == null || np.app.isEmpty()) ? np.pkg : np.app;
             final boolean hasSource = np != null && np.title != null && !np.title.isEmpty();
             final boolean useMedia = hasSource && counted > 0 && withPos * 5 >= counted * 4;   // ≥۸۰٪ جمله‌ها موقعیتِ پلیر دارند
 
@@ -3390,7 +3399,13 @@ public class BubbleService extends Service {
             //    کاربر بعداً همان برنامه/لینک را دوباره باز کند.
             JSONArray lines = new JSONArray();
             if (!hasSource) {
-                showNotice(msg("منبعی (برنامه/لینک) برای ذخیره پیدا نشد", "No source (app/link) found to save"));
+                if (!YtMedia.hasUsageAccess(this)) {
+                    showNotice(msg("برای ذخیره‌ی برنامه‌ی مبدأ (اینستاگرام، تیک‌تاک، تلگرام…) «دسترسی به آمار استفاده» را برای این برنامه روشن کن و دوباره ذخیره را بزن",
+                            "To save the source app (Instagram, TikTok, Telegram…), turn on “Usage access” for this app, then tap save again"));
+                    YtMedia.openUsageAccessSettings(this);
+                } else {
+                    showNotice(msg("برنامه‌ی مبدأ پیدا نشد", "Couldn't find the source app"));
+                }
                 return;
             }
             long now = System.currentTimeMillis();

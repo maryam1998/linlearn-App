@@ -365,6 +365,74 @@ public class YtMedia extends NotificationListenerService {
         return n;
     }
 
+    // ───────── برنامه‌ی مبدأ از روی «آخرین برنامه‌ی جلوی صفحه» (برای برنامه‌هایی که MediaSession ندارند) ─────────
+
+    /** آیا «دسترسی به آمار استفاده» برای این اپ روشن است؟ */
+    public static boolean hasUsageAccess(Context ctx) {
+        try {
+            android.app.AppOpsManager ao = (android.app.AppOpsManager) ctx.getSystemService(Context.APP_OPS_SERVICE);
+            if (ao == null) return false;
+            int mode = Build.VERSION.SDK_INT >= 29
+                    ? ao.unsafeCheckOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), ctx.getPackageName())
+                    : ao.checkOpNoThrow(android.app.AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), ctx.getPackageName());
+            return mode == android.app.AppOpsManager.MODE_ALLOWED;
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
+    public static void openUsageAccessSettings(Context ctx) {
+        try {
+            ctx.startActivity(new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * آخرین برنامه‌ای که کاربر در آن بوده (اینستاگرام، تیک‌تاک، تلگرام، مرورگر…)، به‌جز خودِ این اپ، لانچر و SystemUI.
+     * فقط نامِ برنامه و پکیج؛ هیچ متنی از محتوا خوانده نمی‌شود. null = دسترسی نیست یا چیزی پیدا نشد.
+     */
+    public static Now foregroundApp(Context ctx) {
+        try {
+            if (!hasUsageAccess(ctx)) return null;
+            Context app = ctx.getApplicationContext();
+            android.app.usage.UsageStatsManager um = (android.app.usage.UsageStatsManager) app.getSystemService(Context.USAGE_STATS_SERVICE);
+            if (um == null) return null;
+            java.util.HashSet<String> skip = new java.util.HashSet<>();
+            skip.add(app.getPackageName());
+            skip.add("com.android.systemui");
+            try {
+                android.content.pm.ResolveInfo home = app.getPackageManager().resolveActivity(
+                        new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0);
+                if (home != null && home.activityInfo != null) skip.add(home.activityInfo.packageName);
+            } catch (Throwable ignored) {}
+            long end = System.currentTimeMillis();
+            android.app.usage.UsageEvents ev = um.queryEvents(end - 30L * 60_000L, end);
+            android.app.usage.UsageEvents.Event e = new android.app.usage.UsageEvents.Event();
+            String last = null;
+            while (ev != null && ev.hasNextEvent()) {
+                ev.getNextEvent(e);
+                if (e.getEventType() != android.app.usage.UsageEvents.Event.MOVE_TO_FOREGROUND) continue;
+                String p = e.getPackageName();
+                if (p == null || skip.contains(p)) continue;
+                last = p;
+            }
+            if (last == null) return null;
+            Now n = new Now();
+            n.pkg = last;
+            try {
+                android.content.pm.PackageManager pm = app.getPackageManager();
+                n.app = String.valueOf(pm.getApplicationLabel(pm.getApplicationInfo(last, 0)));
+            } catch (Throwable t) {
+                n.app = last;
+            }
+            n.title = n.app;
+            return n;
+        } catch (Throwable e) {
+            Log.d(TAG, "foregroundApp failed: " + e);
+            return null;
+        }
+    }
+
     private static Now adjust(Now n, long ageMs) {
         if (n == null) return null;
         Now c = new Now();
