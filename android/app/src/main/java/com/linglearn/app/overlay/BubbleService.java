@@ -319,7 +319,7 @@ public class BubbleService extends Service {
     // ── نمایش/پنهان‌شدنِ خودکارِ کادر ───────────────────────────────────────
     // وقتی چیزی پخش نمی‌شه (ویدیو pause، صدا قطع، یا ضبط متوقف شد) کادر خودش جمع می‌شه و
     // با شروعِ دوباره‌ی پخش خودش برمی‌گرده. بستنِ دستی با ▾ همچنان تا لمسِ حباب پنهان می‌مونه.
-    private static final long IDLE_HIDE_MS = 7000;
+    private static final long IDLE_HIDE_MS = 1000;   // بعد از قطعِ صدا/ویدیو کادر تقریباً بلافاصله بسته می‌شه
     private volatile long lastVoiceMs = 0;   // آخرین لحظه‌ای که صدایی از سیستم شنیده شد
     private volatile long lastTextMs = 0;    // آخرین لحظه‌ای که متنِ تشخیص‌داده‌شده رسید
     private volatile long lastActiveMs = 0;  // آخرین لحظه‌ای که «چیزی در حالِ پخش» یا کاربر مشغول بود
@@ -329,7 +329,7 @@ public class BubbleService extends Service {
     private boolean somethingPlaying(long now) {
         YtSubtitles y = yt;
         if (y != null && y.isPlaying()) return true;
-        return recording && (now - lastVoiceMs < 2000 || now - lastTextMs < 3000);
+        return recording && (now - lastVoiceMs < 1200 || now - lastTextMs < 2000);
     }
 
     private void idleTick() {
@@ -357,6 +357,8 @@ public class BubbleService extends Service {
         idleHidden = false;
         userHidden = false;
         lastActiveMs = SystemClock.elapsedRealtime();
+        // ویدیو/صدای تازه شروع شد → متن‌های ویدیوی قبلی پاک بشن (در حالتِ یوتیوب، فهرستِ همان ویدیو دست نمی‌خوره)
+        if (yt == null && !history.isEmpty()) clearHistory();
         showPanel();
         if (yt != null && ytCur >= 0) {
             ytWantedForce = true;
@@ -3385,12 +3387,6 @@ public class BubbleService extends Service {
             try { np = YtMedia.nowPlaying(this); } catch (Throwable ignored) {}
             // برنامه‌هایی مثلِ اینستاگرام/تیک‌تاک/تلگرام معمولاً MediaSession (عنوان) نمی‌دهند؛ اگر چیزی «در حالِ پخش»
             // نبود، برنامه‌ی مبدأ را از روی آخرین برنامه‌ی جلوی صفحه می‌گیریم (فقط نامِ برنامه، نه محتوا).
-            if (np == null || !np.playing) {
-                try {
-                    YtMedia.Now fg = YtMedia.foregroundApp(this);
-                    if (fg != null && (np == null || !fg.pkg.equals(np.pkg))) np = fg;
-                } catch (Throwable ignored) {}
-            }
             if (np != null && (np.title == null || np.title.isEmpty())) np.title = (np.app == null || np.app.isEmpty()) ? np.pkg : np.app;
             final boolean hasSource = np != null && np.title != null && !np.title.isEmpty();
             final boolean useMedia = hasSource && counted > 0 && withPos * 5 >= counted * 4;   // ≥۸۰٪ جمله‌ها موقعیتِ پلیر دارند
@@ -3399,13 +3395,8 @@ public class BubbleService extends Service {
             //    کاربر بعداً همان برنامه/لینک را دوباره باز کند.
             JSONArray lines = new JSONArray();
             if (!hasSource) {
-                if (!YtMedia.hasUsageAccess(this)) {
-                    showNotice(msg("برای ذخیره‌ی برنامه‌ی مبدأ (اینستاگرام، تیک‌تاک، تلگرام…) «دسترسی به آمار استفاده» را برای این برنامه روشن کن و دوباره ذخیره را بزن",
-                            "To save the source app (Instagram, TikTok, Telegram…), turn on “Usage access” for this app, then tap save again"));
-                    YtMedia.openUsageAccessSettings(this);
-                } else {
-                    showNotice(msg("برنامه‌ی مبدأ پیدا نشد", "Couldn't find the source app"));
-                }
+                showNotice(msg("برای ذخیره‌ی اینستاگرام/تیک‌تاک/…: در همان برنامه «Share ← Hope» را بزن",
+                        "For Instagram/TikTok/…: use “Share → Hope” inside that app"));
                 return;
             }
             long now = System.currentTimeMillis();
@@ -3501,7 +3492,13 @@ public class BubbleService extends Service {
         if (engine == null) return;
         refreshHeader();
         updateYtButton();
-        if (notify) showNotice(msg("زیرنویس یوتیوب خاموش شد", "YouTube subtitles off"));
+        if (!recording) {          // خروج از حالتِ ویدیو → کادر هم همان لحظه بسته بشه و متنِ ویدیو پاک بشه
+            clearHistory();
+            removePanel();
+            userHidden = false;
+        } else if (notify) {
+            showNotice(msg("زیرنویس یوتیوب خاموش شد", "YouTube subtitles off"));
+        }
     }
 
     private final YtSubtitles.Host ytHost = new YtSubtitles.Host() {
