@@ -26,6 +26,7 @@ import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
+import android.media.MediaPlayer;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.ConnectivityManager;
@@ -1092,6 +1093,99 @@ public class BubbleService extends Service {
             super.onScrollChanged(l, t, oldl, oldt);
             View c = getChildAt(0);
             if (c != null) atBottom = c.getHeight() - (getHeight() + getScrollY()) < 60;
+        }
+    }
+
+    // ---------- 🎙 shadowing: ضبطِ صدای کاربر و پخشِ دوباره ----------
+    private TextView tvShadowRec, tvShadowPlay;
+    private boolean shadowRecording = false;
+    private String shadowPath = null;
+    private MediaPlayer shadowPlayer;
+
+    private void updateShadowUi() {
+        if (tvShadowRec != null) {
+            tvShadowRec.setText(shadowRecording ? "\u23F9" : "\uD83C\uDF99");
+            tvShadowRec.setTextColor(shadowRecording ? Color.parseColor("#FF5A5F") : Color.WHITE);
+        }
+        if (tvShadowPlay != null) {
+            tvShadowPlay.setVisibility(!shadowRecording && shadowPath != null ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private void shadowToggle() {
+        if (shadowRecording) {
+            shadowRecording = false;
+            updateShadowUi();
+            ShadowRecordActivity.stopIfRunning();
+            return;
+        }
+        shadowStopPlayback();
+        try {
+            Intent i = new Intent(this, ShadowRecordActivity.class)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+            startActivity(i);
+            shadowRecording = true;
+            shadowPath = null;
+            updateShadowUi();
+            lastActiveMs = SystemClock.elapsedRealtime();
+        } catch (Exception e) {
+            Log.w(TAG, "shadow record start failed", e);
+            shadowRecording = false;
+            updateShadowUi();
+            showNotice(msg("⚠ ضبط شروع نشد", "⚠ Could not start recording"));
+        }
+    }
+
+    static void shadowDone(final String path) {
+        final BubbleService s = instance;
+        if (s == null) return;
+        s.uiHandlerPost(() -> {
+            s.shadowRecording = false;
+            s.shadowPath = path;
+            s.updateShadowUi();
+            if (path != null) s.shadowPlay();
+        });
+    }
+
+    static void shadowFailed(final int kind) {
+        final BubbleService s = instance;
+        if (s == null) return;
+        s.uiHandlerPost(() -> {
+            s.shadowRecording = false;
+            s.updateShadowUi();
+            s.showNotice(kind == 2
+                    ? s.msg("⚠ مجوز میکروفون لازم است", "⚠ Microphone permission required")
+                    : s.msg("⚠ ضبط انجام نشد", "⚠ Recording failed"));
+        });
+    }
+
+    private void uiHandlerPost(Runnable r) {
+        new Handler(Looper.getMainLooper()).post(r);
+    }
+
+    private void shadowPlay() {
+        if (shadowPath == null) return;
+        shadowStopPlayback();
+        try {
+            final MediaPlayer mp = new MediaPlayer();
+            mp.setDataSource(shadowPath);
+            mp.setOnCompletionListener(m -> { try { m.release(); } catch (Exception ignored) {} if (shadowPlayer == m) shadowPlayer = null; });
+            mp.setOnErrorListener((m, w, e) -> { try { m.release(); } catch (Exception ignored) {} if (shadowPlayer == m) shadowPlayer = null; return true; });
+            mp.prepare();
+            mp.start();
+            shadowPlayer = mp;
+            lastActiveMs = SystemClock.elapsedRealtime();
+        } catch (Exception e) {
+            Log.w(TAG, "shadow play failed", e);
+            shadowPlayer = null;
+        }
+    }
+
+    private void shadowStopPlayback() {
+        MediaPlayer mp = shadowPlayer; shadowPlayer = null;
+        if (mp != null) {
+            try { mp.stop(); } catch (Exception ignored) {}
+            try { mp.release(); } catch (Exception ignored) {}
         }
     }
 
@@ -2384,9 +2478,41 @@ public class BubbleService extends Service {
         cap.addView(div, new LinearLayout.LayoutParams(dp(1), dp(12)));
         cap.addView(fontStep("A+", 14, +0.1f));
         FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, dp(22), Gravity.END | Gravity.CENTER_VERTICAL);
-        clp.setMarginEnd(dp(2));
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(22),
+                (atBottom ? Gravity.START : Gravity.END) | Gravity.CENTER_VERTICAL);
+        if (atBottom) clp.setMarginStart(dp(2)); else clp.setMarginEnd(dp(2));
         f.addView(cap, clp);
+
+        // 🎙 دکمه‌ی ضبطِ shadowing (پایین-راستِ کادر)
+        if (atBottom) {
+            LinearLayout sh = new LinearLayout(this);
+            sh.setOrientation(LinearLayout.HORIZONTAL);
+            sh.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+            sh.setGravity(Gravity.CENTER_VERTICAL);
+            tvShadowPlay = new TextView(this);
+            tvShadowPlay.setText("\u25B6");
+            tvShadowPlay.setTextColor(Color.WHITE);
+            tvShadowPlay.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            tvShadowPlay.setGravity(Gravity.CENTER);
+            tvShadowPlay.setPadding(dp(10), 0, dp(10), 0);
+            tvShadowPlay.setVisibility(View.GONE);
+            tvShadowPlay.setOnClickListener(v -> shadowPlay());
+            sh.addView(tvShadowPlay, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            tvShadowRec = new TextView(this);
+            tvShadowRec.setTextColor(Color.WHITE);
+            tvShadowRec.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            tvShadowRec.setGravity(Gravity.CENTER);
+            tvShadowRec.setPadding(dp(10), 0, dp(10), 0);
+            tvShadowRec.setOnClickListener(v -> shadowToggle());
+            sh.addView(tvShadowRec, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            updateShadowUi();
+            FrameLayout.LayoutParams slp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, dp(22), Gravity.END | Gravity.CENTER_VERTICAL);
+            slp.setMarginEnd(dp(2));
+            f.addView(sh, slp);
+        }
 
         final float[] d = new float[2];      // downY, startH(frac)
         f.setOnTouchListener((v, ev) -> {
@@ -4196,48 +4322,4 @@ public class BubbleService extends Service {
             ResponseBody rb = r.body();
             String resp = rb == null ? "" : rb.string();
             if (!r.isSuccessful()) throw new HttpStatusException(r.code(), resp);
-            return resp;
-        }
-    }
-
-    private static String briefErr(Exception e) {
-        String m = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-        if (m.contains("unexpected end of stream") || m.contains("Unable to resolve host")
-                || m.contains("timed out") || m.contains("Connection reset")
-                || m.contains("Software caused connection abort")) {
-            return "Network unstable, retrying next segment";
-        }
-        return m.length() > 120 ? m.substring(0, 120) + "…" : m;
-    }
-
-    private void shutdown() { cleanup(); stopForeground(true); stopSelf(); }
-
-    private void cleanup() {
-        running = false;
-        pendingYt = false;
-        stopYoutube(false);
-        main.removeCallbacksAndMessages(null);
-        try { TransCache.get(this).flush(); } catch (Throwable ignored) {}
-        closeLocalTranslator();
-        recording = false;
-        if (micEngine) { micEngine = false; SpeechHostActivity.finishIfRunning(); }
-        releaseSherpa();
-        PcmFeed.close();
-        instance = null;
-        AudioRecord r = record; record = null;
-        if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
-        if (pulse != null) { pulse.cancel(); pulse = null; }
-        MediaProjection mp = mediaProjection; mediaProjection = null;
-        if (mp != null) { try { mp.stop(); } catch (Exception ignored) {} }
-        removePanel();
-        removeCloseTargetNow();
-        if (bubble != null && wm != null) {
-            try { wm.removeView(bubble); } catch (Exception ignored) {}
-        }
-        bubble = null;
-        net.shutdownNow();
-        netTr.shutdownNow();
-        netPartial.shutdownNow();
-        sttPartialEx.shutdownNow();
-    }
-}
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
