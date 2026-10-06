@@ -2711,7 +2711,11 @@ public class BubbleService extends Service {
         else if ("translation".equals(mode)) { showTr = !ts.isEmpty(); showSrc = ts.isEmpty() || !anyTr; }
         else { showSrc = true; showTr = !ts.isEmpty(); }
 
-        setTextIfChanged(e.tvSrc, typedSrc(e));
+        {
+            String shown = typedSrc(e);
+            if (e.src != null && shown.length() < e.src.length()) setTextTyping(e.tvSrc, shown);   // وسطِ تایپ: سبک (بدون استایل/لی‌اوتِ سنگین)
+            else setTextIfChanged(e.tvSrc, shown);
+        }
         e.srcRow.setVisibility(showSrc && !e.src.isEmpty() ? View.VISIBLE : View.GONE);
 
         for (String t : ts) {
@@ -2728,6 +2732,14 @@ public class BubbleService extends Service {
     }
 
     /** متنِ بدونِ تغییر دوباره ست نمی‌شود، و متنی که کاربر دارد انتخابش می‌کند (یا کادرِ لغتش باز است) دست‌نخورده می‌ماند. */
+    private void setTextTyping(TextView tv, String v) {
+        if (tv == null || v == null) return;
+        if (tv == cardSrcTv || tv == selectingTv || tv == speakTv) return;
+        boolean first = tv.length() == 0;
+        tv.setText(v);
+        if (first) applyStyle(tv);          // استایلِ کامل فقط برای حرفِ اول و موقعِ تمام شدنِ تایپ (setTextIfChanged)
+    }
+
     private void setTextIfChanged(TextView tv, String v) {
         if (tv == null || v == null) return;
         if (tv == cardSrcTv || tv == selectingTv || tv == speakTv) return;
@@ -2805,7 +2817,7 @@ public class BubbleService extends Service {
             int len = e.src == null ? 0 : e.src.length();
             if (e.box == null || e.shownChars >= len) { typing.remove(e); continue; }
             int back = len - e.shownChars;
-            e.shownChars += back > 120 ? 6 : back > 60 ? 3 : back > 25 ? 2 : 1;
+            e.shownChars += Math.max(1, (back + 2) / 3);   // عقب‌افتادگی خیلی سریع جبران می‌شه (~۰٫۱ ثانیه)
             renderEntry(e);                       // اگه هنوز عقبه، typedSrc دوباره اضافه‌اش می‌کنه
         }
         if (!typing.isEmpty()) scheduleType();
@@ -2815,7 +2827,7 @@ public class BubbleService extends Service {
     private void scheduleType() {
         if (typeScheduled) return;
         typeScheduled = true;
-        main.postDelayed(typeRunnable, 28);
+        main.postDelayed(typeRunnable, 16);
     }
 
     /** متنِ اصلیِ خطِ زنده: فقط تا حرفِ «رسیده» نشون داده می‌شه و بقیه یکی‌یکی ظاهر می‌شن. */
