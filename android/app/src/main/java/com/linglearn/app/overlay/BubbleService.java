@@ -303,6 +303,7 @@ public class BubbleService extends Service {
     private YtSubtitles yt;               // 📺 حالت یوتیوب (null = خاموش)
     private TextView tvYt;                // دکمه‌ی ▶ در هدرِ پنل
     private TextView tvSave;              // دکمه‌ی 💾 (هم حالت یوتیوب، هم ترجمه‌ی زنده)
+    private String lastSourceKey = "";     // پلیر|عنوانِ آخرین منبعِ صدا؛ برای نگه داشتنِ تاریخچه وقتی همان فایل ادامه پیدا می‌کند
     private String liveKey = null;        // شناسه‌ی جلسه‌ی ترجمه‌ی زنده برای ذخیره (با پاک کردنِ تاریخچه ریست می‌شود)
     private long liveStartMs = 0;
     private boolean ytListMode = false;       // 📺 لیستِ کاملِ زیرنویس در پنل است (سقفِ تاریخچه اعمال نشود)
@@ -357,8 +358,21 @@ public class BubbleService extends Service {
         idleHidden = false;
         userHidden = false;
         lastActiveMs = SystemClock.elapsedRealtime();
-        // ویدیو/صدای تازه شروع شد → متن‌های ویدیوی قبلی پاک بشن (در حالتِ یوتیوب، فهرستِ همان ویدیو دست نمی‌خوره)
-        if (yt == null && !history.isEmpty()) clearHistory();
+        // پلیرِ همان فایل (کتابِ صوتی/پادکست…) ادامه پیدا کرد → تاریخچه می‌مونه؛ منبعِ دیگه یا برنامه‌ی بدونِ MediaSession → پاک می‌شه
+        if (yt == null && !history.isEmpty()) {
+            String key = "";
+            try {
+                YtMedia.Now np = YtMedia.nowPlaying(this);
+                if (np != null && np.title != null && !np.title.isEmpty()) key = np.pkg + "|" + np.title;
+            } catch (Throwable ignored) {}
+            if (key.isEmpty() || !key.equals(lastSourceKey)) clearHistory();
+            lastSourceKey = key;
+        } else if (yt == null) {
+            try {
+                YtMedia.Now np = YtMedia.nowPlaying(this);
+                lastSourceKey = (np != null && np.title != null && !np.title.isEmpty()) ? np.pkg + "|" + np.title : "";
+            } catch (Throwable ignored) { lastSourceKey = ""; }
+        }
         showPanel();
         if (yt != null && ytCur >= 0) {
             ytWantedForce = true;
@@ -1030,6 +1044,7 @@ public class BubbleService extends Service {
     /** One recognised sentence and its translations (one per target language). */
     private static final class Entry {
         String src = "";
+        int shownChars = Integer.MAX_VALUE;   // تایپِ حرف‌به‌حرف: چند حرفِ اول نمایش داده شده (MAX = بدونِ تایپ)
         final long createdAt = System.currentTimeMillis();
         final HashMap<String, String> tr = new HashMap<>();        // lang -> shown text ("…" = pending)
         final HashMap<String, String> trSrc = new HashMap<>();     // lang -> source text that translation was made from
@@ -1459,6 +1474,9 @@ public class BubbleService extends Service {
         stopPanelSpeech();
         closeWordCard();
         history.clear();
+        typing.clear();
+        main.removeCallbacks(typeRunnable);
+        typeScheduled = false;
         liveKey = null;
         live = null;
         consumedWords = 0;
@@ -2693,7 +2711,7 @@ public class BubbleService extends Service {
         else if ("translation".equals(mode)) { showTr = !ts.isEmpty(); showSrc = ts.isEmpty() || !anyTr; }
         else { showSrc = true; showTr = !ts.isEmpty(); }
 
-        setTextIfChanged(e.tvSrc, e.src);
+        setTextIfChanged(e.tvSrc, typedSrc(e));
         e.srcRow.setVisibility(showSrc && !e.src.isEmpty() ? View.VISIBLE : View.GONE);
 
         for (String t : ts) {
@@ -2778,6 +2796,42 @@ public class BubbleService extends Service {
         return sb.toString();
     }
 
+    // ───────── ✍️ تایپِ حرف‌به‌حرفِ متنِ زنده ─────────
+    private final java.util.LinkedHashSet<Entry> typing = new java.util.LinkedHashSet<>();
+    private boolean typeScheduled = false;
+    private final Runnable typeRunnable = () -> {
+        typeScheduled = false;
+        for (Entry e : new ArrayList<>(typing)) {
+            int len = e.src == null ? 0 : e.src.length();
+            if (e.box == null || e.shownChars >= len) { typing.remove(e); continue; }
+            int back = len - e.shownChars;
+            e.shownChars += back > 120 ? 6 : back > 60 ? 3 : back > 25 ? 2 : 1;
+            renderEntry(e);                       // اگه هنوز عقبه، typedSrc دوباره اضافه‌اش می‌کنه
+        }
+        if (!typing.isEmpty()) scheduleType();
+        queueYtRefresh();
+    };
+
+    private void scheduleType() {
+        if (typeScheduled) return;
+        typeScheduled = true;
+        main.postDelayed(typeRunnable, 28);
+    }
+
+    /** متنِ اصلیِ خطِ زنده: فقط تا حرفِ «رسیده» نشون داده می‌شه و بقیه یکی‌یکی ظاهر می‌شن. */
+    private String typedSrc(Entry e) {
+        String full = e.src == null ? "" : e.src;
+        if (e.shownChars == Integer.MAX_VALUE) return full;
+        if (full.isEmpty()) return full;
+        if (e.shownChars >= full.length()) { e.shownChars = full.length(); return full; }
+        if (e.shownChars < 1) e.shownChars = 1;
+        int cut = e.shownChars;
+        if (cut < full.length() && Character.isHighSurrogate(full.charAt(cut - 1))) cut++;
+        typing.add(e);
+        scheduleType();
+        return full.substring(0, cut);
+    }
+
     private void cancelLivePending() {
         main.removeCallbacks(srcRenderRunnable);
         srcRenderScheduled = false;
@@ -2828,6 +2882,7 @@ public class BubbleService extends Service {
 
     private Entry newLiveEntry() {
         Entry e = newEntry();
+        e.shownChars = 0;                 // متنِ زنده حرف‌به‌حرف تایپ می‌شود
         try {
             YtMedia.Now n = YtMedia.nowPlaying(this);
             if (n != null && n.posMs >= 0) e.mediaPosMs = Math.max(0, n.posMs - 800);   // ~تأخیرِ تشخیصِ گفتار
