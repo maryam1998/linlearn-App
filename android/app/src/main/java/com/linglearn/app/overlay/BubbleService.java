@@ -700,7 +700,7 @@ public class BubbleService extends Service {
                         }
                         if (dragging) {
                             int nx = clamp(Math.round(startX + dx), 0, screenW() - bubbleSize);
-                            int ny = clamp(Math.round(startY + dy), 0, screenH() - bubbleSize);
+                            int ny = clamp(Math.round(startY + dy), minBubbleY(), maxBubbleY());
                             boolean hot = closeView != null
                                     && Math.hypot(nx + bubbleSize / 2f - tgtCx, ny + bubbleSize / 2f - tgtCy) < dp(84);
                             if (hot != overTarget) {
@@ -739,8 +739,9 @@ public class BubbleService extends Service {
                                 }
                             } else {
                                 bubble.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-                                if (bubble.collapseAmount() > 0.5f) dockBubble(false);   // لمسِ اولِ حبابِ نیمه‌پنهان: فقط بیرون می‌آید (کلیکِ ناخواسته ضبط را شروع نکند)
-                                else if (idleHidden && recording) { idlePinned = !somethingPlaying(SystemClock.elapsedRealtime()); reopenFromIdle(); }   // کادر خودکار بسته شده بود: لمس فقط بازش می‌کنه، ضبط را قطع نمی‌کنه
+                                // حبابِ نیمه‌پنهان در حالِ ضبط هم با «یک» لمس ضبط را قطع می‌کند (قبلاً چند لمس لازم بود و حباب دوباره جمع می‌شد)؛
+                                // فقط وقتی ضبط خاموش است لمسِ اول حباب را بیرون می‌آورد تا ضبطِ ناخواسته شروع نشود.
+                                if (bubble.collapseAmount() > 0.5f && !recording) dockBubble(false);
                                 else toggleRecording();
                             }
                         }
@@ -770,6 +771,15 @@ public class BubbleService extends Service {
         } else showPanel();
     }
 
+    /** حباب زیرِ نوارِ وضعیت و بالای نوارِ ناوبری می‌ماند تا هیچ‌وقت در گوشه‌ی بالا گیر نکند و لمس‌ناپذیر نشود. */
+    private int minBubbleY() {
+        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        int h = id > 0 ? getResources().getDimensionPixelSize(id) : dp(24);
+        return h + dp(6);
+    }
+
+    private int maxBubbleY() { return Math.max(minBubbleY(), screenH() - bubbleSize - dp(64)); }
+
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 
     private ValueAnimator dockAnim;
@@ -790,6 +800,7 @@ public class BubbleService extends Service {
         final int side = left ? -1 : 1;
         final int target = left ? -hide : screenW() - bubbleSize + hide;
         final int from = bubbleLp.x;
+        final int fromY = bubbleLp.y, toY = clamp(bubbleLp.y, minBubbleY(), maxBubbleY());
         final float c0 = bubble.collapseAmount(), c1 = collapse ? 1f : 0f;
         dockAnim = ValueAnimator.ofFloat(0f, 1f);
         dockAnim.setDuration(240);
@@ -798,6 +809,7 @@ public class BubbleService extends Service {
             if (wm == null || bubble == null) return;
             float t = (Float) a.getAnimatedValue();
             bubbleLp.x = Math.round(from + (target - from) * t);
+            bubbleLp.y = Math.round(fromY + (toY - fromY) * t);
             bubble.setDock(side, c0 + (c1 - c0) * t);
             try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
             movePanel();
@@ -1047,16 +1059,21 @@ public class BubbleService extends Service {
             rf.set(cx - r + 3.5f * d, cy - r + 3.5f * d, cx + r - 3.5f * d, cy + r - 3.5f * d);
             cv.drawArc(rf, 205f, 130f, false, shine);         // درخشِ ظریفِ نیمه‌ی بالا
 
-            // آیکونِ میکروفون؛ هنگامِ جمع‌شدن به سمتِ نیمه‌ی دیدنی می‌رود
+            // آیکونِ میکروفون؛ هنگامِ جمع‌شدن به سمتِ نیمه‌ی دیدنی می‌رود. در حالِ ضبط به‌جای آن «■ توقف» نشان داده می‌شود.
             float ix = cx - side * collapse * (w * 0.22f);
             float k = 0.85f * d;
-            rf.set(ix - 4.2f * k, cy - 11f * k, ix + 4.2f * k, cy + 2f * k);
-            cv.drawRoundRect(rf, 4.2f * k, 4.2f * k, fill);
-            line.setStrokeWidth(1.9f * k);
-            rf.set(ix - 8f * k, cy - 8f * k, ix + 8f * k, cy + 7f * k);
-            cv.drawArc(rf, 0f, 180f, false, line);
-            cv.drawLine(ix, cy + 7f * k, ix, cy + 11f * k, line);
-            cv.drawLine(ix - 4f * k, cy + 11f * k, ix + 4f * k, cy + 11f * k, line);
+            if (rec) {
+                rf.set(ix - 7f * k, cy - 7f * k, ix + 7f * k, cy + 7f * k);
+                cv.drawRoundRect(rf, 3f * k, 3f * k, fill);
+            } else {
+                rf.set(ix - 4.2f * k, cy - 11f * k, ix + 4.2f * k, cy + 2f * k);
+                cv.drawRoundRect(rf, 4.2f * k, 4.2f * k, fill);
+                line.setStrokeWidth(1.9f * k);
+                rf.set(ix - 8f * k, cy - 8f * k, ix + 8f * k, cy + 7f * k);
+                cv.drawArc(rf, 0f, 180f, false, line);
+                cv.drawLine(ix, cy + 7f * k, ix, cy + 11f * k, line);
+                cv.drawLine(ix - 4f * k, cy + 11f * k, ix + 4f * k, cy + 11f * k, line);
+            }
 
             if (rec) {                                        // نقطه‌ی قرمزِ «در حال ضبط»؛ سمتِ داخلیِ صفحه تا در حالتِ نیمه‌پنهان دیده شود
                 float bx = cx - side * r * 0.72f, by = cy + r * 0.72f;
