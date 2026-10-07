@@ -1,8 +1,13 @@
 package com.linglearn.app.overlay;
 
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.widget.Toast;
 
 import org.json.JSONArray;
@@ -24,15 +29,49 @@ public class ShareReceiverActivity extends Activity {
 
     private static final Pattern URL = Pattern.compile("(?i)\\b(https?://[^\\s\"'<>]+)");
 
+    /** از 💾 حباب: به‌جای متنِ Share، لینکِ کپی‌شده‌ی کلیپ‌بورد خوانده می‌شود. */
+    static final String EXTRA_FROM_CLIP = "com.linglearn.app.FROM_CLIP";
+    private boolean fromClip = false, clipDone = false;
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        fromClip = getIntent() != null && getIntent().getBooleanExtra(EXTRA_FROM_CLIP, false);
+        if (fromClip) {
+            // کلیپ‌بورد فقط وقتی خوانده می‌شود که پنجره فوکوس داشته باشد؛ اگر فوکوس دیر آمد، بعد از ۱.۲ ثانیه هم امتحان می‌کنیم
+            new Handler(Looper.getMainLooper()).postDelayed(this::finishFromClip, 1200);
+            return;
+        }
         boolean ok = false;
         try {
             ok = handle(getIntent());
         } catch (Throwable ignored) {}
         Toast.makeText(this, ok ? "ذخیره شد ✓ — Saved to Hope" : "لینکی پیدا نشد — No link found",
                 Toast.LENGTH_SHORT).show();
+        finish();
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus && fromClip) finishFromClip();
+    }
+
+    private void finishFromClip() {
+        if (clipDone) return;
+        clipDone = true;
+        boolean ok = false;
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            ClipData cd = cm == null ? null : cm.getPrimaryClip();
+            if (cd != null && cd.getItemCount() > 0) {
+                CharSequence t = cd.getItemAt(0).coerceToText(this);
+                if (t != null) ok = handleText(t.toString(), null);
+            }
+        } catch (Throwable ignored) {}
+        Toast.makeText(this, ok ? "لینکِ کپی‌شده ذخیره شد ✓ — Saved to Hope"
+                : "لینکی در کلیپ‌بورد نیست — اول در همان برنامه Share ← Copy link را بزن",
+                Toast.LENGTH_LONG).show();
         finish();
     }
 
@@ -44,7 +83,10 @@ public class ShareReceiverActivity extends Activity {
 
     private boolean handle(Intent in) throws Exception {
         if (in == null || !Intent.ACTION_SEND.equals(in.getAction())) return false;
-        String text = in.getStringExtra(Intent.EXTRA_TEXT);
+        return handleText(in.getStringExtra(Intent.EXTRA_TEXT), in.getStringExtra(Intent.EXTRA_SUBJECT));
+    }
+
+    private boolean handleText(String text, String subject) throws Exception {
         if (text == null || text.trim().isEmpty()) return false;
         Matcher m = URL.matcher(text);
         if (!m.find()) return false;
@@ -58,7 +100,6 @@ public class ShareReceiverActivity extends Activity {
         // عنوان: متنِ همراهِ لینک (مثلاً کپشنِ تیک‌تاک)، وگرنه نامِ برنامه
         String title = text.replace(m.group(1), "").replaceAll("\\s+", " ").trim();
         if (title.length() > 120) title = title.substring(0, 120).trim() + "…";
-        String subject = in.getStringExtra(Intent.EXTRA_SUBJECT);
         if (title.isEmpty() && subject != null && !subject.trim().isEmpty()) title = subject.trim();
         if (title.isEmpty()) title = app;
 

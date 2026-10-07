@@ -325,7 +325,7 @@ public class BubbleService extends Service {
     private static final long REOPEN_CONFIRM_MS = 400; // صدا باید این‌قدر پیوسته باشه تا کادر باز شه (نویزِ کوتاه کادر را باز نکنه)
     private static final long PANEL_FADE_IN_MS = 180;
     private static final long PANEL_FADE_OUT_MS = 280;
-    private static final long REOPEN_KEEP_HISTORY_MS = 45000;  // منبعِ ناشناس: اگه کمتر از این مدت بسته بوده، تاریخچه نگه داشته می‌شه
+    private static final long REOPEN_KEEP_HISTORY_MS = 600000;  // منبعِ ناشناس: اگه کمتر از این مدت بسته بوده، تاریخچه نگه داشته می‌شه
     private volatile long lastVoiceMs = 0;   // آخرین لحظه‌ای که صدایی از سیستم شنیده شد
     private volatile long lastTextMs = 0;    // آخرین لحظه‌ای که متنِ تشخیص‌داده‌شده رسید
     private volatile long lastActiveMs = 0;  // آخرین لحظه‌ای که «چیزی در حالِ پخش» یا کاربر مشغول بود
@@ -348,7 +348,7 @@ public class BubbleService extends Service {
         if (!running) return;
         long now = SystemClock.elapsedRealtime();
         boolean active = somethingPlaying(now);
-        boolean busy = (wordCard != null && wordCard.getVisibility() == View.VISIBLE)
+        boolean busy = panelDragging || (wordCard != null && wordCard.getVisibility() == View.VISIBLE)
                 || (scroll != null && (scroll.frozen || SystemClock.uptimeMillis() - scroll.lastUserTouch < 6000));
         if (active || busy) lastActiveMs = now;
         if (!active) activeSinceMs = 0;
@@ -475,7 +475,10 @@ public class BubbleService extends Service {
     private static final int MAX_LINE_WORDS = 22;        // جمله‌ی بدونِ مکث/نقطه از این بلندتر شد، سرِ یک ویرگول/حرفِ ربط شکسته می‌شود
     private static final java.util.Set<String> ABBREVIATIONS = new HashSet<>(Arrays.asList(
             "mr.", "mrs.", "ms.", "dr.", "st.", "prof.", "jr.", "sr.", "vs.", "mt.", "no.", "gen.", "col.",
-            "capt.", "lt.", "sgt.", "rev.", "hon.", "messrs.", "etc.", "e.g.", "i.e."));
+            "capt.", "lt.", "sgt.", "rev.", "hon.", "messrs.", "etc.", "e.g.", "i.e.",
+            // اسپانیایی/آلمانی/فرانسوی/ایتالیایی: مخففی که نقطه دارد پایانِ جمله نیست
+            "sra.", "srta.", "dra.", "hr.", "fr.", "nr.", "bzw.", "usw.", "ca.", "z.b.", "d.h.", "u.a.",
+            "bspw.", "ggf.", "evtl.", "mme.", "mlle.", "p.ej.", "sig.", "dott.", "ing.", "avv."));
     private int consumedWords = 0;                       // چند کلمه‌ی اولِ گفتارِ جاری قبلاً به‌صورتِ خطِ جدا بسته شده (تشخیصِ گفتار تجمعی است)
     private String pendingHyp = "";
     private long lastSrcRenderAt = 0;
@@ -1006,7 +1009,7 @@ public class BubbleService extends Service {
 
         private float discR() { return Math.min(getWidth(), getHeight()) / 2f - 8f * d; }
 
-        private float badgeAlpha() { return dragMode ? 0f : Math.max(0f, 1f - collapse * 2f); }
+        private float badgeAlpha() { return 0f; }   // ✕ روی حباب حذف شد؛ بستن: نگه‌داشتنِ کادر و رها کردن روی ✕ پایین، یا کشیدنِ حباب روی ✕، یا اعلان
 
         private float badgeCx() { return getWidth() / 2f - side * discR() * 0.80f; }
 
@@ -1319,40 +1322,7 @@ public class BubbleService extends Service {
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
         header.addView(headerButton("\u25BE", v -> { idleHidden = false; userHidden = true; removePanel(); }));   // ▾ = فقط کادرِ تاریخچه را پنهان می‌کند (بستنِ حباب: ✕ روی خودِ حباب)
         tvHeader.setPadding(0, dp(8), 0, dp(8));          // سطحِ لمسِ بزرگ‌تر برای کشیدنِ کادر
-        final int dragSlop = ViewConfiguration.get(this).getScaledTouchSlop();
-        header.setOnTouchListener(new View.OnTouchListener() {
-            float downX, downY;
-            int startX, startY;
-            boolean moved;
-
-            @Override
-            public boolean onTouch(View v, MotionEvent e) {
-                switch (e.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN: {
-                        int[] loc = new int[2];
-                        panel.getLocationOnScreen(loc);
-                        startX = loc[0]; startY = loc[1];
-                        downX = e.getRawX(); downY = e.getRawY();
-                        moved = false;
-                        main.removeCallbacks(hidePanel);
-                        return true;
-                    }
-                    case MotionEvent.ACTION_MOVE: {
-                        float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
-                        if (!moved && (Math.abs(dx) > dragSlop || Math.abs(dy) > dragSlop)) moved = true;
-                        if (moved) {
-                            panelFree = true;
-                            panelFreeX = Math.round(startX + dx);
-                            panelFreeY = Math.round(startY + dy);
-                            refreshLayout();
-                        }
-                        return true;
-                    }
-                    default:
-                        return true;
-                }
-            }
-        });
+        header.setOnTouchListener(new PanelMover());      // کشیدنِ سربرگ = جابه‌جایی؛ نگه‌داشتن = برداشتنِ کادر + ✕ پایینِ صفحه
         panel.addView(header, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -1423,8 +1393,23 @@ public class BubbleService extends Service {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
+        // وقتی چیزی در حالِ پخش نیست، لمسِ بیرونِ کادر آن را (نرم) می‌بندد؛ متن می‌ماند و با پخشِ بعدی دوباره باز می‌شود.
+        // لمس همچنان به برنامه‌ی زیرین می‌رسد (ما آن را نمی‌بلعیم).
+        // لمس روی جاهای خالیِ کادر (حاشیه‌ها، فاصله‌ها) هم مثلِ سربرگ کادر را جابه‌جا می‌کند.
+        final PanelMover panelMover = new PanelMover();
+        panel.setOnTouchListener((v, ev) -> {
+            if (ev.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
+                boolean cardOpen = wordCard != null && wordCard.getVisibility() == View.VISIBLE;
+                if (!cardOpen && !panelDragging && panelShown && !fadingOut && !somethingPlaying(SystemClock.elapsedRealtime())) {
+                    main.post(this::fadeOutPanelForIdle);
+                }
+                return false;
+            }
+            return panelMover.onTouch(v, ev);
+        });
     }
 
     private TextView headerButton(String label, View.OnClickListener l) {
@@ -1512,7 +1497,8 @@ public class BubbleService extends Service {
         stopPanelSpeech();
         main.removeCallbacks(hidePanel);
         if (fadingOut) { fadingOut = false; fadeGen++; if (panel != null) panel.animate().cancel(); }
-        if (panel != null) panel.setAlpha(1f);
+        if (panel != null) { panel.setAlpha(1f); panel.setScaleX(1f); panel.setScaleY(1f); }
+        panelDragging = false;
         idlePinned = false;
         if (panelShown && panel != null && wm != null) {
             try { wm.removeView(panel); } catch (Exception ignored) {}
@@ -2548,6 +2534,98 @@ public class BubbleService extends Service {
     /** دستگیره‌ی «کرکره‌ای»: یک خطِ باریک؛ با یک انگشت به‌سمتِ بیرون بکش = کادر باز می‌شود، به‌سمتِ داخل = جمع می‌شود.
      *  سمتِ راستِ همان نوار یک کپسولِ کوچکِ A− | A+ برای اندازه‌ی متن است. */
     @SuppressLint("ClickableViewAccessibility")
+    private boolean panelDragging = false;     // کاربر کادر را گرفته (کشیدن/نگه‌داشتن) → کادر خودکار بسته نشود
+
+    /**
+     * جابه‌جایی و بستنِ کادر (مثلِ XRecorder): با انگشت بکش تا کادر هرجا خواستی برود؛
+     * یا نگه دار تا کادر «برداشته» شود و دایره‌ی ✕ پایینِ صفحه بیاید؛ کادر را روی ✕ رها کنی کاملاً بسته می‌شود.
+     */
+    private final class PanelMover implements View.OnTouchListener {
+        private final int slop = ViewConfiguration.get(BubbleService.this).getScaledTouchSlop();
+        private final long longMs = ViewConfiguration.getLongPressTimeout();
+        private float downX, downY;
+        private int startX, startY;
+        private boolean moved, picked, hot;
+        private final Runnable longRun = () -> {
+            if (moved || panel == null || !panelShown) return;
+            picked = true;
+            panelDragging = true;
+            panel.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            panel.animate().scaleX(1.02f).scaleY(1.02f).setDuration(120).start();
+            showCloseTarget();
+        };
+
+        @Override
+        public boolean onTouch(View v, MotionEvent e) {
+            if (panel == null || !panelShown) return false;
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN: {
+                    int[] loc = new int[2];
+                    panel.getLocationOnScreen(loc);
+                    startX = loc[0]; startY = loc[1];
+                    downX = e.getRawX(); downY = e.getRawY();
+                    moved = false; picked = false; hot = false;
+                    main.removeCallbacks(hidePanel);
+                    main.removeCallbacks(longRun);
+                    main.postDelayed(longRun, longMs);
+                    return true;
+                }
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
+                    if (!moved && (Math.abs(dx) > slop || Math.abs(dy) > slop)) {
+                        moved = true;
+                        panelDragging = true;
+                        if (!picked) main.removeCallbacks(longRun);
+                    }
+                    if (moved) {
+                        panelFree = true;
+                        panelFreeX = Math.round(startX + dx);
+                        panelFreeY = Math.round(startY + dy);
+                        refreshLayout();
+                    }
+                    if (picked) updateHot(e.getRawX(), e.getRawY());
+                    return true;
+                }
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL: {
+                    main.removeCallbacks(longRun);
+                    boolean up = e.getActionMasked() == MotionEvent.ACTION_UP;
+                    boolean wasPicked = picked, wasHot = hot;
+                    picked = false; hot = false; moved = false;
+                    panelDragging = false;
+                    lastActiveMs = SystemClock.elapsedRealtime();
+                    if (wasPicked) {
+                        if (up && wasHot) { closePanelAnimated(); }
+                        else {
+                            panel.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(140).start();
+                            hideCloseTarget();
+                        }
+                    }
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        private void updateHot(float rx, float ry) {
+            boolean h = closeView != null && Math.hypot(rx - tgtCx, ry - tgtCy) < dp(90);
+            if (h == hot) return;
+            hot = h;
+            overTarget = h;
+            if (closeView != null) closeView.setHot(h);
+            if (h) panel.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            panel.animate().scaleX(h ? 0.55f : 1.02f).scaleY(h ? 0.55f : 1.02f).alpha(h ? 0.6f : 1f).setDuration(140).start();
+        }
+    }
+
+    /** کادر روی ✕ رها شد: کوچک و محو می‌شود و سرویس کاملاً بسته می‌شود. */
+    private void closePanelAnimated() {
+        hideCloseTarget();
+        if (panel == null) { shutdown(); return; }
+        panel.animate().scaleX(0f).scaleY(0f).alpha(0f).setDuration(150)
+                .withEndAction(this::shutdown).start();
+    }
+
     private View makeGrip(final boolean atBottom) {
         final FrameLayout f = new FrameLayout(this);
 
@@ -2929,6 +3007,7 @@ public class BubbleService extends Service {
         if (wm == null || bubble == null || raw == null || raw.isEmpty()) return;
         if (asrMuted()) return;
         wakeFromIdle();
+        trackSpeechRate(raw);
         final String text = stripConsumed(raw);          // بخشِ قبلاً‌بسته‌شده (خط‌های جدا) دوباره نمایش داده نشود
         if (text.isEmpty()) return;
         pendingHyp = text;
@@ -2950,8 +3029,36 @@ public class BubbleService extends Service {
     private long pauseMs() {
         if (sherpaEngine instanceof WhisperEngine) return PAUSE_COMMIT_SONG_MS;
         if (!micEngine) return SRV_PAUSE_COMMIT_MS;       // حالت سرور: پیش‌نمایش‌ها فاصله دارند
-        return looksIncomplete(pendingHyp) ? SENT_PAUSE_INCOMPLETE_MS : SENT_PAUSE_MS;
+        syncSentenceLang();
+        long base = looksIncomplete(pendingHyp) ? SENT_PAUSE_INCOMPLETE_MS : SENT_PAUSE_MS;
+        return Math.round(base * paceFactor());
     }
+
+    // ── مکثِ تطبیقی: گوینده‌ی کند مکثِ بلندتری بین جمله‌ها دارد، گوینده‌ی تند مکثِ کوتاه‌تری ──
+    private double speechWps = 2.5;                      // میانگینِ سرعتِ گفتار (کلمه در ثانیه)؛ ~۲٫۵ = گفتگوی معمولی
+    private long rateStartAt = 0, rateLastAt = 0;
+    private int rateStartWords = 0, rateLastWords = 0;
+
+    private void trackSpeechRate(String raw) {
+        if (!cumulativeAsr() || raw == null) return;
+        long now = SystemClock.uptimeMillis();
+        int n = words(raw).length;
+        if (rateStartAt == 0 || n < rateLastWords || now - rateLastAt > 1200) {   // شروعِ تازه یا مکث/ریست شدنِ متن
+            rateStartAt = now; rateStartWords = n; rateLastWords = n; rateLastAt = now;
+            return;
+        }
+        rateLastWords = n; rateLastAt = now;
+        long dt = now - rateStartAt;
+        int dw = n - rateStartWords;
+        if (dt >= 1500 && dw >= 4) {
+            double sample = dw * 1000.0 / dt;
+            if (sample > 0.8 && sample < 6.0) speechWps = 0.75 * speechWps + 0.25 * sample;
+            rateStartAt = now; rateStartWords = n;
+        }
+    }
+
+    /** ۰٫۷ (گوینده‌ی تند) … ۱٫۶ (گوینده‌ی کند): ضریبِ مکثِ پایانِ جمله. */
+    private double paceFactor() { return Math.max(0.7, Math.min(1.6, 2.5 / speechWps)); }
 
     /** تشخیصِ گفتارِ زنده (Sherpa/Google) متنِ «کلِ گفتارِ جاری» را می‌دهد؛ حالتِ آهنگ (Whisper) پنجره‌ای است و تجمعی نیست. */
     private boolean cumulativeAsr() {
@@ -3007,7 +3114,7 @@ public class BubbleService extends Service {
             if (",;:\u060C".indexOf(c) >= 0 || endsSentence(x)) return i;
         }
         for (int i = hi - 1; i >= lo; i--) {
-            if (BREAK_BEFORE.contains(w[i].toLowerCase(Locale.ROOT))) return i;
+            if (activeBreak.contains(w[i].toLowerCase(Locale.ROOT))) return i;
         }
         for (int i = hi; i >= lo; i--) {                               // برشِ اجباری: هرگز بعد از «the/of/to/and…» نه
             if (!endsDangling(w[i - 1])) return i;
@@ -3026,13 +3133,64 @@ public class BubbleService extends Service {
             "i", "we", "they", "he", "she", "i'm", "i've", "i'll", "i'd", "we're", "they're", "you're",
             "he's", "she's", "it's", "there's", "what", "how", "why", "also", "just", "even", "then"));
 
+    // ── کلمه‌های «آویزان» و حرف‌ربط‌ها برای زبان‌های دیگر (فقط واژه‌هایی که تقریباً هرگز آخرِ جمله نمی‌آیند) ──
+    private static java.util.Set<String> wset(String csv) {
+        return new HashSet<>(Arrays.asList(csv.trim().split("\\s+")));
+    }
+
+    private static final java.util.Map<String, java.util.Set<String>> DANGLING_BY_LANG = new HashMap<>();
+    private static final java.util.Map<String, java.util.Set<String>> BREAK_BY_LANG = new HashMap<>();
+    static {
+        DANGLING_BY_LANG.put("es", wset("el la los las un una unos unas y e o u pero que porque si como cuando donde mientras aunque de del a al en con por para sin sobre entre hasta desde mi tu su mis tus sus muy"));
+        BREAK_BY_LANG.put("es", wset("y pero que porque cuando donde mientras aunque si como"));
+        DANGLING_BY_LANG.put("fr", wset("le la les un une des du de et ou mais que qui dont si comme quand parce car à au aux en dans avec pour sans sur sous par mon ma mes ton ta tes son sa ses notre votre leur je tu il elle ne très"));
+        BREAK_BY_LANG.put("fr", wset("et mais que qui dont quand parce car comme si"));
+        DANGLING_BY_LANG.put("de", wset("der die das den dem des ein eine einen einem einer und oder aber dass weil wenn als ob von zu zum zur in im mit für auf an bei nach aus über unter durch gegen ohne um mein dein sein ihr unser ich du er wir sehr"));
+        BREAK_BY_LANG.put("de", wset("und aber oder dass weil wenn als ob während obwohl damit"));
+        DANGLING_BY_LANG.put("it", wset("il lo la i gli le un uno una e ed o ma che perché se come quando mentre di del della dei delle a al alla ai in nel nella con per su sul tra fra da mio tuo suo mia tua sua io tu lui lei noi voi non molto"));
+        BREAK_BY_LANG.put("it", wset("e ed ma che perché quando mentre se come"));
+        DANGLING_BY_LANG.put("pt", wset("o a os as um uma uns umas e ou mas que porque se como quando onde enquanto embora de do da dos das em no na nos nas com por para sem sobre entre até desde meu minha seu sua eu tu ele ela muito"));
+        BREAK_BY_LANG.put("pt", wset("e mas que porque quando onde enquanto embora se como"));
+        DANGLING_BY_LANG.put("nl", wset("de het een en of maar dat omdat als wanneer waar terwijl van in op met voor naar aan bij uit over door zonder mijn jouw zijn haar ik jij je hij zij wij zeer"));
+        BREAK_BY_LANG.put("nl", wset("en maar of dat omdat als wanneer terwijl"));
+        DANGLING_BY_LANG.put("ru", wset("и а но или что чтобы как если когда где пока хотя потому в на с со по к у о об от до из за для без при про над под между через мой твой его её их наш ваш я ты он она мы они не очень"));
+        BREAK_BY_LANG.put("ru", wset("и а но или что чтобы как если когда где пока хотя потому"));
+        DANGLING_BY_LANG.put("tr", wset("ve ile ama fakat ancak çünkü eğer veya bir bu şu ki"));
+        BREAK_BY_LANG.put("tr", wset("ve ama fakat ancak çünkü eğer veya ki"));
+        DANGLING_BY_LANG.put("ar", wset("في من على إلى الى عن مع أن إن لكن لأن أو ثم حتى كما لقد"));
+        BREAK_BY_LANG.put("ar", wset("لكن لأن ثم حتى أو"));
+        DANGLING_BY_LANG.put("fa", wset("و که از به در با را برای تا اگر اما ولی یا چون این آن یک بر بی"));
+        BREAK_BY_LANG.put("fa", wset("و که اما ولی یا چون اگر تا"));
+    }
+    private static volatile java.util.Set<String> activeDangling = DANGLING;
+    private static volatile java.util.Set<String> activeBreak = BREAK_BEFORE;
+    private static volatile String sentenceLang = "en";
+
+    /** قوانینِ «جمله ناتمام است» را با زبانِ گفتار هماهنگ می‌کند؛ زبانِ بدونِ فهرست (ژاپنی، چینی، …) فقط با نقطه‌گذاری/مکث/طولِ خط می‌شکند. */
+    private void syncSentenceLang() {
+        String l;
+        try { l = (yt != null && yt.isActive()) ? yt.trackLang() : effectiveSource(); } catch (Throwable t) { l = "en"; }
+        if (l == null) l = "";
+        l = l.toLowerCase(Locale.ROOT);
+        if (l.length() > 2) l = l.substring(0, 2);
+        if (l.equals(sentenceLang)) return;
+        sentenceLang = l;
+        if (l.isEmpty() || l.equals("au") || l.equals("en")) {         // «auto» و انگلیسی: همان قوانینِ قبلی
+            activeDangling = DANGLING; activeBreak = BREAK_BEFORE;
+        } else {
+            java.util.Set<String> d = DANGLING_BY_LANG.get(l), b = BREAK_BY_LANG.get(l);
+            activeDangling = d != null ? d : new HashSet<String>();
+            activeBreak = b != null ? b : new HashSet<String>();
+        }
+    }
+
     private static boolean endsDangling(String word) {
         if (word == null || word.isEmpty()) return false;
         char last = word.charAt(word.length() - 1);
         if (",.;:!?\u061F\u060C\u2026".indexOf(last) >= 0) return false;       // علامتِ پایان/ویرگول دارد
         String low = word.toLowerCase(Locale.ROOT).replace('\u2019', '\'');
         low = low.replaceAll("^[\"'(\\[]+|[\"')\\]]+$", "");
-        return DANGLING.contains(low);
+        return activeDangling.contains(low);
     }
 
     /** آیا متنِ زنده هنوز ناتمام به‌نظر می‌رسد؟ (خیلی کوتاه یا آخرش کلمه‌ی «آویزان») */
@@ -3072,6 +3230,8 @@ public class BubbleService extends Service {
 
     /** مکثِ بلند: جمله‌ی جاری همین‌جا بسته می‌شود و گفتارِ بعدی در خطِ تازه می‌آید. */
     private void endSentenceByPause() {
+        syncSentenceLang();
+        rateStartAt = 0;                                    // جمله بسته شد؛ اندازه‌گیریِ سرعت از جمله‌ی بعد
         final String hyp = pendingHyp;
         if (hyp == null || hyp.isEmpty()) return;
         final int n = words(hyp).length;
@@ -3103,6 +3263,7 @@ public class BubbleService extends Service {
     }
 
     private void flushPartial(boolean pause) {
+        syncSentenceLang();
         final Entry e = live;
         if (e == null || pendingHyp.isEmpty()) return;
         final String next = smoothHyp(e.src, pendingHyp);
@@ -3161,7 +3322,7 @@ public class BubbleService extends Service {
             if (",.;:?!\u061F\u060C".indexOf(c) >= 0) return i;
         }
         for (int i = maxEnd - 1; i >= from + 4; i--) {                 // بعد: قبل از حرفِ ربط
-            if (BREAK_BEFORE.contains(w[i].toLowerCase(Locale.ROOT))) return i;
+            if (activeBreak.contains(w[i].toLowerCase(Locale.ROOT))) return i;
         }
         for (int i = maxEnd; i >= from + CHUNK_MIN_WORDS; i--) {       // تکه را به «the/of/to/and…» ختم نکن
             if (!endsDangling(w[i - 1])) return i;
@@ -3535,8 +3696,18 @@ public class BubbleService extends Service {
             //    کاربر بعداً همان برنامه/لینک را دوباره باز کند.
             JSONArray lines = new JSONArray();
             if (!hasSource) {
-                showNotice(msg("برای ذخیره‌ی اینستاگرام/تیک‌تاک/…: در همان برنامه «Share ← Hope» را بزن",
-                        "For Instagram/TikTok/…: use “Share → Hope” inside that app"));
+                // اینستاگرام/تیک‌تاک/… اطلاعاتِ پخش نمی‌دهند → لینکِ کپی‌شده‌ی پست را (Share ← Copy link) از کلیپ‌بورد می‌خوانیم.
+                // کلیپ‌بورد فقط از یک Activityِ دارای فوکوس خوانده می‌شود؛ ShareReceiverActivity آن را یک لحظه باز می‌کند و برمی‌گردد.
+                try {
+                    Intent ci = new Intent(this, ShareReceiverActivity.class)
+                            .putExtra(ShareReceiverActivity.EXTRA_FROM_CLIP, true)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+                    startActivity(ci);
+                    showNotice(msg("لینکِ کپی‌شده‌ی پست ذخیره می‌شه… (اگر نکردی: در همان برنامه Share ← Copy link، بعد دوباره 💾)",
+                            "Saving the copied post link… (if you haven’t: Share → Copy link in that app, then tap 💾 again)"));
+                } catch (Throwable t) {
+                    showNotice(msg("برای ذخیره: در همان برنامه «Share ← Hope» را بزن", "To save: use “Share → Hope” inside that app"));
+                }
                 return;
             }
             long now = System.currentTimeMillis();
