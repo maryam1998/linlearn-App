@@ -223,6 +223,7 @@ public class BubbleService extends Service {
         s.main.post(() -> {
             if (s.yt != null) s.yt.onSettingsChanged();
             s.prepareLocalTranslator();
+            s.applyAppFont();
             s.refreshHeader();
             for (Entry e : new ArrayList<>(s.history)) s.renderEntry(e);
             s.refreshLayout();
@@ -1312,10 +1313,7 @@ public class BubbleService extends Service {
         header.addView(tvRepeat);
         updateRepeatButton();
         updateYtButton();
-        TextView tvFont = headerButton("Aa", v -> toggleFontRow());
-        tvFont.setTypeface(Typeface.DEFAULT_BOLD);
-        tvFont.setOnLongClickListener(v -> { resetView(); return true; });
-        header.addView(tvFont);
+        // فونت دیگر داخلِ کادر انتخاب نمی‌شود؛ از «نوع فونت» در تنظیماتِ اپ می‌آید (applyAppFont). اندازه: A− / A+ پایینِ کادر.
         TextView tvOpacity = headerButton("\uD83C\uDF13", v -> toggleOpacityRow());
         tvOpacity.setPadding(dp(8), dp(6), dp(8), dp(6));
         header.addView(tvOpacity);
@@ -1354,9 +1352,6 @@ public class BubbleService extends Service {
         opacityRow.addView(opacityBar, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         opacityRow.addView(opacityPct, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         panel.addView(opacityRow, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-
-        panel.addView(buildFontRow(), new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         buildWordCard();
@@ -2212,6 +2207,8 @@ public class BubbleService extends Service {
             new FontOpt("fa_btitr", "بی‌تیتر", "B Titr", null, new String[]{"btitr", "titr"}, true, false, 1f, false),
             new FontOpt("fa_nastaliq", "نستعلیق", "Nastaliq", null, new String[]{"nastaliq", "nastaleeq"}, true, true, 1.1f, false),
             new FontOpt("fa_vazir", "وزیرمتن", "Vazirmatn", null, new String[]{"vazir"}, false, false, 1f, true),
+            new FontOpt("fa_serif", "سریف", "Serif", "serif", null, false, false, 1f, false),
+            new FontOpt("fa_medium", "متوسط", "Medium", "sans-serif-medium", null, false, false, 1f, false),
     };
 
     private static final FontOpt[] EN_FONTS = {
@@ -2224,6 +2221,33 @@ public class BubbleService extends Service {
             new FontOpt("en_inter", "Inter", "Inter", null, new String[]{"inter"}, false, false, 1f, true),
             new FontOpt("en_lora", "Lora", "Lora", null, new String[]{"lora"}, false, false, 1f, true),
     };
+
+    /** «نوع فونت» تنظیماتِ اپ (default/modern/classic/elegant/rounded/warm) → نزدیک‌ترین فونتِ قابل‌استفاده در کادر.
+     *  فونتِ وبِ دقیق (Vazirmatn/Lora/…) فقط اگر فایلش در assets/fonts باشد استفاده می‌شود؛ وگرنه معادلِ سیستمی. */
+    private void applyAppFont() {
+        String id = getSharedPreferences(PREFS, MODE_PRIVATE).getString("appFont", "default");
+        boolean vazir = fontAvailable(fontById(FA_FONTS, "fa_vazir")) && fontById(FA_FONTS, "fa_vazir").id.equals("fa_vazir");
+        boolean inter = fontAvailable(fontById(EN_FONTS, "en_inter")) && fontById(EN_FONTS, "en_inter").id.equals("en_inter");
+        boolean lora = fontAvailable(fontById(EN_FONTS, "en_lora")) && fontById(EN_FONTS, "en_lora").id.equals("en_lora");
+        String fa, en;
+        switch (id == null ? "default" : id) {
+            case "classic": case "elegant": fa = "fa_serif"; en = "en_serif"; break;
+            case "rounded": fa = "fa_medium"; en = "en_medium"; break;
+            case "modern":  fa = vazir ? "fa_vazir" : "fa_default"; en = inter ? "en_inter" : "en_default"; break;
+            case "warm":    fa = vazir ? "fa_vazir" : "fa_default"; en = "en_default"; break;
+            default:        fa = vazir ? "fa_vazir" : "fa_default"; en = lora ? "en_lora" : "en_default"; break;
+        }
+        if (fa.equals(fontFaId) && en.equals(fontEnId)) return;
+        fontFaId = fa; fontEnId = en;
+        if (panel != null) relayoutAfterStyle();
+    }
+
+    public static void saveAppFont(Context ctx, String font) {
+        if (font == null) return;
+        String f = font.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!f.matches("default|modern|classic|elegant|rounded|warm")) return;
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("appFont", f).apply();
+    }
 
     private float fontScale = 1f;
     private String fontFaId = "fa_default";    // فونتِ متنِ فارسی/عربی
@@ -2242,8 +2266,7 @@ public class BubbleService extends Service {
     private void loadViewPrefs() {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         fontScale = Math.max(FONT_MIN, Math.min(FONT_MAX, sp.getFloat("fontScale", 1f)));
-        fontFaId = sp.getString("fontFa", "fa_default");
-        fontEnId = sp.getString("fontEn", "en_default");
+        applyAppFont();                                   // فونتِ کادر = «نوع فونت» در تنظیماتِ اپ
         panelHFrac = Math.max(0.12f, Math.min(0.85f, sp.getFloat("panelHFrac", 0.42f)));
         panelWFrac = sp.getFloat("panelWFrac", -1f);
         panelAlpha = Math.max(0f, Math.min(1f, sp.getFloat("panelAlphaV2", 1f)));
@@ -2520,7 +2543,7 @@ public class BubbleService extends Service {
     }
 
     private void resetView() {
-        fontScale = 1f; fontFaId = "fa_default"; fontEnId = "en_default";
+        fontScale = 1f; applyAppFont();
         panelHFrac = 0.42f; panelWFrac = -1f; panelAlpha = 1f;
         if (opacityBar != null) opacityBar.setProgress(100);
         applyPanelAlpha();
@@ -2528,7 +2551,7 @@ public class BubbleService extends Service {
         refreshFontChips();
         relayoutAfterStyle();
         saveViewPrefs();
-        showNotice(msg("اندازه و فونت به حالت اولیه برگشت", "Size and font reset"));
+        showNotice(msg("اندازه و شفافیت به حالت اولیه برگشت", "Size and opacity reset"));
     }
 
     /** دستگیره‌ی «کرکره‌ای»: یک خطِ باریک؛ با یک انگشت به‌سمتِ بیرون بکش = کادر باز می‌شود، به‌سمتِ داخل = جمع می‌شود.
@@ -2722,6 +2745,7 @@ public class BubbleService extends Service {
         t.setMinWidth(dp(34));
         t.setPadding(dp(4), 0, dp(4), 0);
         t.setOnClickListener(v -> setFontScale(fontScale + delta, true));
+        t.setOnLongClickListener(v -> { resetView(); return true; });     // نگه‌داشتنِ A−/A+ = بازگشت به اندازه و شفافیتِ اولیه
         return t;
     }
 
