@@ -436,24 +436,51 @@ final class YtSubtitles {
         long pos = s.nowMs() + offsetMs;
         loopTick(pos);
         int idx = findCue(pos);
-        if (idx >= 0 && idx != shownIdx) {
-            boolean reset = shownIdx < 0 || idx < shownIdx || idx - shownIdx > 3;   // seek یا شروع
-            shownIdx = idx;
-            shown.add(idx);
-            for (String lang : langs()) {
-                if (arr(lang)[idx] == null) quick(idx, lang);     // ترجمه‌ی سریعِ جمله‌ی جاری تا منتظرِ chunk نمانیم
+        if (idx >= 0) {
+            final boolean cueChanged = idx != shownIdx;
+            boolean reset = false;
+            if (cueChanged) {
+                reset = shownIdx < 0 || idx < shownIdx || idx - shownIdx > 3;   // seek یا شروع
+                shownIdx = idx;
+                shown.add(idx);
+                for (String lang : langs()) {
+                    if (arr(lang)[idx] == null) quick(idx, lang);     // ترجمه‌ی سریعِ جمله‌ی جاری تا منتظرِ chunk نمانیم
+                }
             }
-            int si = sentOfCue(idx);
+            // جمله را با «زمانِ دقیقِ داخلِ تکه» پیدا می‌کنیم، نه فقط با عوض‌شدنِ تکه؛ وگرنه وقتی یک تکه
+            // چند جمله دارد فقط یکی‌شان پررنگ می‌شد و بقیه (یکی در میون) خوانده می‌شدند ولی پررنگ نمی‌شدند.
+            int si = sentAtPos(idx, pos);
             if (si >= 0 && (si != shownSent || reset)) {
                 shownSent = si;
                 host.setCurrent(si, reset);
             }
-            pump();
+            if (cueChanged) pump();
         }
         if (++tickCount % 7 == 0) pump();    // ~هر ثانیه: chunk های جدید/زبان‌های تازه
     }
 
     // ════════════════════ ۳) ترجمه‌ی lazy، chunk به chunk ════════════════════
+
+    /** جمله‌ی در حالِ گفته‌شدن در لحظه‌ی pos: جای پخش داخلِ تکه (نسبتِ زمان) روی متنِ تکه نگاشت می‌شود. */
+    private int sentAtPos(int cue, long pos) {
+        if (cue < 0 || cue >= cueSents.length || cueSents[cue].length == 0) return -1;
+        int[] cand = cueSents[cue];
+        if (cand.length == 1) return cand[0];
+        long st = cues.get(cue).startMs;
+        long en = cues.get(cue).endMs;
+        if (cue + 1 < cues.size()) {
+            long nx = cues.get(cue + 1).startMs;
+            if (nx > st && (en <= st || nx < en)) en = nx;    // تکه‌های هم‌پوشانِ یوتیوب: تا شروعِ تکه‌ی بعد
+        }
+        if (en <= st) en = st + 2500;
+        double frac = (double) (pos - st) / (double) (en - st);
+        if (frac < 0) frac = 0; else if (frac > 1) frac = 1;
+        double chr = cueRangeS[cue] + frac * (cueRangeE[cue] - cueRangeS[cue]);
+        for (int si : cand) {
+            if (chr < sents.get(si)[1]) return si;
+        }
+        return cand[cand.length - 1];
+    }
 
     /** جمله‌ای که بیشترین هم‌پوشانی را با تکه‌ی cue دارد. */
     private int sentOfCue(int cue) {
