@@ -1313,7 +1313,10 @@ public class BubbleService extends Service {
         header.addView(tvRepeat);
         updateRepeatButton();
         updateYtButton();
-        // فونت دیگر داخلِ کادر انتخاب نمی‌شود؛ از «نوع فونت» در تنظیماتِ اپ می‌آید (applyAppFont). اندازه: A− / A+ پایینِ کادر.
+        TextView tvFont = headerButton("Aa", v -> toggleFontRow());   // انتخابِ فونت: همان فونت‌های «نوع فونت» در تنظیماتِ اپ
+        tvFont.setTypeface(Typeface.DEFAULT_BOLD);
+        tvFont.setOnLongClickListener(v -> { resetView(); return true; });
+        header.addView(tvFont);
         TextView tvOpacity = headerButton("\uD83C\uDF13", v -> toggleOpacityRow());
         tvOpacity.setPadding(dp(8), dp(6), dp(8), dp(6));
         header.addView(tvOpacity);
@@ -1352,6 +1355,9 @@ public class BubbleService extends Service {
         opacityRow.addView(opacityBar, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         opacityRow.addView(opacityPct, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         panel.addView(opacityRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        panel.addView(buildFontRow(), new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         buildWordCard();
@@ -2224,22 +2230,41 @@ public class BubbleService extends Service {
 
     /** «نوع فونت» تنظیماتِ اپ (default/modern/classic/elegant/rounded/warm) → نزدیک‌ترین فونتِ قابل‌استفاده در کادر.
      *  فونتِ وبِ دقیق (Vazirmatn/Lora/…) فقط اگر فایلش در assets/fonts باشد استفاده می‌شود؛ وگرنه معادلِ سیستمی. */
-    private void applyAppFont() {
-        String id = getSharedPreferences(PREFS, MODE_PRIVATE).getString("appFont", "default");
-        boolean vazir = fontAvailable(fontById(FA_FONTS, "fa_vazir")) && fontById(FA_FONTS, "fa_vazir").id.equals("fa_vazir");
-        boolean inter = fontAvailable(fontById(EN_FONTS, "en_inter")) && fontById(EN_FONTS, "en_inter").id.equals("en_inter");
-        boolean lora = fontAvailable(fontById(EN_FONTS, "en_lora")) && fontById(EN_FONTS, "en_lora").id.equals("en_lora");
-        String fa, en;
+    private String[] mapAppFont(String id) {
+        boolean vazir = fontById(FA_FONTS, "fa_vazir").id.equals("fa_vazir") && fontAvailable(fontById(FA_FONTS, "fa_vazir"));
+        boolean inter = fontById(EN_FONTS, "en_inter").id.equals("en_inter") && fontAvailable(fontById(EN_FONTS, "en_inter"));
+        boolean lora = fontById(EN_FONTS, "en_lora").id.equals("en_lora") && fontAvailable(fontById(EN_FONTS, "en_lora"));
         switch (id == null ? "default" : id) {
-            case "classic": case "elegant": fa = "fa_serif"; en = "en_serif"; break;
-            case "rounded": fa = "fa_medium"; en = "en_medium"; break;
-            case "modern":  fa = vazir ? "fa_vazir" : "fa_default"; en = inter ? "en_inter" : "en_default"; break;
-            case "warm":    fa = vazir ? "fa_vazir" : "fa_default"; en = "en_default"; break;
-            default:        fa = vazir ? "fa_vazir" : "fa_default"; en = lora ? "en_lora" : "en_default"; break;
+            case "classic": case "elegant": return new String[]{"fa_serif", "en_serif"};
+            case "rounded": return new String[]{"fa_medium", "en_medium"};
+            case "modern":  return new String[]{vazir ? "fa_vazir" : "fa_default", inter ? "en_inter" : "en_default"};
+            case "warm":    return new String[]{vazir ? "fa_vazir" : "fa_default", "en_default"};
+            default:        return new String[]{vazir ? "fa_vazir" : "fa_default", lora ? "en_lora" : "en_default"};
         }
-        if (fa.equals(fontFaId) && en.equals(fontEnId)) return;
-        fontFaId = fa; fontEnId = en;
-        if (panel != null) relayoutAfterStyle();
+    }
+
+    private String currentAppFont() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getString("appFont", "default");
+    }
+
+    private void applyAppFont() {
+        String[] m = mapAppFont(currentAppFont());
+        boolean changed = !(m[0].equals(fontFaId) && m[1].equals(fontEnId));
+        fontFaId = m[0]; fontEnId = m[1];
+        if (panel != null) {
+            refreshFontChips();
+            if (changed) relayoutAfterStyle();
+        }
+    }
+
+    /** از اپ (Settings → نوع فونت): فقط وقتی انتخابِ اپ عوض شده اعمال می‌شود تا انتخابِ داخلِ کادر با هر بازشدنِ اپ پاک نشود. */
+    public static void pushAppFont(Context ctx, String font) {
+        if (font == null) return;
+        String f = font.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!f.matches("default|modern|classic|elegant|rounded|warm")) return;
+        SharedPreferences sp = ctx.getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (f.equals(sp.getString("appFontLast", ""))) return;
+        sp.edit().putString("appFontLast", f).putString("appFont", f).apply();
     }
 
     public static void saveAppFont(Context ctx, String font) {
@@ -2448,17 +2473,69 @@ public class BubbleService extends Service {
 
     // ── ردیفِ انتخابِ فونت (زیرِ هدرِ پنل) ──
 
+    private static final String[] APP_FONT_IDS = {"default", "modern", "classic", "elegant", "rounded", "warm"};
+    private static final String[] APP_FONT_FA = {"پیش‌فرض", "مدرن", "کلاسیک", "شیک", "گرد", "گرم"};
+    private static final String[] APP_FONT_EN = {"Default", "Modern", "Classic", "Elegant", "Rounded", "Warm"};
+    private final ArrayList<TextView> appFontChips = new ArrayList<>();
+
     private View buildFontRow() {
         fontRow = new LinearLayout(this);
         fontRow.setOrientation(LinearLayout.VERTICAL);
         fontRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         fontRow.setVisibility(View.GONE);
         fontRow.setPadding(0, dp(2), 0, dp(6));
-        faChips.clear(); enChips.clear();
-        fontRow.addView(fontLine("فارسی", FA_FONTS, true));
-        fontRow.addView(fontLine("English", EN_FONTS, false));
+        appFontChips.clear();
+
+        LinearLayout line = new LinearLayout(this);
+        line.setOrientation(LinearLayout.HORIZONTAL);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        line.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        line.setPadding(0, dp(2), 0, dp(2));
+        TextView lb = new TextView(this);
+        lb.setText(msg("فونت", "Font"));
+        lb.setTextColor(COLOR_GOLD);
+        lb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        lb.setTypeface(Typeface.DEFAULT_BOLD);
+        lb.setMinWidth(dp(50));
+        line.addView(lb, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        hs.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        LinearLayout chips = new LinearLayout(this);
+        chips.setOrientation(LinearLayout.HORIZONTAL);
+        chips.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        final boolean fa = isFa();
+        for (int i = 0; i < APP_FONT_IDS.length; i++) {
+            final String id = APP_FONT_IDS[i];
+            String[] m = mapAppFont(id);
+            FontOpt o = fa ? fontById(FA_FONTS, m[0]) : fontById(EN_FONTS, m[1]);
+            TextView c = new TextView(this);
+            c.setTag(id);
+            c.setText(fa ? APP_FONT_FA[i] : APP_FONT_EN[i]);
+            c.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            c.setGravity(Gravity.CENTER);
+            c.setSingleLine(true);
+            c.setPadding(dp(12), dp(5), dp(12), dp(5));
+            c.setTypeface(typefaceOf(o, false));              // پیش‌نمایش: نامِ هر فونت با خودِ همان فونت
+            c.setOnClickListener(v -> pickAppFont(id));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMarginEnd(dp(6));
+            chips.addView(c, lp);
+            appFontChips.add(c);
+        }
+        hs.addView(chips, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        line.addView(hs, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        fontRow.addView(line);
         refreshFontChips();
         return fontRow;
+    }
+
+    private void pickAppFont(String id) {
+        saveAppFont(this, id);
+        applyAppFont();
+        refreshFontChips();
+        saveViewPrefs();
     }
 
     private View fontLine(String label, FontOpt[] opts, boolean fa) {
@@ -2513,8 +2590,15 @@ public class BubbleService extends Service {
     }
 
     private void refreshFontChips() {
-        paintChips(faChips, fontFaId);
-        paintChips(enChips, fontEnId);
+        String sel = currentAppFont();
+        for (TextView c : appFontChips) {
+            boolean on = sel.equals(c.getTag());
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(14));
+            g.setColor(on ? COLOR_GOLD : Color.parseColor("#26FFFFFF"));
+            c.setBackground(g);
+            c.setTextColor(on ? Color.parseColor("#1C2541") : Color.WHITE);
+        }
     }
 
     private void paintChips(ArrayList<TextView> chips, String sel) {
@@ -2543,7 +2627,10 @@ public class BubbleService extends Service {
     }
 
     private void resetView() {
-        fontScale = 1f; applyAppFont();
+        fontScale = 1f;
+        SharedPreferences rsp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        rsp.edit().putString("appFont", rsp.getString("appFontLast", "default")).apply();
+        applyAppFont();
         panelHFrac = 0.42f; panelWFrac = -1f; panelAlpha = 1f;
         if (opacityBar != null) opacityBar.setProgress(100);
         applyPanelAlpha();
@@ -2551,7 +2638,7 @@ public class BubbleService extends Service {
         refreshFontChips();
         relayoutAfterStyle();
         saveViewPrefs();
-        showNotice(msg("اندازه و شفافیت به حالت اولیه برگشت", "Size and opacity reset"));
+        showNotice(msg("اندازه، شفافیت و فونت به حالت اولیه برگشت", "Size, opacity and font reset"));
     }
 
     /** دستگیره‌ی «کرکره‌ای»: یک خطِ باریک؛ با یک انگشت به‌سمتِ بیرون بکش = کادر باز می‌شود، به‌سمتِ داخل = جمع می‌شود.
@@ -2745,7 +2832,6 @@ public class BubbleService extends Service {
         t.setMinWidth(dp(34));
         t.setPadding(dp(4), 0, dp(4), 0);
         t.setOnClickListener(v -> setFontScale(fontScale + delta, true));
-        t.setOnLongClickListener(v -> { resetView(); return true; });     // نگه‌داشتنِ A−/A+ = بازگشت به اندازه و شفافیتِ اولیه
         return t;
     }
 
@@ -3721,17 +3807,48 @@ public class BubbleService extends Service {
             JSONArray lines = new JSONArray();
             if (!hasSource) {
                 // اینستاگرام/تیک‌تاک/… اطلاعاتِ پخش نمی‌دهند → لینکِ کپی‌شده‌ی پست را (Share ← Copy link) از کلیپ‌بورد می‌خوانیم.
-                // کلیپ‌بورد فقط از یک Activityِ دارای فوکوس خوانده می‌شود؛ ShareReceiverActivity آن را یک لحظه باز می‌کند و برمی‌گردد.
+                // 1) همین الان یک ردیفِ «بدونِ لینک» ذخیره می‌شود (زمان + چند کلمه‌ی اولِ گفتار فقط برای شناختنِ آن)، تا چیزی گم نشود.
+                // 2) اگر لینکِ پست کپی شده باشد (Share ← Copy link)، همان ردیف با لینک کامل می‌شود. کلیپ‌بورد فقط از یک
+                //    Activityِ دارای فوکوس خوانده می‌شود؛ ShareReceiverActivity آن را یک لحظه باز می‌کند و برمی‌گردد.
+                String snippet = "";
+                for (Entry e : snap) {
+                    if (e == live || e.src == null || e.src.trim().isEmpty()) continue;
+                    String[] ws = words(e.src);
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < ws.length && i < 6; i++) { if (i > 0) sb.append(' '); sb.append(ws[i]); }
+                    snippet = sb.toString() + (ws.length > 6 ? "…" : "");
+                    break;
+                }
+                java.text.SimpleDateFormat tf = new java.text.SimpleDateFormat("MM/dd HH:mm", Locale.US);
+                String ptitle = msg("ویدیوی ذخیره‌شده", "Saved video") + " · " + tf.format(new java.util.Date())
+                        + (snippet.isEmpty() ? "" : " — " + snippet);
+                long pnow = System.currentTimeMillis();
+                java.text.SimpleDateFormat pfmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+                pfmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+                String psrc = effectiveSource();
+                JSONObject pitem = new JSONObject()
+                        .put("key", liveKey)
+                        .put("live", true)
+                        .put("title", ptitle)
+                        .put("channel", msg("منبعِ نامشخص (بدونِ لینک)", "Unknown source (no link)"))
+                        .put("lang", psrc == null || "auto".equals(psrc) ? "en" : psrc)
+                        .put("targets", new JSONArray(ts))
+                        .put("rev", pnow)
+                        .put("savedAt", pfmt.format(new java.util.Date(pnow)))
+                        .put("lines", new JSONArray());
+                boolean pok = YtSaved.add(this, pitem);
                 try {
                     Intent ci = new Intent(this, ShareReceiverActivity.class)
                             .putExtra(ShareReceiverActivity.EXTRA_FROM_CLIP, true)
+                            .putExtra(ShareReceiverActivity.EXTRA_REPLACE_KEY, liveKey)
+                            .putExtra(ShareReceiverActivity.EXTRA_TITLE, ptitle)
                             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
                     startActivity(ci);
-                    showNotice(msg("لینکِ کپی‌شده‌ی پست ذخیره می‌شه… (اگر نکردی: در همان برنامه Share ← Copy link، بعد دوباره 💾)",
-                            "Saving the copied post link… (if you haven’t: Share → Copy link in that app, then tap 💾 again)"));
-                } catch (Throwable t) {
-                    showNotice(msg("برای ذخیره: در همان برنامه «Share ← Hope» را بزن", "To save: use “Share → Hope” inside that app"));
-                }
+                } catch (Throwable ignored) {}
+                showNotice(pok
+                        ? msg("ذخیره شد ✓ (بدونِ لینک). برای لینک: در همان برنامه Share ← Copy link بزن و دوباره 💾",
+                              "Saved ✓ (no link). For the link: Share → Copy link in that app, then tap 💾 again")
+                        : msg("ذخیره نشد", "Save failed"));
                 return;
             }
             long now = System.currentTimeMillis();

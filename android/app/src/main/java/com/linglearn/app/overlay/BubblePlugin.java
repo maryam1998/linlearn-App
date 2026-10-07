@@ -204,7 +204,7 @@ public class BubblePlugin extends Plugin {
     // setPanelFont({ font: "default"|"modern"|"classic"|"elegant"|"rounded"|"warm" }) — فونتِ کادرِ ترجمه از «نوع فونت» تنظیماتِ اپ می‌آید
     @PluginMethod
     public void setPanelFont(PluginCall call) {
-        BubbleService.saveAppFont(getContext(), call.getString("font"));
+        BubbleService.pushAppFont(getContext(), call.getString("font"));
         BubbleService.settingsChanged();
         call.resolve();
     }

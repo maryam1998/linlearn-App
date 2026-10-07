@@ -31,6 +31,8 @@ public class ShareReceiverActivity extends Activity {
 
     /** از 💾 حباب: به‌جای متنِ Share، لینکِ کپی‌شده‌ی کلیپ‌بورد خوانده می‌شود. */
     static final String EXTRA_FROM_CLIP = "com.linglearn.app.FROM_CLIP";
+    static final String EXTRA_REPLACE_KEY = "com.linglearn.app.REPLACE_KEY";   // ردیفِ بدونِ لینکِ قبلی که باید با لینک کامل شود
+    static final String EXTRA_TITLE = "com.linglearn.app.TITLE";
     private boolean fromClip = false, clipDone = false;
 
     @Override
@@ -66,7 +68,8 @@ public class ShareReceiverActivity extends Activity {
             ClipData cd = cm == null ? null : cm.getPrimaryClip();
             if (cd != null && cd.getItemCount() > 0) {
                 CharSequence t = cd.getItemAt(0).coerceToText(this);
-                if (t != null) ok = handleText(t.toString(), null);
+                if (t != null) ok = handleText(t.toString(), null,
+                        getIntent().getStringExtra(EXTRA_REPLACE_KEY), getIntent().getStringExtra(EXTRA_TITLE));
             }
         } catch (Throwable ignored) {}
         Toast.makeText(this, ok ? "لینکِ کپی‌شده ذخیره شد ✓ — Saved to Hope"
@@ -83,10 +86,10 @@ public class ShareReceiverActivity extends Activity {
 
     private boolean handle(Intent in) throws Exception {
         if (in == null || !Intent.ACTION_SEND.equals(in.getAction())) return false;
-        return handleText(in.getStringExtra(Intent.EXTRA_TEXT), in.getStringExtra(Intent.EXTRA_SUBJECT));
+        return handleText(in.getStringExtra(Intent.EXTRA_TEXT), in.getStringExtra(Intent.EXTRA_SUBJECT), null, null);
     }
 
-    private boolean handleText(String text, String subject) throws Exception {
+    private boolean handleText(String text, String subject, String replaceKey, String titleOverride) throws Exception {
         if (text == null || text.trim().isEmpty()) return false;
         Matcher m = URL.matcher(text);
         if (!m.find()) return false;
@@ -102,6 +105,7 @@ public class ShareReceiverActivity extends Activity {
         if (title.length() > 120) title = title.substring(0, 120).trim() + "…";
         if (title.isEmpty() && subject != null && !subject.trim().isEmpty()) title = subject.trim();
         if (title.isEmpty()) title = app;
+        if (titleOverride != null && !titleOverride.trim().isEmpty()) title = titleOverride.trim();
 
         long now = System.currentTimeMillis();
         SimpleDateFormat fmt = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
@@ -116,7 +120,7 @@ public class ShareReceiverActivity extends Activity {
                 .put("inApp", false)
                 .put("timed", false);
         JSONObject item = new JSONObject()
-                .put("key", "share-" + Integer.toHexString(url.hashCode()))
+                .put("key", (replaceKey != null && !replaceKey.isEmpty()) ? replaceKey : "share-" + Integer.toHexString(url.hashCode()))
                 .put("live", false)
                 .put("title", title)
                 .put("channel", app)
