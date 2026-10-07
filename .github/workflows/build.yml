@@ -68,6 +68,7 @@ jobs:
           cp Hope-build/app.bundle.min.js   www/
           cp Hope-build/manifest.json       www/
           cp Hope-build/sw.js               www/
+          cp Hope-build/tailwind.css        www/
           cp -r Hope-build/icons            www/
           [ -d Hope-build/dictionaries ] && cp -r Hope-build/dictionaries www/ || true
           [ -d Hope-build/src ]          && cp -r Hope-build/src          www/ || true
