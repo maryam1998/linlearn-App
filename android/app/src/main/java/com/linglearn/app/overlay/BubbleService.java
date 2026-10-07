@@ -320,11 +320,21 @@ public class BubbleService extends Service {
     // ── نمایش/پنهان‌شدنِ خودکارِ کادر ───────────────────────────────────────
     // وقتی چیزی پخش نمی‌شه (ویدیو pause، صدا قطع، یا ضبط متوقف شد) کادر خودش جمع می‌شه و
     // با شروعِ دوباره‌ی پخش خودش برمی‌گرده. بستنِ دستی با ▾ همچنان تا لمسِ حباب پنهان می‌مونه.
-    private static final long IDLE_HIDE_MS = 1000;   // بعد از قطعِ صدا/ویدیو کادر تقریباً بلافاصله بسته می‌شه
+    private static final long IDLE_HIDE_MS = 3000;   // بعد از قطعِ صدا/ویدیو چند ثانیه صبر می‌کنه (مکثِ بین جمله‌ها کادر را نپرانه) و بعد نرم محو می‌شه
+    private static final long IDLE_TICK_MS = 250;     // دقتِ بررسیِ وضعیتِ پخش
+    private static final long REOPEN_CONFIRM_MS = 400; // صدا باید این‌قدر پیوسته باشه تا کادر باز شه (نویزِ کوتاه کادر را باز نکنه)
+    private static final long PANEL_FADE_IN_MS = 180;
+    private static final long PANEL_FADE_OUT_MS = 280;
+    private static final long REOPEN_KEEP_HISTORY_MS = 45000;  // منبعِ ناشناس: اگه کمتر از این مدت بسته بوده، تاریخچه نگه داشته می‌شه
     private volatile long lastVoiceMs = 0;   // آخرین لحظه‌ای که صدایی از سیستم شنیده شد
     private volatile long lastTextMs = 0;    // آخرین لحظه‌ای که متنِ تشخیص‌داده‌شده رسید
     private volatile long lastActiveMs = 0;  // آخرین لحظه‌ای که «چیزی در حالِ پخش» یا کاربر مشغول بود
     private boolean idleHidden = false;      // کادر را خودکار (نه کاربر) بسته‌ایم
+    private boolean idlePinned = false;      // کاربر در حالِ سکوت کادر را برای خواندن باز کرده؛ تا بستنِ دستی خودکار بسته نشه
+    private boolean fadingOut = false;       // کادر در حالِ محو شدنِ خودکار است
+    private int fadeGen = 0;
+    private long idleHiddenAtMs = 0;
+    private long activeSinceMs = 0;          // از کی صدا/پخش پیوسته فعال است (0 = فعال نیست)
     private final Runnable idleRunnable = this::idleTick;
 
     private boolean somethingPlaying(long now) {
@@ -341,16 +351,48 @@ public class BubbleService extends Service {
         boolean busy = (wordCard != null && wordCard.getVisibility() == View.VISIBLE)
                 || (scroll != null && (scroll.frozen || SystemClock.uptimeMillis() - scroll.lastUserTouch < 6000));
         if (active || busy) lastActiveMs = now;
-        if (active && idleHidden) {
-            reopenFromIdle();
-        } else if (!active && !busy && panelShown && !userHidden && now - lastActiveMs > IDLE_HIDE_MS) {
-            idleHidden = true;
-            userHidden = true;
-            final boolean wasFree = panelFree;   // جای دستیِ کادر با بسته‌شدنِ خودکار گم نشه
+        if (!active) activeSinceMs = 0;
+        else if (activeSinceMs == 0) activeSinceMs = now;
+
+        if (fadingOut) {
+            // وسطِ محو شدن صدا برگشت یا کاربر لمس کرد → منصرف شو
+            if (active || busy) { cancelPanelFade(); idleHidden = false; userHidden = false; }
+        } else if (active && idleHidden) {
+            boolean ytNow = yt != null && yt.isPlaying();
+            if (ytNow || now - activeSinceMs >= REOPEN_CONFIRM_MS) reopenFromIdle();
+        } else if (!active && !busy && panelShown && !userHidden && !idlePinned
+                && now - lastActiveMs > IDLE_HIDE_MS) {
+            fadeOutPanelForIdle();
+        }
+        main.postDelayed(idleRunnable, IDLE_TICK_MS);
+    }
+
+    /** بسته‌شدنِ خودکار: محوِ نرم و بعد برداشتنِ کادر (جای دستیِ کادر حفظ می‌شه). */
+    private void fadeOutPanelForIdle() {
+        if (!panelShown || panel == null || fadingOut) return;
+        fadingOut = true;
+        idleHidden = true;
+        userHidden = true;
+        idleHiddenAtMs = SystemClock.elapsedRealtime();
+        final int gen = ++fadeGen;
+        panel.animate().cancel();
+        panel.animate().alpha(0f).setDuration(PANEL_FADE_OUT_MS).withEndAction(() -> {
+            if (!fadingOut || gen != fadeGen) return;
+            fadingOut = false;
+            final boolean wasFree = panelFree;
             removePanel();
             panelFree = wasFree;
+        }).start();
+    }
+
+    private void cancelPanelFade() {
+        if (!fadingOut) return;
+        fadingOut = false;
+        fadeGen++;
+        if (panel != null) {
+            panel.animate().cancel();
+            panel.animate().alpha(1f).setDuration(120).start();
         }
-        main.postDelayed(idleRunnable, 700);
     }
 
     /** کادری که خودکار بسته شده بود دوباره باز می‌شه و (در حالتِ یوتیوب) سرِ جمله‌ی در حالِ پخش می‌ره. */
@@ -365,7 +407,10 @@ public class BubbleService extends Service {
                 YtMedia.Now np = YtMedia.nowPlaying(this);
                 if (np != null && np.title != null && !np.title.isEmpty()) key = np.pkg + "|" + np.title;
             } catch (Throwable ignored) {}
-            if (key.isEmpty() || !key.equals(lastSourceKey)) clearHistory();
+            boolean sameSource = key.isEmpty()
+                    ? (SystemClock.elapsedRealtime() - idleHiddenAtMs < REOPEN_KEEP_HISTORY_MS)
+                    : key.equals(lastSourceKey);
+            if (!sameSource) clearHistory();
             lastSourceKey = key;
         } else if (yt == null) {
             try {
@@ -695,7 +740,7 @@ public class BubbleService extends Service {
                             } else {
                                 bubble.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
                                 if (bubble.collapseAmount() > 0.5f) dockBubble(false);   // لمسِ اولِ حبابِ نیمه‌پنهان: فقط بیرون می‌آید (کلیکِ ناخواسته ضبط را شروع نکند)
-                                else if (idleHidden && recording) reopenFromIdle();   // کادر خودکار بسته شده بود: لمس فقط بازش می‌کنه، ضبط را قطع نمی‌کنه
+                                else if (idleHidden && recording) { idlePinned = !somethingPlaying(SystemClock.elapsedRealtime()); reopenFromIdle(); }   // کادر خودکار بسته شده بود: لمس فقط بازش می‌کنه، ضبط را قطع نمی‌کنه
                                 else toggleRecording();
                             }
                         }
@@ -716,7 +761,8 @@ public class BubbleService extends Service {
         if (panelShown) { idleHidden = false; userHidden = true; removePanel(); return; }
         idleHidden = false;
         userHidden = false;
-        lastActiveMs = SystemClock.elapsedRealtime() + 8000;   // بازکردنِ دستیِ تاریخچه: کادر چند ثانیه‌ی بیشتر می‌مونه
+        lastActiveMs = SystemClock.elapsedRealtime();
+        idlePinned = !somethingPlaying(lastActiveMs);   // در سکوت باز شد → تا وقتی خودت نبندی (▾ یا لمسِ حباب) می‌مونه تا بخونی
         if (history.isEmpty()) {
             showNotice(isFa()
                     ? "لمس: شروع/توقف ضبط  ·  نگه‌داشتن: تاریخچه  ·  ✕ یا کشیدن به پایین: بستن"
@@ -1426,11 +1472,18 @@ public class BubbleService extends Service {
 
     private void showPanel() {
         if (wm == null || bubble == null) return;
+        if (fadingOut) cancelPanelFade();
         ensurePanel();
         refreshHeader();
         computePanelPos();
         try {
-            if (!panelShown) { wm.addView(panel, panelLp); panelShown = true; }
+            if (!panelShown) {
+                panel.animate().cancel();
+                panel.setAlpha(0f);
+                wm.addView(panel, panelLp);
+                panelShown = true;
+                panel.animate().alpha(1f).setDuration(PANEL_FADE_IN_MS).start();
+            }
             else wm.updateViewLayout(panel, panelLp);
         } catch (Exception e) { Log.w(TAG, "panel show failed", e); }
         // history stays on screen while recording / while there is history; a lone notice fades out
@@ -1441,6 +1494,9 @@ public class BubbleService extends Service {
     private void removePanel() {
         stopPanelSpeech();
         main.removeCallbacks(hidePanel);
+        if (fadingOut) { fadingOut = false; fadeGen++; if (panel != null) panel.animate().cancel(); }
+        if (panel != null) panel.setAlpha(1f);
+        idlePinned = false;
         if (panelShown && panel != null && wm != null) {
             try { wm.removeView(panel); } catch (Exception ignored) {}
         }
