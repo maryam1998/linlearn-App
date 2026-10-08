@@ -142,6 +142,7 @@ final class WhisperModelManager {
         CANCEL = false;
         ACTIVE = model;
         Thread t = new Thread(() -> {
+            Exception result = null;
             try {
                 Exception last = null;
                 for (int attempt = 1; attempt <= 3; attempt++) {
@@ -159,12 +160,16 @@ final class WhisperModelManager {
                         try { Thread.sleep(1500L * attempt); } catch (InterruptedException ie) { break; }
                     }
                 }
-                if (last != null) { if (cb != null) cb.onError(model, last); }
-                else if (cb != null) cb.onDone(model);
+                result = last;
             } finally {
+                // اول وضعیت رو پاک کن، بعد به JS خبر بده — قبلاً JS موقعِ refresh (بعد از «توقف»)
+                // هنوز downloading=true می‌دید و دکمه‌ها گیر می‌کردن.
                 ACTIVE = null;
                 CANCEL = false;
                 DOWNLOADING.set(false);
+            }
+            if (cb != null) {
+                if (result != null) cb.onError(model, result); else cb.onDone(model);
             }
         }, "whisper-download");
         t.setDaemon(true);

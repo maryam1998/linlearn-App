@@ -298,6 +298,30 @@ final class SherpaModelManager {
     }
 
     // ============ دانلود STT ============
+    // توقف/ادامه مثلِ دانلودِ صدا: فایل‌های .part نگه داشته می‌شن و دانلودِ بعدی با Range ادامه پیدا می‌کنه.
+    private static volatile boolean STT_CANCEL = false;
+    private static volatile String STT_ACTIVE = null;
+
+    /** توقفِ دانلودِ مدلِ تشخیص گفتار (بخشِ دانلودشده می‌مونه). */
+    static void cancelDownload() { if (DOWNLOADING.get()) STT_CANCEL = true; }
+
+    /** زبانی که همین الان مدلش دانلود می‌شه (یا null). */
+    static String activeDownloadLang() { return STT_ACTIVE; }
+
+    /** حجمِ بخشِ دانلودشده‌ی ناتمامِ مدلِ یه زبان (برای دکمه‌ی «ادامه»). */
+    static long getSttPartialBytes(Context ctx, String lang) {
+        String l = normalize(lang);
+        Spec s = l == null ? null : SPECS.get(l);
+        if (s == null) return 0;
+        long sum = 0;
+        File dir = sttDirFor(ctx, l);
+        for (String f : s.files()) {
+            File p = new File(dir, f + ".part");
+            if (p.isFile()) sum += p.length();
+        }
+        return sum;
+    }
+
     static void downloadModel(final Context ctx, final String lang, final ProgressCallback cb) {
         final Context app = ctx.getApplicationContext();
         final String l = normalize(lang);
@@ -311,45 +335,84 @@ final class SherpaModelManager {
             return;
         }
         DOWNLOADING_STATE = true;
+        STT_CANCEL = false;
+        STT_ACTIVE = l;
         Thread t = new Thread(() -> {
+            Exception failure = null;
             try {
                 File dir = sttDirFor(app, l);
                 if (!dir.isDirectory() && !dir.mkdirs()) throw new java.io.IOException("cannot create " + dir);
-                long done = 0;
+                long[] done = {0};
                 for (String name : s.files()) {
+                    if (STT_CANCEL) throw new DownloadCancelled();
                     File target = new File(dir, name);
-                    if (target.isFile() && target.length() > 0) { done += target.length(); continue; }
-                    File part = new File(dir, name + ".part");
-                    String url = HF_BASE + s.repo + "/resolve/main/" + name;
-                    Request req = new Request.Builder().url(url).build();
-                    try (Response r = HTTP.newCall(req).execute()) {
-                        if (!r.isSuccessful() || r.body() == null) {
-                            throw new java.io.IOException("HTTP " + r.code() + " for " + name);
-                        }
-                        try (InputStream in = r.body().byteStream();
-                             OutputStream out = new FileOutputStream(part)) {
-                            byte[] buf = new byte[64 * 1024];
-                            int n;
-                            while ((n = in.read(buf)) > 0) {
-                                out.write(buf, 0, n);
-                                done += n;
-                                if (cb != null) cb.onProgress(l, done, -1);
-                            }
-                        }
-                    }
-                    if (!part.renameTo(target)) throw new java.io.IOException("rename failed: " + name);
+                    if (target.isFile() && target.length() > 0) { done[0] += target.length(); continue; }
+                    downloadSttFile(HF_BASE + s.repo + "/resolve/main/" + name, target, cb, l, done);
                 }
-                if (cb != null) cb.onDone(l);
             } catch (Exception e) {
-                Log.w(TAG, "STT download failed for " + l, e);
-                if (cb != null) cb.onError(l, e);
+                if (!(e instanceof DownloadCancelled)) Log.w(TAG, "STT download failed for " + l, e);
+                failure = e;
             } finally {
+                // اول وضعیت رو پاک کن، بعد به JS خبر بده — وگرنه JS موقعِ refresh هنوز «در حال دانلود» می‌بینه
+                STT_ACTIVE = null;
+                STT_CANCEL = false;
                 DOWNLOADING.set(false);
                 DOWNLOADING_STATE = false;
+            }
+            if (cb != null) {
+                if (failure == null) cb.onDone(l); else cb.onError(l, failure);
             }
         }, "sherpa-download");
         t.setDaemon(true);
         t.start();
+    }
+
+    /** یک فایلِ مدلِ STT رو با امکانِ ادامه (Range) و توقفِ کاربر می‌گیره. done[0] = مجموعِ بایت‌های همه‌ی فایل‌ها. */
+    private static void downloadSttFile(String url, File target, ProgressCallback cb, String l, long[] done) throws Exception {
+        File part = new File(target.getParentFile(), target.getName() + ".part");
+        long existing = part.isFile() ? part.length() : 0;
+        Request.Builder rb = new Request.Builder().url(url);
+        if (existing > 0) rb.header("Range", "bytes=" + existing + "-");
+        try (Response r = HTTP.newCall(rb.build()).execute()) {
+            if (r.code() == 416) {
+                // بخشِ قبلی با فایلِ سرور نمی‌خونه؛ از اول می‌گیریم
+                part.delete();
+                downloadSttFile(url, target, cb, l, done);
+                return;
+            }
+            if (!r.isSuccessful() || r.body() == null) {
+                throw new java.io.IOException("HTTP " + r.code() + " for " + target.getName());
+            }
+            String ctype = r.header("Content-Type");
+            if (ctype != null && ctype.toLowerCase(Locale.ROOT).startsWith("text/html")) {
+                part.delete();
+                throw new java.io.IOException("server returned HTML instead of " + target.getName());
+            }
+            boolean resumed = r.code() == 206 && existing > 0;
+            long base = resumed ? existing : 0;
+            long len = r.body().contentLength();
+            long total = len > 0 ? base + len : -1;
+            done[0] += base;
+            long lastEmit = 0;
+            try (InputStream in = r.body().byteStream();
+                 OutputStream out = new FileOutputStream(part, resumed)) {
+                byte[] buf = new byte[64 * 1024];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    if (STT_CANCEL) throw new DownloadCancelled();
+                    out.write(buf, 0, n);
+                    done[0] += n;
+                    if (cb != null) {
+                        long now = System.currentTimeMillis();
+                        if (now - lastEmit > 300) { lastEmit = now; cb.onProgress(l, done[0], -1); }
+                    }
+                }
+            }
+            if (cb != null) cb.onProgress(l, done[0], -1);
+            if (total > 0 && part.length() != total) throw new java.io.IOException("incomplete download: " + target.getName());
+        }
+        if (target.exists()) target.delete();
+        if (!part.renameTo(target)) throw new java.io.IOException("rename failed: " + target.getName());
     }
 
     // ============ دانلود TTS ============

@@ -509,14 +509,29 @@ final class TtsEngine {
                 }
                 frames += c.length;
             }
-            // صبر تا آخرین نمونه واقعاً پخش بشه (تا onDone زودتر از پایانِ صدا نیاد)
+            // رفعِ باگِ «لغات و جمله‌های کوتاه خونده نمی‌شن»:
+            // توی AudioTrack حالتِ MODE_STREAM، پخش تا وقتی بافر کاملاً پر نشده شروع نمی‌شه
+            // (بافرِ ما ~۱ ثانیه‌ست). هر صدایی که کوتاه‌تر از اون باشه (لغت‌ها و جمله‌های کوتاه)
+            // هیچ‌وقت شروع نمی‌شد و آخرِ کار با flush() دور ریخته می‌شد، ولی onDone(ok) هم
+            // صدا زده می‌شد، پس بی‌صدا رد می‌شد. راهِ درست: بعد از نوشتنِ آخرین تکه stop() می‌زنیم؛
+            // توی حالتِ STREAM یعنی «هرچی تو بافره تا آخر پخش بشه» (drain).
             if (!cancelled && ok && started) {
+                try { track.stop(); } catch (Throwable ignored) {}
                 long deadline = SystemClock.uptimeMillis() + (frames * 1000L / sampleRate) + 1500;
                 while (SystemClock.uptimeMillis() < deadline) {
                     if (epoch.get() != myEpoch || released) { cancelled = true; break; }
                     long head = track.getPlaybackHeadPosition() & 0xFFFFFFFFL;
                     if (head >= frames) break;
                     Thread.sleep(15);
+                }
+                // head یعنی «به mixer رسید»، نه «از بلندگو درآمد»؛ چند ده میلی‌ثانیه صبر می‌کنیم
+                // تا ته‌ِ صدا با pause()/flush() آخرِ finally بریده نشه.
+                if (!cancelled) {
+                    long until = SystemClock.uptimeMillis() + 120;
+                    while (SystemClock.uptimeMillis() < until) {
+                        if (epoch.get() != myEpoch || released) { cancelled = true; break; }
+                        Thread.sleep(10);
+                    }
                 }
             }
             if (!cancelled && ok && !gotAudio.get()) {

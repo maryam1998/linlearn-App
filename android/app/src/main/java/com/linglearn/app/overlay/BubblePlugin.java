@@ -321,7 +321,17 @@ public class BubblePlugin extends Plugin {
         ret.put("supported", SherpaModelManager.isAvailable(lang));
         ret.put("downloaded", SherpaModelManager.getModelDir(ctx, lang) != null);
         ret.put("downloading", SherpaModelManager.isDownloading());
+        ret.put("partialBytes", SherpaModelManager.getSttPartialBytes(ctx, lang));
+        String act = SherpaModelManager.activeDownloadLang();
+        ret.put("activeLang", act == null ? "" : act);
         call.resolve(ret);
+    }
+
+    // cancelModelDownload() — توقفِ دانلودِ مدلِ تشخیص گفتار (فایل .part می‌مونه تا ادامه پیدا کنه)
+    @PluginMethod
+    public void cancelModelDownload(PluginCall call) {
+        SherpaModelManager.cancelDownload();
+        call.resolve();
     }
 
     // downloadModel({ lang: "en" })
@@ -363,6 +373,7 @@ public class BubblePlugin extends Plugin {
                     public void onError(String l, Exception e) {
                         JSObject ret = new JSObject();
                         ret.put("lang", l);
+                        ret.put("cancelled", e instanceof SherpaModelManager.DownloadCancelled);
                         ret.put("error", e.getMessage() != null ? e.getMessage() : "unknown");
                         notifyListeners("modelDownloadError", ret);
                     }
