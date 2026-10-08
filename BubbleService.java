@@ -223,6 +223,7 @@ public class BubbleService extends Service {
         s.main.post(() -> {
             if (s.yt != null) s.yt.onSettingsChanged();
             s.prepareLocalTranslator();
+            s.applyAppFont();
             s.refreshHeader();
             for (Entry e : new ArrayList<>(s.history)) s.renderEntry(e);
             s.refreshLayout();
@@ -302,7 +303,13 @@ public class BubbleService extends Service {
     private Entry live;                   // sentence currently being spoken (partial result)
     private YtSubtitles yt;               // 📺 حالت یوتیوب (null = خاموش)
     private TextView tvYt;                // دکمه‌ی ▶ در هدرِ پنل
+    private TextView tvYtRestart;         // دکمه‌ی ⏮ : کلِ ویدیوی یوتیوب از اول
+    private TextView tvYtAll;             // دکمه‌ی 🔂 : (حالتِ «متنِ کامل») خواندنِ کلِ متن از اول و تکرارِ آن
+    private boolean ytFullMode = false;   // 📄 زیرنویسِ کامل بدونِ دسترسیِ اعلان و بدونِ پررنگ‌شدن
+    private volatile boolean fullLoop = false;
+    private int fullIdx = 0, fullToken = 0;
     private TextView tvSave;              // دکمه‌ی 💾 (هم حالت یوتیوب، هم ترجمه‌ی زنده)
+    private String lastSourceKey = "";     // پلیر|عنوانِ آخرین منبعِ صدا؛ برای نگه داشتنِ تاریخچه وقتی همان فایل ادامه پیدا می‌کند
     private String liveKey = null;        // شناسه‌ی جلسه‌ی ترجمه‌ی زنده برای ذخیره (با پاک کردنِ تاریخچه ریست می‌شود)
     private long liveStartMs = 0;
     private boolean ytListMode = false;       // 📺 لیستِ کاملِ زیرنویس در پنل است (سقفِ تاریخچه اعمال نشود)
@@ -319,11 +326,21 @@ public class BubbleService extends Service {
     // ── نمایش/پنهان‌شدنِ خودکارِ کادر ───────────────────────────────────────
     // وقتی چیزی پخش نمی‌شه (ویدیو pause، صدا قطع، یا ضبط متوقف شد) کادر خودش جمع می‌شه و
     // با شروعِ دوباره‌ی پخش خودش برمی‌گرده. بستنِ دستی با ▾ همچنان تا لمسِ حباب پنهان می‌مونه.
-    private static final long IDLE_HIDE_MS = 1000;   // بعد از قطعِ صدا/ویدیو کادر تقریباً بلافاصله بسته می‌شه
+    private static final long IDLE_HIDE_MS = 3000;   // بعد از قطعِ صدا/ویدیو چند ثانیه صبر می‌کنه (مکثِ بین جمله‌ها کادر را نپرانه) و بعد نرم محو می‌شه
+    private static final long IDLE_TICK_MS = 250;     // دقتِ بررسیِ وضعیتِ پخش
+    private static final long REOPEN_CONFIRM_MS = 400; // صدا باید این‌قدر پیوسته باشه تا کادر باز شه (نویزِ کوتاه کادر را باز نکنه)
+    private static final long PANEL_FADE_IN_MS = 180;
+    private static final long PANEL_FADE_OUT_MS = 280;
+    private static final long REOPEN_KEEP_HISTORY_MS = 600000;  // منبعِ ناشناس: اگه کمتر از این مدت بسته بوده، تاریخچه نگه داشته می‌شه
     private volatile long lastVoiceMs = 0;   // آخرین لحظه‌ای که صدایی از سیستم شنیده شد
     private volatile long lastTextMs = 0;    // آخرین لحظه‌ای که متنِ تشخیص‌داده‌شده رسید
     private volatile long lastActiveMs = 0;  // آخرین لحظه‌ای که «چیزی در حالِ پخش» یا کاربر مشغول بود
     private boolean idleHidden = false;      // کادر را خودکار (نه کاربر) بسته‌ایم
+    private boolean idlePinned = false;      // کاربر در حالِ سکوت کادر را برای خواندن باز کرده؛ تا بستنِ دستی خودکار بسته نشه
+    private boolean fadingOut = false;       // کادر در حالِ محو شدنِ خودکار است
+    private int fadeGen = 0;
+    private long idleHiddenAtMs = 0;
+    private long activeSinceMs = 0;          // از کی صدا/پخش پیوسته فعال است (0 = فعال نیست)
     private final Runnable idleRunnable = this::idleTick;
 
     private boolean somethingPlaying(long now) {
@@ -337,19 +354,51 @@ public class BubbleService extends Service {
         if (!running) return;
         long now = SystemClock.elapsedRealtime();
         boolean active = somethingPlaying(now);
-        boolean busy = (wordCard != null && wordCard.getVisibility() == View.VISIBLE)
+        boolean busy = panelDragging || (wordCard != null && wordCard.getVisibility() == View.VISIBLE)
                 || (scroll != null && (scroll.frozen || SystemClock.uptimeMillis() - scroll.lastUserTouch < 6000));
         if (active || busy) lastActiveMs = now;
-        if (active && idleHidden) {
-            reopenFromIdle();
-        } else if (!active && !busy && panelShown && !userHidden && now - lastActiveMs > IDLE_HIDE_MS) {
-            idleHidden = true;
-            userHidden = true;
-            final boolean wasFree = panelFree;   // جای دستیِ کادر با بسته‌شدنِ خودکار گم نشه
+        if (!active) activeSinceMs = 0;
+        else if (activeSinceMs == 0) activeSinceMs = now;
+
+        if (fadingOut) {
+            // وسطِ محو شدن صدا برگشت یا کاربر لمس کرد → منصرف شو
+            if (active || busy) { cancelPanelFade(); idleHidden = false; userHidden = false; }
+        } else if (active && idleHidden) {
+            boolean ytNow = yt != null && yt.isPlaying();
+            if (ytNow || now - activeSinceMs >= REOPEN_CONFIRM_MS) reopenFromIdle();
+        } else if (!active && !busy && panelShown && !userHidden && !idlePinned
+                && now - lastActiveMs > IDLE_HIDE_MS) {
+            fadeOutPanelForIdle();
+        }
+        main.postDelayed(idleRunnable, IDLE_TICK_MS);
+    }
+
+    /** بسته‌شدنِ خودکار: محوِ نرم و بعد برداشتنِ کادر (جای دستیِ کادر حفظ می‌شه). */
+    private void fadeOutPanelForIdle() {
+        if (!panelShown || panel == null || fadingOut) return;
+        fadingOut = true;
+        idleHidden = true;
+        userHidden = true;
+        idleHiddenAtMs = SystemClock.elapsedRealtime();
+        final int gen = ++fadeGen;
+        panel.animate().cancel();
+        panel.animate().alpha(0f).setDuration(PANEL_FADE_OUT_MS).withEndAction(() -> {
+            if (!fadingOut || gen != fadeGen) return;
+            fadingOut = false;
+            final boolean wasFree = panelFree;
             removePanel();
             panelFree = wasFree;
+        }).start();
+    }
+
+    private void cancelPanelFade() {
+        if (!fadingOut) return;
+        fadingOut = false;
+        fadeGen++;
+        if (panel != null) {
+            panel.animate().cancel();
+            panel.animate().alpha(1f).setDuration(120).start();
         }
-        main.postDelayed(idleRunnable, 700);
     }
 
     /** کادری که خودکار بسته شده بود دوباره باز می‌شه و (در حالتِ یوتیوب) سرِ جمله‌ی در حالِ پخش می‌ره. */
@@ -357,8 +406,24 @@ public class BubbleService extends Service {
         idleHidden = false;
         userHidden = false;
         lastActiveMs = SystemClock.elapsedRealtime();
-        // ویدیو/صدای تازه شروع شد → متن‌های ویدیوی قبلی پاک بشن (در حالتِ یوتیوب، فهرستِ همان ویدیو دست نمی‌خوره)
-        if (yt == null && !history.isEmpty()) clearHistory();
+        // پلیرِ همان فایل (کتابِ صوتی/پادکست…) ادامه پیدا کرد → تاریخچه می‌مونه؛ منبعِ دیگه یا برنامه‌ی بدونِ MediaSession → پاک می‌شه
+        if (yt == null && !history.isEmpty()) {
+            String key = "";
+            try {
+                YtMedia.Now np = YtMedia.nowPlaying(this);
+                if (np != null && np.title != null && !np.title.isEmpty()) key = np.pkg + "|" + np.title;
+            } catch (Throwable ignored) {}
+            boolean sameSource = key.isEmpty()
+                    ? (SystemClock.elapsedRealtime() - idleHiddenAtMs < REOPEN_KEEP_HISTORY_MS)
+                    : key.equals(lastSourceKey);
+            if (!sameSource) clearHistory();
+            lastSourceKey = key;
+        } else if (yt == null) {
+            try {
+                YtMedia.Now np = YtMedia.nowPlaying(this);
+                lastSourceKey = (np != null && np.title != null && !np.title.isEmpty()) ? np.pkg + "|" + np.title : "";
+            } catch (Throwable ignored) { lastSourceKey = ""; }
+        }
         showPanel();
         if (yt != null && ytCur >= 0) {
             ytWantedForce = true;
@@ -416,7 +481,10 @@ public class BubbleService extends Service {
     private static final int MAX_LINE_WORDS = 22;        // جمله‌ی بدونِ مکث/نقطه از این بلندتر شد، سرِ یک ویرگول/حرفِ ربط شکسته می‌شود
     private static final java.util.Set<String> ABBREVIATIONS = new HashSet<>(Arrays.asList(
             "mr.", "mrs.", "ms.", "dr.", "st.", "prof.", "jr.", "sr.", "vs.", "mt.", "no.", "gen.", "col.",
-            "capt.", "lt.", "sgt.", "rev.", "hon.", "messrs.", "etc.", "e.g.", "i.e."));
+            "capt.", "lt.", "sgt.", "rev.", "hon.", "messrs.", "etc.", "e.g.", "i.e.",
+            // اسپانیایی/آلمانی/فرانسوی/ایتالیایی: مخففی که نقطه دارد پایانِ جمله نیست
+            "sra.", "srta.", "dra.", "hr.", "fr.", "nr.", "bzw.", "usw.", "ca.", "z.b.", "d.h.", "u.a.",
+            "bspw.", "ggf.", "evtl.", "mme.", "mlle.", "p.ej.", "sig.", "dott.", "ing.", "avv."));
     private int consumedWords = 0;                       // چند کلمه‌ی اولِ گفتارِ جاری قبلاً به‌صورتِ خطِ جدا بسته شده (تشخیصِ گفتار تجمعی است)
     private String pendingHyp = "";
     private long lastSrcRenderAt = 0;
@@ -641,7 +709,7 @@ public class BubbleService extends Service {
                         }
                         if (dragging) {
                             int nx = clamp(Math.round(startX + dx), 0, screenW() - bubbleSize);
-                            int ny = clamp(Math.round(startY + dy), 0, screenH() - bubbleSize);
+                            int ny = clamp(Math.round(startY + dy), minBubbleY(), maxBubbleY());
                             boolean hot = closeView != null
                                     && Math.hypot(nx + bubbleSize / 2f - tgtCx, ny + bubbleSize / 2f - tgtCy) < dp(84);
                             if (hot != overTarget) {
@@ -680,8 +748,9 @@ public class BubbleService extends Service {
                                 }
                             } else {
                                 bubble.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
-                                if (bubble.collapseAmount() > 0.5f) dockBubble(false);   // لمسِ اولِ حبابِ نیمه‌پنهان: فقط بیرون می‌آید (کلیکِ ناخواسته ضبط را شروع نکند)
-                                else if (idleHidden && recording) reopenFromIdle();   // کادر خودکار بسته شده بود: لمس فقط بازش می‌کنه، ضبط را قطع نمی‌کنه
+                                // حبابِ نیمه‌پنهان در حالِ ضبط هم با «یک» لمس ضبط را قطع می‌کند (قبلاً چند لمس لازم بود و حباب دوباره جمع می‌شد)؛
+                                // فقط وقتی ضبط خاموش است لمسِ اول حباب را بیرون می‌آورد تا ضبطِ ناخواسته شروع نشود.
+                                if (bubble.collapseAmount() > 0.5f && !recording) dockBubble(false);
                                 else toggleRecording();
                             }
                         }
@@ -702,13 +771,23 @@ public class BubbleService extends Service {
         if (panelShown) { idleHidden = false; userHidden = true; removePanel(); return; }
         idleHidden = false;
         userHidden = false;
-        lastActiveMs = SystemClock.elapsedRealtime() + 8000;   // بازکردنِ دستیِ تاریخچه: کادر چند ثانیه‌ی بیشتر می‌مونه
+        lastActiveMs = SystemClock.elapsedRealtime();
+        idlePinned = !somethingPlaying(lastActiveMs);   // در سکوت باز شد → تا وقتی خودت نبندی (▾ یا لمسِ حباب) می‌مونه تا بخونی
         if (history.isEmpty()) {
             showNotice(isFa()
                     ? "لمس: شروع/توقف ضبط  ·  نگه‌داشتن: تاریخچه  ·  ✕ یا کشیدن به پایین: بستن"
                     : "Tap: start/stop  ·  Hold: history  ·  ✕ or drag down: close");
         } else showPanel();
     }
+
+    /** حباب زیرِ نوارِ وضعیت و بالای نوارِ ناوبری می‌ماند تا هیچ‌وقت در گوشه‌ی بالا گیر نکند و لمس‌ناپذیر نشود. */
+    private int minBubbleY() {
+        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        int h = id > 0 ? getResources().getDimensionPixelSize(id) : dp(24);
+        return h + dp(6);
+    }
+
+    private int maxBubbleY() { return Math.max(minBubbleY(), screenH() - bubbleSize - dp(64)); }
 
     private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
 
@@ -730,6 +809,7 @@ public class BubbleService extends Service {
         final int side = left ? -1 : 1;
         final int target = left ? -hide : screenW() - bubbleSize + hide;
         final int from = bubbleLp.x;
+        final int fromY = bubbleLp.y, toY = clamp(bubbleLp.y, minBubbleY(), maxBubbleY());
         final float c0 = bubble.collapseAmount(), c1 = collapse ? 1f : 0f;
         dockAnim = ValueAnimator.ofFloat(0f, 1f);
         dockAnim.setDuration(240);
@@ -738,6 +818,7 @@ public class BubbleService extends Service {
             if (wm == null || bubble == null) return;
             float t = (Float) a.getAnimatedValue();
             bubbleLp.x = Math.round(from + (target - from) * t);
+            bubbleLp.y = Math.round(fromY + (toY - fromY) * t);
             bubble.setDock(side, c0 + (c1 - c0) * t);
             try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
             movePanel();
@@ -934,7 +1015,7 @@ public class BubbleService extends Service {
 
         private float discR() { return Math.min(getWidth(), getHeight()) / 2f - 8f * d; }
 
-        private float badgeAlpha() { return dragMode ? 0f : Math.max(0f, 1f - collapse * 2f); }
+        private float badgeAlpha() { return 0f; }   // ✕ روی حباب حذف شد؛ بستن: نگه‌داشتنِ کادر و رها کردن روی ✕ پایین، یا کشیدنِ حباب روی ✕، یا اعلان
 
         private float badgeCx() { return getWidth() / 2f - side * discR() * 0.80f; }
 
@@ -987,16 +1068,21 @@ public class BubbleService extends Service {
             rf.set(cx - r + 3.5f * d, cy - r + 3.5f * d, cx + r - 3.5f * d, cy + r - 3.5f * d);
             cv.drawArc(rf, 205f, 130f, false, shine);         // درخشِ ظریفِ نیمه‌ی بالا
 
-            // آیکونِ میکروفون؛ هنگامِ جمع‌شدن به سمتِ نیمه‌ی دیدنی می‌رود
+            // آیکونِ میکروفون؛ هنگامِ جمع‌شدن به سمتِ نیمه‌ی دیدنی می‌رود. در حالِ ضبط به‌جای آن «■ توقف» نشان داده می‌شود.
             float ix = cx - side * collapse * (w * 0.22f);
             float k = 0.85f * d;
-            rf.set(ix - 4.2f * k, cy - 11f * k, ix + 4.2f * k, cy + 2f * k);
-            cv.drawRoundRect(rf, 4.2f * k, 4.2f * k, fill);
-            line.setStrokeWidth(1.9f * k);
-            rf.set(ix - 8f * k, cy - 8f * k, ix + 8f * k, cy + 7f * k);
-            cv.drawArc(rf, 0f, 180f, false, line);
-            cv.drawLine(ix, cy + 7f * k, ix, cy + 11f * k, line);
-            cv.drawLine(ix - 4f * k, cy + 11f * k, ix + 4f * k, cy + 11f * k, line);
+            if (rec) {
+                rf.set(ix - 7f * k, cy - 7f * k, ix + 7f * k, cy + 7f * k);
+                cv.drawRoundRect(rf, 3f * k, 3f * k, fill);
+            } else {
+                rf.set(ix - 4.2f * k, cy - 11f * k, ix + 4.2f * k, cy + 2f * k);
+                cv.drawRoundRect(rf, 4.2f * k, 4.2f * k, fill);
+                line.setStrokeWidth(1.9f * k);
+                rf.set(ix - 8f * k, cy - 8f * k, ix + 8f * k, cy + 7f * k);
+                cv.drawArc(rf, 0f, 180f, false, line);
+                cv.drawLine(ix, cy + 7f * k, ix, cy + 11f * k, line);
+                cv.drawLine(ix - 4f * k, cy + 11f * k, ix + 4f * k, cy + 11f * k, line);
+            }
 
             if (rec) {                                        // نقطه‌ی قرمزِ «در حال ضبط»؛ سمتِ داخلیِ صفحه تا در حالتِ نیمه‌پنهان دیده شود
                 float bx = cx - side * r * 0.72f, by = cy + r * 0.72f;
@@ -1030,7 +1116,7 @@ public class BubbleService extends Service {
     /** One recognised sentence and its translations (one per target language). */
     private static final class Entry {
         String src = "";
-        int shownWords = Integer.MAX_VALUE;   // تایپِ کلمه‌به‌کلمه: چند کلمه‌ی اول نمایش داده شده (MAX = بدونِ تایپ)
+        int shownChars = Integer.MAX_VALUE;   // تایپِ حرف‌به‌حرف: چند حرفِ اول نمایش داده شده (MAX = بدونِ تایپ)
         final long createdAt = System.currentTimeMillis();
         final HashMap<String, String> tr = new HashMap<>();        // lang -> shown text ("…" = pending)
         final HashMap<String, String> trSrc = new HashMap<>();     // lang -> source text that translation was made from
@@ -1224,6 +1310,15 @@ public class BubbleService extends Service {
         header.addView(tvHeader, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         tvYt = headerButton("\u25B6", v -> toggleYoutube());
         header.addView(tvYt);
+        tvYtRestart = headerButton("\u23EE", v -> restartYoutubeFromStart());   // ⏮ فقط در حالتِ یوتیوب دیده می‌شود
+        tvYtRestart.setPadding(dp(8), dp(6), dp(8), dp(6));
+        tvYtRestart.setVisibility(View.GONE);
+        header.addView(tvYtRestart);
+        tvYtAll = headerButton("\uD83D\uDD02", v -> toggleFullText());   // 🔂 فقط در حالتِ «متنِ کامل»
+        tvYtAll.setPadding(dp(8), dp(6), dp(8), dp(6));
+        tvYtAll.setVisibility(View.GONE);
+        header.addView(tvYtAll);
+        tvYt.setOnLongClickListener(v -> { askYoutubeAccessChoice(); return true; });   // نگه‌داشتنِ ▶ = انتخابِ «همگام» یا «فقط متنِ کامل»
         tvSave = headerButton("\uD83D\uDCBE", v -> saveCurrent());
         header.addView(tvSave);
         loadRepeatPref();
@@ -1232,7 +1327,7 @@ public class BubbleService extends Service {
         header.addView(tvRepeat);
         updateRepeatButton();
         updateYtButton();
-        TextView tvFont = headerButton("Aa", v -> toggleFontRow());
+        TextView tvFont = headerButton("Aa", v -> toggleFontRow());   // انتخابِ فونت: همان فونت‌های «نوع فونت» در تنظیماتِ اپ
         tvFont.setTypeface(Typeface.DEFAULT_BOLD);
         tvFont.setOnLongClickListener(v -> { resetView(); return true; });
         header.addView(tvFont);
@@ -1242,40 +1337,7 @@ public class BubbleService extends Service {
         header.addView(headerButton("\uD83D\uDDD1", v -> clearHistory()));
         header.addView(headerButton("\u25BE", v -> { idleHidden = false; userHidden = true; removePanel(); }));   // ▾ = فقط کادرِ تاریخچه را پنهان می‌کند (بستنِ حباب: ✕ روی خودِ حباب)
         tvHeader.setPadding(0, dp(8), 0, dp(8));          // سطحِ لمسِ بزرگ‌تر برای کشیدنِ کادر
-        final int dragSlop = ViewConfiguration.get(this).getScaledTouchSlop();
-        header.setOnTouchListener(new View.OnTouchListener() {
-            float downX, downY;
-            int startX, startY;
-            boolean moved;
-
-            @Override
-            public boolean onTouch(View v, MotionEvent e) {
-                switch (e.getActionMasked()) {
-                    case MotionEvent.ACTION_DOWN: {
-                        int[] loc = new int[2];
-                        panel.getLocationOnScreen(loc);
-                        startX = loc[0]; startY = loc[1];
-                        downX = e.getRawX(); downY = e.getRawY();
-                        moved = false;
-                        main.removeCallbacks(hidePanel);
-                        return true;
-                    }
-                    case MotionEvent.ACTION_MOVE: {
-                        float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
-                        if (!moved && (Math.abs(dx) > dragSlop || Math.abs(dy) > dragSlop)) moved = true;
-                        if (moved) {
-                            panelFree = true;
-                            panelFreeX = Math.round(startX + dx);
-                            panelFreeY = Math.round(startY + dy);
-                            refreshLayout();
-                        }
-                        return true;
-                    }
-                    default:
-                        return true;
-                }
-            }
-        });
+        header.setOnTouchListener(new PanelMover());      // کشیدنِ سربرگ = جابه‌جایی؛ نگه‌داشتن = برداشتنِ کادر + ✕ پایینِ صفحه
         panel.addView(header, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
@@ -1346,8 +1408,23 @@ public class BubbleService extends Service {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
+        // وقتی چیزی در حالِ پخش نیست، لمسِ بیرونِ کادر آن را (نرم) می‌بندد؛ متن می‌ماند و با پخشِ بعدی دوباره باز می‌شود.
+        // لمس همچنان به برنامه‌ی زیرین می‌رسد (ما آن را نمی‌بلعیم).
+        // لمس روی جاهای خالیِ کادر (حاشیه‌ها، فاصله‌ها) هم مثلِ سربرگ کادر را جابه‌جا می‌کند.
+        final PanelMover panelMover = new PanelMover();
+        panel.setOnTouchListener((v, ev) -> {
+            if (ev.getActionMasked() == MotionEvent.ACTION_OUTSIDE) {
+                boolean cardOpen = wordCard != null && wordCard.getVisibility() == View.VISIBLE;
+                if (!cardOpen && !panelDragging && panelShown && !fadingOut && !somethingPlaying(SystemClock.elapsedRealtime())) {
+                    main.post(this::fadeOutPanelForIdle);
+                }
+                return false;
+            }
+            return panelMover.onTouch(v, ev);
+        });
     }
 
     private TextView headerButton(String label, View.OnClickListener l) {
@@ -1412,11 +1489,18 @@ public class BubbleService extends Service {
 
     private void showPanel() {
         if (wm == null || bubble == null) return;
+        if (fadingOut) cancelPanelFade();
         ensurePanel();
         refreshHeader();
         computePanelPos();
         try {
-            if (!panelShown) { wm.addView(panel, panelLp); panelShown = true; }
+            if (!panelShown) {
+                panel.animate().cancel();
+                panel.setAlpha(0f);
+                wm.addView(panel, panelLp);
+                panelShown = true;
+                panel.animate().alpha(1f).setDuration(PANEL_FADE_IN_MS).start();
+            }
             else wm.updateViewLayout(panel, panelLp);
         } catch (Exception e) { Log.w(TAG, "panel show failed", e); }
         // history stays on screen while recording / while there is history; a lone notice fades out
@@ -1427,6 +1511,10 @@ public class BubbleService extends Service {
     private void removePanel() {
         stopPanelSpeech();
         main.removeCallbacks(hidePanel);
+        if (fadingOut) { fadingOut = false; fadeGen++; if (panel != null) panel.animate().cancel(); }
+        if (panel != null) { panel.setAlpha(1f); panel.setScaleX(1f); panel.setScaleY(1f); }
+        panelDragging = false;
+        idlePinned = false;
         if (panelShown && panel != null && wm != null) {
             try { wm.removeView(panel); } catch (Exception ignored) {}
         }
@@ -1669,6 +1757,7 @@ public class BubbleService extends Service {
     private void toggleSpeak(final TextView b, final String text, final String lang, final TextView hl,
                              final Entry ent, final String kind) {
         if (text == null || text.trim().isEmpty() || text.equals("…")) return;
+        if (fullLoop) stopFullText();
         if (speakingBtn == b) { stopPanelSpeech(); return; }
         if (speakTv != null) clearSpeakHighlight();
         setSpeaking(b);
@@ -1769,7 +1858,18 @@ public class BubbleService extends Service {
                     : msg("تکرار " + times + " بار با صدای یوتیوب", "Repeat " + times + "× with YouTube audio"));
     }
 
+    /** ⏮ کلِ ویدیوی یوتیوب را از ثانیه‌ی صفر دوباره پخش می‌کند (تکرارِ جمله، اگر فعال بود، متوقف می‌شود). */
+    private void restartYoutubeFromStart() {
+        if (yt == null || !yt.isActive()) return;
+        stopPanelSpeech();                                   // صدای برنامه با صدای یوتیوب قاطی نشود
+        if (yt.restartVideo())
+            showNotice(msg("ویدیو از اول پخش شد", "Video restarted from the beginning"));
+        else
+            showNotice(msg("پلیر یوتیوب در دسترس نیست", "YouTube player not available"));
+    }
+
     private void stopPanelSpeech() {
+        if (fullLoop) stopFullText();
         if (speakingBtn == null && !panelSpeaking && speakTv == null) return;
         speakToken++;
         run = null;
@@ -2124,6 +2224,8 @@ public class BubbleService extends Service {
         final float sizeMul;
         boolean resolved;
         Typeface reg, bold;
+        String[] sysKeys;                       // اگر فایلِ assets/fonts نبود: فونتِ عربی/فارسیِ خودِ گوشی (/system/fonts) با این کلیدواژه‌ها
+        FontOpt sys(String... k) { this.sysKeys = k; return this; }
 
         FontOpt(String id, String faLabel, String enLabel, String sys, String[] keys,
                 boolean noBold, boolean tall, float sizeMul, boolean optional) {
@@ -2139,6 +2241,13 @@ public class BubbleService extends Service {
             new FontOpt("fa_btitr", "بی‌تیتر", "B Titr", null, new String[]{"btitr", "titr"}, true, false, 1f, false),
             new FontOpt("fa_nastaliq", "نستعلیق", "Nastaliq", null, new String[]{"nastaliq", "nastaleeq"}, true, true, 1.1f, false),
             new FontOpt("fa_vazir", "وزیرمتن", "Vazirmatn", null, new String[]{"vazir"}, false, false, 1f, true),
+            new FontOpt("fa_serif", "سریف", "Serif", "serif", null, false, false, 1f, false),
+            new FontOpt("fa_medium", "متوسط", "Medium", "sans-serif-medium", null, false, false, 1f, false),
+            // فونت‌های فارسیِ خودِ گوشی؛ «serif/medium» اندروید روی حروفِ فارسی اثری ندارد و همه با یک فونتِ fallback رسم می‌شوند
+            new FontOpt("fa_sysnaskh", "نسخ", "Naskh", null, null, false, false, 1.05f, false).sys("notonaskharabic", "droidnaskh", "naskh"),
+            new FontOpt("fa_syssans", "ساده", "Sans", null, null, false, false, 1f, false).sys("notosansarabic", "droidsansarabic", "sansarabic"),
+            new FontOpt("fa_syskufi", "کوفی", "Kufi", null, null, false, false, 1f, false).sys("kufi"),
+            new FontOpt("fa_sysnastaliq", "نستعلیق", "Nastaliq", null, null, true, true, 1.1f, false).sys("nastaliq", "nastaleeq"),
     };
 
     private static final FontOpt[] EN_FONTS = {
@@ -2151,6 +2260,59 @@ public class BubbleService extends Service {
             new FontOpt("en_inter", "Inter", "Inter", null, new String[]{"inter"}, false, false, 1f, true),
             new FontOpt("en_lora", "Lora", "Lora", null, new String[]{"lora"}, false, false, 1f, true),
     };
+
+    /** «نوع فونت» تنظیماتِ اپ (default/modern/classic/elegant/rounded/warm) → نزدیک‌ترین فونتِ قابل‌استفاده در کادر.
+     *  فونتِ وبِ دقیق (Vazirmatn/Lora/…) فقط اگر فایلش در assets/fonts باشد استفاده می‌شود؛ وگرنه معادلِ سیستمی. */
+    private String[] mapAppFont(String id) {
+        boolean vazir = fontById(FA_FONTS, "fa_vazir").id.equals("fa_vazir") && fontAvailable(fontById(FA_FONTS, "fa_vazir"));
+        boolean inter = fontById(EN_FONTS, "en_inter").id.equals("en_inter") && fontAvailable(fontById(EN_FONTS, "en_inter"));
+        boolean lora = fontById(EN_FONTS, "en_lora").id.equals("en_lora") && fontAvailable(fontById(EN_FONTS, "en_lora"));
+        switch (id == null ? "default" : id) {
+            case "classic": return new String[]{pickFa("fa_sysnaskh", "fa_serif"), "en_serif"};
+            case "elegant": return new String[]{pickFa("fa_sysnastaliq", "fa_sysnaskh", "fa_serif"), "en_serif"};
+            case "rounded": return new String[]{pickFa("fa_syskufi", "fa_medium"), "en_medium"};
+            case "modern":  return new String[]{vazir ? "fa_vazir" : pickFa("fa_syssans", "fa_default"), inter ? "en_inter" : "en_default"};
+            case "warm":    return new String[]{vazir ? "fa_vazir" : pickFa("fa_sysnaskh", "fa_default"), "en_default"};
+            default:        return new String[]{vazir ? "fa_vazir" : "fa_default", lora ? "en_lora" : "en_default"};
+        }
+    }
+
+    /** اولین فونتِ فارسی از لیست که واقعاً روی این گوشی/برنامه موجود است (آخری = پشتیبان). */
+    private String pickFa(String... ids) {
+        for (String i : ids) if (fontAvailable(fontById(FA_FONTS, i))) return i;
+        return ids[ids.length - 1];
+    }
+
+    private String currentAppFont() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getString("appFont", "default");
+    }
+
+    private void applyAppFont() {
+        String[] m = mapAppFont(currentAppFont());
+        boolean changed = !(m[0].equals(fontFaId) && m[1].equals(fontEnId));
+        fontFaId = m[0]; fontEnId = m[1];
+        if (panel != null) {
+            refreshFontChips();
+            if (changed) relayoutAfterStyle();
+        }
+    }
+
+    /** از اپ (Settings → نوع فونت): فقط وقتی انتخابِ اپ عوض شده اعمال می‌شود تا انتخابِ داخلِ کادر با هر بازشدنِ اپ پاک نشود. */
+    public static void pushAppFont(Context ctx, String font) {
+        if (font == null) return;
+        String f = font.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!f.matches("default|modern|classic|elegant|rounded|warm")) return;
+        SharedPreferences sp = ctx.getSharedPreferences(PREFS, MODE_PRIVATE);
+        if (f.equals(sp.getString("appFontLast", ""))) return;
+        sp.edit().putString("appFontLast", f).putString("appFont", f).apply();
+    }
+
+    public static void saveAppFont(Context ctx, String font) {
+        if (font == null) return;
+        String f = font.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!f.matches("default|modern|classic|elegant|rounded|warm")) return;
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("appFont", f).apply();
+    }
 
     private float fontScale = 1f;
     private String fontFaId = "fa_default";    // فونتِ متنِ فارسی/عربی
@@ -2169,8 +2331,7 @@ public class BubbleService extends Service {
     private void loadViewPrefs() {
         SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
         fontScale = Math.max(FONT_MIN, Math.min(FONT_MAX, sp.getFloat("fontScale", 1f)));
-        fontFaId = sp.getString("fontFa", "fa_default");
-        fontEnId = sp.getString("fontEn", "en_default");
+        applyAppFont();                                   // فونتِ کادر = «نوع فونت» در تنظیماتِ اپ
         panelHFrac = Math.max(0.12f, Math.min(0.85f, sp.getFloat("panelHFrac", 0.42f)));
         panelWFrac = sp.getFloat("panelWFrac", -1f);
         panelAlpha = Math.max(0f, Math.min(1f, sp.getFloat("panelAlphaV2", 1f)));
@@ -2240,12 +2401,53 @@ public class BubbleService extends Service {
         return s.toLowerCase(Locale.ROOT).replaceAll("\\.(ttf|otf)$", "").replaceAll("[^a-z0-9]", "");
     }
 
+    private static final String[] SYS_FONT_DIRS = {"/system/fonts", "/system/product/fonts", "/product/fonts", "/system_ext/fonts", "/vendor/fonts"};
+
+    private static boolean isBoldName(String n) { return n.endsWith("bd") || n.contains("bold"); }
+
+    /** فایلِ فونتِ فارسی/عربیِ خودِ گوشی؛ regular و bold جدا. نسخه‌ی «UI» فقط وقتی استفاده می‌شود که غیرِ UI نباشد. */
+    private void resolveSystemFont(FontOpt o) {
+        java.io.File reg = null, bold = null, regUi = null, boldUi = null;
+        for (String d : SYS_FONT_DIRS) {
+            java.io.File[] fs = new java.io.File(d).listFiles();
+            if (fs == null) continue;
+            Arrays.sort(fs);
+            for (java.io.File f : fs) {
+                String lf = f.getName().toLowerCase(Locale.ROOT);
+                if (!lf.endsWith(".ttf") && !lf.endsWith(".otf")) continue;
+                String n = normName(f.getName());
+                boolean hit = false;
+                for (String k : o.sysKeys) if (n.contains(k)) { hit = true; break; }
+                if (!hit) continue;
+                if (n.contains("italic") || n.contains("light") || n.contains("thin") || n.contains("black")
+                        || n.contains("medium") || n.contains("semi") || n.contains("extra")) continue;
+                boolean ui = n.contains("ui");
+                if (isBoldName(n)) { if (!ui) { if (bold == null) bold = f; } else if (boldUi == null) boldUi = f; }
+                else if (ui) { if (regUi == null) regUi = f; }
+                else if (reg == null) reg = f;
+            }
+        }
+        if (reg == null) reg = regUi;
+        if (bold == null) bold = boldUi;
+        if (reg == null) reg = bold;
+        if (reg == null) { Log.w(TAG, "no system font for " + o.id); return; }
+        try {
+            o.reg = Typeface.createFromFile(reg);
+            o.bold = bold != null && !bold.equals(reg) ? Typeface.createFromFile(bold)
+                    : (o.noBold ? o.reg : Typeface.create(o.reg, Typeface.BOLD));
+            Log.i(TAG, "font " + o.id + " <- " + reg.getAbsolutePath());
+        } catch (Throwable t) {
+            Log.w(TAG, "system font load failed: " + reg, t);
+            o.reg = null; o.bold = null;
+        }
+    }
+
     private void resolveFont(FontOpt o) {
         if (o.resolved) return;
         o.resolved = true;
-        if (o.keys == null) return;
+        if (o.keys == null && o.sysKeys == null) return;
         String regFile = null, boldFile = null;
-        for (String f : fontAssetList()) {
+        if (o.keys != null) for (String f : fontAssetList()) {
             String lf = f.toLowerCase(Locale.ROOT);
             if (!lf.endsWith(".ttf") && !lf.endsWith(".otf")) continue;
             String n = normName(f);
@@ -2257,7 +2459,11 @@ public class BubbleService extends Service {
             else if (regFile == null) regFile = f;
         }
         if (regFile == null) regFile = boldFile;            // مثلاً BTitrBd.ttf تنها فایلِ موجود است
-        if (regFile == null) { Log.w(TAG, "font file not found in assets/fonts for " + o.id); return; }
+        if (regFile == null) {
+            if (o.sysKeys != null) resolveSystemFont(o);
+            else Log.w(TAG, "font file not found in assets/fonts for " + o.id);
+            return;
+        }
         try {
             o.reg = Typeface.createFromAsset(getAssets(), "fonts/" + regFile);
             if (boldFile != null && !boldFile.equals(regFile)) o.bold = Typeface.createFromAsset(getAssets(), "fonts/" + boldFile);
@@ -2269,13 +2475,13 @@ public class BubbleService extends Service {
     }
 
     private boolean fontAvailable(FontOpt o) {
-        if (o.keys == null) return true;                    // فونتِ سیستم
+        if (o.keys == null && o.sysKeys == null) return true;   // فونتِ سیستم
         resolveFont(o);
         return o.reg != null;
     }
 
     private Typeface typefaceOf(FontOpt o, boolean bold) {
-        if (o.keys != null) {
+        if (o.keys != null || o.sysKeys != null) {
             resolveFont(o);
             if (o.reg != null) return bold && o.bold != null ? o.bold : o.reg;
         }
@@ -2352,17 +2558,69 @@ public class BubbleService extends Service {
 
     // ── ردیفِ انتخابِ فونت (زیرِ هدرِ پنل) ──
 
+    private static final String[] APP_FONT_IDS = {"default", "modern", "classic", "elegant", "rounded", "warm"};
+    private static final String[] APP_FONT_FA = {"پیش‌فرض", "مدرن", "کلاسیک", "شیک", "گرد", "گرم"};
+    private static final String[] APP_FONT_EN = {"Default", "Modern", "Classic", "Elegant", "Rounded", "Warm"};
+    private final ArrayList<TextView> appFontChips = new ArrayList<>();
+
     private View buildFontRow() {
         fontRow = new LinearLayout(this);
         fontRow.setOrientation(LinearLayout.VERTICAL);
         fontRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         fontRow.setVisibility(View.GONE);
         fontRow.setPadding(0, dp(2), 0, dp(6));
-        faChips.clear(); enChips.clear();
-        fontRow.addView(fontLine("فارسی", FA_FONTS, true));
-        fontRow.addView(fontLine("English", EN_FONTS, false));
+        appFontChips.clear();
+
+        LinearLayout line = new LinearLayout(this);
+        line.setOrientation(LinearLayout.HORIZONTAL);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        line.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        line.setPadding(0, dp(2), 0, dp(2));
+        TextView lb = new TextView(this);
+        lb.setText(msg("فونت", "Font"));
+        lb.setTextColor(COLOR_GOLD);
+        lb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        lb.setTypeface(Typeface.DEFAULT_BOLD);
+        lb.setMinWidth(dp(50));
+        line.addView(lb, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.setHorizontalScrollBarEnabled(false);
+        hs.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        LinearLayout chips = new LinearLayout(this);
+        chips.setOrientation(LinearLayout.HORIZONTAL);
+        chips.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        final boolean fa = isFa();
+        for (int i = 0; i < APP_FONT_IDS.length; i++) {
+            final String id = APP_FONT_IDS[i];
+            String[] m = mapAppFont(id);
+            FontOpt o = fa ? fontById(FA_FONTS, m[0]) : fontById(EN_FONTS, m[1]);
+            TextView c = new TextView(this);
+            c.setTag(id);
+            c.setText(fa ? APP_FONT_FA[i] : APP_FONT_EN[i]);
+            c.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+            c.setGravity(Gravity.CENTER);
+            c.setSingleLine(true);
+            c.setPadding(dp(12), dp(5), dp(12), dp(5));
+            c.setTypeface(typefaceOf(o, false));              // پیش‌نمایش: نامِ هر فونت با خودِ همان فونت
+            c.setOnClickListener(v -> pickAppFont(id));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.setMarginEnd(dp(6));
+            chips.addView(c, lp);
+            appFontChips.add(c);
+        }
+        hs.addView(chips, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        line.addView(hs, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        fontRow.addView(line);
         refreshFontChips();
         return fontRow;
+    }
+
+    private void pickAppFont(String id) {
+        saveAppFont(this, id);
+        applyAppFont();
+        refreshFontChips();
+        saveViewPrefs();
     }
 
     private View fontLine(String label, FontOpt[] opts, boolean fa) {
@@ -2417,8 +2675,15 @@ public class BubbleService extends Service {
     }
 
     private void refreshFontChips() {
-        paintChips(faChips, fontFaId);
-        paintChips(enChips, fontEnId);
+        String sel = currentAppFont();
+        for (TextView c : appFontChips) {
+            boolean on = sel.equals(c.getTag());
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(14));
+            g.setColor(on ? COLOR_GOLD : Color.parseColor("#26FFFFFF"));
+            c.setBackground(g);
+            c.setTextColor(on ? Color.parseColor("#1C2541") : Color.WHITE);
+        }
     }
 
     private void paintChips(ArrayList<TextView> chips, String sel) {
@@ -2447,7 +2712,10 @@ public class BubbleService extends Service {
     }
 
     private void resetView() {
-        fontScale = 1f; fontFaId = "fa_default"; fontEnId = "en_default";
+        fontScale = 1f;
+        SharedPreferences rsp = getSharedPreferences(PREFS, MODE_PRIVATE);
+        rsp.edit().putString("appFont", rsp.getString("appFontLast", "default")).apply();
+        applyAppFont();
         panelHFrac = 0.42f; panelWFrac = -1f; panelAlpha = 1f;
         if (opacityBar != null) opacityBar.setProgress(100);
         applyPanelAlpha();
@@ -2455,12 +2723,104 @@ public class BubbleService extends Service {
         refreshFontChips();
         relayoutAfterStyle();
         saveViewPrefs();
-        showNotice(msg("اندازه و فونت به حالت اولیه برگشت", "Size and font reset"));
+        showNotice(msg("اندازه، شفافیت و فونت به حالت اولیه برگشت", "Size, opacity and font reset"));
     }
 
     /** دستگیره‌ی «کرکره‌ای»: یک خطِ باریک؛ با یک انگشت به‌سمتِ بیرون بکش = کادر باز می‌شود، به‌سمتِ داخل = جمع می‌شود.
      *  سمتِ راستِ همان نوار یک کپسولِ کوچکِ A− | A+ برای اندازه‌ی متن است. */
     @SuppressLint("ClickableViewAccessibility")
+    private boolean panelDragging = false;     // کاربر کادر را گرفته (کشیدن/نگه‌داشتن) → کادر خودکار بسته نشود
+
+    /**
+     * جابه‌جایی و بستنِ کادر (مثلِ XRecorder): با انگشت بکش تا کادر هرجا خواستی برود؛
+     * یا نگه دار تا کادر «برداشته» شود و دایره‌ی ✕ پایینِ صفحه بیاید؛ کادر را روی ✕ رها کنی کاملاً بسته می‌شود.
+     */
+    private final class PanelMover implements View.OnTouchListener {
+        private final int slop = ViewConfiguration.get(BubbleService.this).getScaledTouchSlop();
+        private final long longMs = ViewConfiguration.getLongPressTimeout();
+        private float downX, downY;
+        private int startX, startY;
+        private boolean moved, picked, hot;
+        private final Runnable longRun = () -> {
+            if (moved || panel == null || !panelShown) return;
+            picked = true;
+            panelDragging = true;
+            panel.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+            panel.animate().scaleX(1.02f).scaleY(1.02f).setDuration(120).start();
+            showCloseTarget();
+        };
+
+        @Override
+        public boolean onTouch(View v, MotionEvent e) {
+            if (panel == null || !panelShown) return false;
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN: {
+                    int[] loc = new int[2];
+                    panel.getLocationOnScreen(loc);
+                    startX = loc[0]; startY = loc[1];
+                    downX = e.getRawX(); downY = e.getRawY();
+                    moved = false; picked = false; hot = false;
+                    main.removeCallbacks(hidePanel);
+                    main.removeCallbacks(longRun);
+                    main.postDelayed(longRun, longMs);
+                    return true;
+                }
+                case MotionEvent.ACTION_MOVE: {
+                    float dx = e.getRawX() - downX, dy = e.getRawY() - downY;
+                    if (!moved && (Math.abs(dx) > slop || Math.abs(dy) > slop)) {
+                        moved = true;
+                        panelDragging = true;
+                        if (!picked) main.removeCallbacks(longRun);
+                    }
+                    if (moved) {
+                        panelFree = true;
+                        panelFreeX = Math.round(startX + dx);
+                        panelFreeY = Math.round(startY + dy);
+                        refreshLayout();
+                    }
+                    if (picked) updateHot(e.getRawX(), e.getRawY());
+                    return true;
+                }
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL: {
+                    main.removeCallbacks(longRun);
+                    boolean up = e.getActionMasked() == MotionEvent.ACTION_UP;
+                    boolean wasPicked = picked, wasHot = hot;
+                    picked = false; hot = false; moved = false;
+                    panelDragging = false;
+                    lastActiveMs = SystemClock.elapsedRealtime();
+                    if (wasPicked) {
+                        if (up && wasHot) { closePanelAnimated(); }
+                        else {
+                            panel.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(140).start();
+                            hideCloseTarget();
+                        }
+                    }
+                    return true;
+                }
+            }
+            return true;
+        }
+
+        private void updateHot(float rx, float ry) {
+            boolean h = closeView != null && Math.hypot(rx - tgtCx, ry - tgtCy) < dp(90);
+            if (h == hot) return;
+            hot = h;
+            overTarget = h;
+            if (closeView != null) closeView.setHot(h);
+            if (h) panel.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP);
+            panel.animate().scaleX(h ? 0.55f : 1.02f).scaleY(h ? 0.55f : 1.02f).alpha(h ? 0.6f : 1f).setDuration(140).start();
+        }
+    }
+
+    /** کادر روی ✕ رها شد: کوچک و محو می‌شود و سرویس کاملاً بسته می‌شود. */
+    private void closePanelAnimated() {
+        hideCloseTarget();
+        if (panel == null) { shutdown(); return; }
+        panel.animate().scaleX(0f).scaleY(0f).alpha(0f).setDuration(150)
+                .withEndAction(this::shutdown).start();
+    }
+
     private View makeGrip(final boolean atBottom) {
         final FrameLayout f = new FrameLayout(this);
 
@@ -2697,7 +3057,11 @@ public class BubbleService extends Service {
         else if ("translation".equals(mode)) { showTr = !ts.isEmpty(); showSrc = ts.isEmpty() || !anyTr; }
         else { showSrc = true; showTr = !ts.isEmpty(); }
 
-        setTextIfChanged(e.tvSrc, typedSrc(e));
+        {
+            String shown = typedSrc(e);
+            if (e.src != null && shown.length() < e.src.length()) setTextTyping(e.tvSrc, shown);   // وسطِ تایپ: سبک (بدون استایل/لی‌اوتِ سنگین)
+            else setTextIfChanged(e.tvSrc, shown);
+        }
         e.srcRow.setVisibility(showSrc && !e.src.isEmpty() ? View.VISIBLE : View.GONE);
 
         for (String t : ts) {
@@ -2714,6 +3078,14 @@ public class BubbleService extends Service {
     }
 
     /** متنِ بدونِ تغییر دوباره ست نمی‌شود، و متنی که کاربر دارد انتخابش می‌کند (یا کادرِ لغتش باز است) دست‌نخورده می‌ماند. */
+    private void setTextTyping(TextView tv, String v) {
+        if (tv == null || v == null) return;
+        if (tv == cardSrcTv || tv == selectingTv || tv == speakTv) return;
+        boolean first = tv.length() == 0;
+        tv.setText(v);
+        if (first) applyStyle(tv);          // استایلِ کامل فقط برای حرفِ اول و موقعِ تمام شدنِ تایپ (setTextIfChanged)
+    }
+
     private void setTextIfChanged(TextView tv, String v) {
         if (tv == null || v == null) return;
         if (tv == cardSrcTv || tv == selectingTv || tv == speakTv) return;
@@ -2782,16 +3154,16 @@ public class BubbleService extends Service {
         return sb.toString();
     }
 
-    // ───────── ✍️ تایپِ کلمه‌به‌کلمه‌ی متنِ زنده ─────────
+    // ───────── ✍️ تایپِ حرف‌به‌حرفِ متنِ زنده ─────────
     private final java.util.LinkedHashSet<Entry> typing = new java.util.LinkedHashSet<>();
     private boolean typeScheduled = false;
     private final Runnable typeRunnable = () -> {
         typeScheduled = false;
         for (Entry e : new ArrayList<>(typing)) {
-            String[] w = words(e.src);
-            if (e.box == null || e.shownWords >= w.length) { typing.remove(e); continue; }
-            int back = w.length - e.shownWords;
-            e.shownWords += back > 14 ? 3 : back > 8 ? 2 : 1;
+            int len = e.src == null ? 0 : e.src.length();
+            if (e.box == null || e.shownChars >= len) { typing.remove(e); continue; }
+            int back = len - e.shownChars;
+            e.shownChars += Math.max(1, (back + 2) / 3);   // عقب‌افتادگی خیلی سریع جبران می‌شه (~۰٫۱ ثانیه)
             renderEntry(e);                       // اگه هنوز عقبه، typedSrc دوباره اضافه‌اش می‌کنه
         }
         if (!typing.isEmpty()) scheduleType();
@@ -2801,22 +3173,21 @@ public class BubbleService extends Service {
     private void scheduleType() {
         if (typeScheduled) return;
         typeScheduled = true;
-        int back = 0;
-        for (Entry e : typing) back = Math.max(back, words(e.src).length - e.shownWords);
-        main.postDelayed(typeRunnable, back > 8 ? 35 : back > 4 ? 55 : 80);
+        main.postDelayed(typeRunnable, 16);
     }
 
-    /** متنِ اصلیِ خطِ زنده: فقط تا کلمه‌ی «رسیده» نشون داده می‌شه و بقیه یکی‌یکی ظاهر می‌شن. */
+    /** متنِ اصلیِ خطِ زنده: فقط تا حرفِ «رسیده» نشون داده می‌شه و بقیه یکی‌یکی ظاهر می‌شن. */
     private String typedSrc(Entry e) {
         String full = e.src == null ? "" : e.src;
-        if (e.shownWords == Integer.MAX_VALUE) return full;
-        String[] w = words(full);
-        if (w.length == 0) return full;
-        if (e.shownWords >= w.length) { e.shownWords = w.length; return full; }
-        if (e.shownWords < 1) e.shownWords = 1;
+        if (e.shownChars == Integer.MAX_VALUE) return full;
+        if (full.isEmpty()) return full;
+        if (e.shownChars >= full.length()) { e.shownChars = full.length(); return full; }
+        if (e.shownChars < 1) e.shownChars = 1;
+        int cut = e.shownChars;
+        if (cut < full.length() && Character.isHighSurrogate(full.charAt(cut - 1))) cut++;
         typing.add(e);
         scheduleType();
-        return joinWords(w, 0, e.shownWords);
+        return full.substring(0, cut);
     }
 
     private void cancelLivePending() {
@@ -2831,6 +3202,7 @@ public class BubbleService extends Service {
         if (wm == null || bubble == null || raw == null || raw.isEmpty()) return;
         if (asrMuted()) return;
         wakeFromIdle();
+        trackSpeechRate(raw);
         final String text = stripConsumed(raw);          // بخشِ قبلاً‌بسته‌شده (خط‌های جدا) دوباره نمایش داده نشود
         if (text.isEmpty()) return;
         pendingHyp = text;
@@ -2852,8 +3224,36 @@ public class BubbleService extends Service {
     private long pauseMs() {
         if (sherpaEngine instanceof WhisperEngine) return PAUSE_COMMIT_SONG_MS;
         if (!micEngine) return SRV_PAUSE_COMMIT_MS;       // حالت سرور: پیش‌نمایش‌ها فاصله دارند
-        return looksIncomplete(pendingHyp) ? SENT_PAUSE_INCOMPLETE_MS : SENT_PAUSE_MS;
+        syncSentenceLang();
+        long base = looksIncomplete(pendingHyp) ? SENT_PAUSE_INCOMPLETE_MS : SENT_PAUSE_MS;
+        return Math.round(base * paceFactor());
     }
+
+    // ── مکثِ تطبیقی: گوینده‌ی کند مکثِ بلندتری بین جمله‌ها دارد، گوینده‌ی تند مکثِ کوتاه‌تری ──
+    private double speechWps = 2.5;                      // میانگینِ سرعتِ گفتار (کلمه در ثانیه)؛ ~۲٫۵ = گفتگوی معمولی
+    private long rateStartAt = 0, rateLastAt = 0;
+    private int rateStartWords = 0, rateLastWords = 0;
+
+    private void trackSpeechRate(String raw) {
+        if (!cumulativeAsr() || raw == null) return;
+        long now = SystemClock.uptimeMillis();
+        int n = words(raw).length;
+        if (rateStartAt == 0 || n < rateLastWords || now - rateLastAt > 1200) {   // شروعِ تازه یا مکث/ریست شدنِ متن
+            rateStartAt = now; rateStartWords = n; rateLastWords = n; rateLastAt = now;
+            return;
+        }
+        rateLastWords = n; rateLastAt = now;
+        long dt = now - rateStartAt;
+        int dw = n - rateStartWords;
+        if (dt >= 1500 && dw >= 4) {
+            double sample = dw * 1000.0 / dt;
+            if (sample > 0.8 && sample < 6.0) speechWps = 0.75 * speechWps + 0.25 * sample;
+            rateStartAt = now; rateStartWords = n;
+        }
+    }
+
+    /** ۰٫۷ (گوینده‌ی تند) … ۱٫۶ (گوینده‌ی کند): ضریبِ مکثِ پایانِ جمله. */
+    private double paceFactor() { return Math.max(0.7, Math.min(1.6, 2.5 / speechWps)); }
 
     /** تشخیصِ گفتارِ زنده (Sherpa/Google) متنِ «کلِ گفتارِ جاری» را می‌دهد؛ حالتِ آهنگ (Whisper) پنجره‌ای است و تجمعی نیست. */
     private boolean cumulativeAsr() {
@@ -2869,7 +3269,7 @@ public class BubbleService extends Service {
 
     private Entry newLiveEntry() {
         Entry e = newEntry();
-        e.shownWords = 0;                 // متنِ زنده کلمه‌به‌کلمه تایپ می‌شود
+        e.shownChars = 0;                 // متنِ زنده حرف‌به‌حرف تایپ می‌شود
         try {
             YtMedia.Now n = YtMedia.nowPlaying(this);
             if (n != null && n.posMs >= 0) e.mediaPosMs = Math.max(0, n.posMs - 800);   // ~تأخیرِ تشخیصِ گفتار
@@ -2909,7 +3309,7 @@ public class BubbleService extends Service {
             if (",;:\u060C".indexOf(c) >= 0 || endsSentence(x)) return i;
         }
         for (int i = hi - 1; i >= lo; i--) {
-            if (BREAK_BEFORE.contains(w[i].toLowerCase(Locale.ROOT))) return i;
+            if (activeBreak.contains(w[i].toLowerCase(Locale.ROOT))) return i;
         }
         for (int i = hi; i >= lo; i--) {                               // برشِ اجباری: هرگز بعد از «the/of/to/and…» نه
             if (!endsDangling(w[i - 1])) return i;
@@ -2928,13 +3328,64 @@ public class BubbleService extends Service {
             "i", "we", "they", "he", "she", "i'm", "i've", "i'll", "i'd", "we're", "they're", "you're",
             "he's", "she's", "it's", "there's", "what", "how", "why", "also", "just", "even", "then"));
 
+    // ── کلمه‌های «آویزان» و حرف‌ربط‌ها برای زبان‌های دیگر (فقط واژه‌هایی که تقریباً هرگز آخرِ جمله نمی‌آیند) ──
+    private static java.util.Set<String> wset(String csv) {
+        return new HashSet<>(Arrays.asList(csv.trim().split("\\s+")));
+    }
+
+    private static final java.util.Map<String, java.util.Set<String>> DANGLING_BY_LANG = new HashMap<>();
+    private static final java.util.Map<String, java.util.Set<String>> BREAK_BY_LANG = new HashMap<>();
+    static {
+        DANGLING_BY_LANG.put("es", wset("el la los las un una unos unas y e o u pero que porque si como cuando donde mientras aunque de del a al en con por para sin sobre entre hasta desde mi tu su mis tus sus muy"));
+        BREAK_BY_LANG.put("es", wset("y pero que porque cuando donde mientras aunque si como"));
+        DANGLING_BY_LANG.put("fr", wset("le la les un une des du de et ou mais que qui dont si comme quand parce car à au aux en dans avec pour sans sur sous par mon ma mes ton ta tes son sa ses notre votre leur je tu il elle ne très"));
+        BREAK_BY_LANG.put("fr", wset("et mais que qui dont quand parce car comme si"));
+        DANGLING_BY_LANG.put("de", wset("der die das den dem des ein eine einen einem einer und oder aber dass weil wenn als ob von zu zum zur in im mit für auf an bei nach aus über unter durch gegen ohne um mein dein sein ihr unser ich du er wir sehr"));
+        BREAK_BY_LANG.put("de", wset("und aber oder dass weil wenn als ob während obwohl damit"));
+        DANGLING_BY_LANG.put("it", wset("il lo la i gli le un uno una e ed o ma che perché se come quando mentre di del della dei delle a al alla ai in nel nella con per su sul tra fra da mio tuo suo mia tua sua io tu lui lei noi voi non molto"));
+        BREAK_BY_LANG.put("it", wset("e ed ma che perché quando mentre se come"));
+        DANGLING_BY_LANG.put("pt", wset("o a os as um uma uns umas e ou mas que porque se como quando onde enquanto embora de do da dos das em no na nos nas com por para sem sobre entre até desde meu minha seu sua eu tu ele ela muito"));
+        BREAK_BY_LANG.put("pt", wset("e mas que porque quando onde enquanto embora se como"));
+        DANGLING_BY_LANG.put("nl", wset("de het een en of maar dat omdat als wanneer waar terwijl van in op met voor naar aan bij uit over door zonder mijn jouw zijn haar ik jij je hij zij wij zeer"));
+        BREAK_BY_LANG.put("nl", wset("en maar of dat omdat als wanneer terwijl"));
+        DANGLING_BY_LANG.put("ru", wset("и а но или что чтобы как если когда где пока хотя потому в на с со по к у о об от до из за для без при про над под между через мой твой его её их наш ваш я ты он она мы они не очень"));
+        BREAK_BY_LANG.put("ru", wset("и а но или что чтобы как если когда где пока хотя потому"));
+        DANGLING_BY_LANG.put("tr", wset("ve ile ama fakat ancak çünkü eğer veya bir bu şu ki"));
+        BREAK_BY_LANG.put("tr", wset("ve ama fakat ancak çünkü eğer veya ki"));
+        DANGLING_BY_LANG.put("ar", wset("في من على إلى الى عن مع أن إن لكن لأن أو ثم حتى كما لقد"));
+        BREAK_BY_LANG.put("ar", wset("لكن لأن ثم حتى أو"));
+        DANGLING_BY_LANG.put("fa", wset("و که از به در با را برای تا اگر اما ولی یا چون این آن یک بر بی"));
+        BREAK_BY_LANG.put("fa", wset("و که اما ولی یا چون اگر تا"));
+    }
+    private static volatile java.util.Set<String> activeDangling = DANGLING;
+    private static volatile java.util.Set<String> activeBreak = BREAK_BEFORE;
+    private static volatile String sentenceLang = "en";
+
+    /** قوانینِ «جمله ناتمام است» را با زبانِ گفتار هماهنگ می‌کند؛ زبانِ بدونِ فهرست (ژاپنی، چینی، …) فقط با نقطه‌گذاری/مکث/طولِ خط می‌شکند. */
+    private void syncSentenceLang() {
+        String l;
+        try { l = (yt != null && yt.isActive()) ? yt.trackLang() : effectiveSource(); } catch (Throwable t) { l = "en"; }
+        if (l == null) l = "";
+        l = l.toLowerCase(Locale.ROOT);
+        if (l.length() > 2) l = l.substring(0, 2);
+        if (l.equals(sentenceLang)) return;
+        sentenceLang = l;
+        if (l.isEmpty() || l.equals("au") || l.equals("en")) {         // «auto» و انگلیسی: همان قوانینِ قبلی
+            activeDangling = DANGLING; activeBreak = BREAK_BEFORE;
+        } else {
+            java.util.Set<String> d = DANGLING_BY_LANG.get(l), b = BREAK_BY_LANG.get(l);
+            activeDangling = d != null ? d : new HashSet<String>();
+            activeBreak = b != null ? b : new HashSet<String>();
+        }
+    }
+
     private static boolean endsDangling(String word) {
         if (word == null || word.isEmpty()) return false;
         char last = word.charAt(word.length() - 1);
         if (",.;:!?\u061F\u060C\u2026".indexOf(last) >= 0) return false;       // علامتِ پایان/ویرگول دارد
         String low = word.toLowerCase(Locale.ROOT).replace('\u2019', '\'');
         low = low.replaceAll("^[\"'(\\[]+|[\"')\\]]+$", "");
-        return DANGLING.contains(low);
+        return activeDangling.contains(low);
     }
 
     /** آیا متنِ زنده هنوز ناتمام به‌نظر می‌رسد؟ (خیلی کوتاه یا آخرش کلمه‌ی «آویزان») */
@@ -2974,6 +3425,8 @@ public class BubbleService extends Service {
 
     /** مکثِ بلند: جمله‌ی جاری همین‌جا بسته می‌شود و گفتارِ بعدی در خطِ تازه می‌آید. */
     private void endSentenceByPause() {
+        syncSentenceLang();
+        rateStartAt = 0;                                    // جمله بسته شد؛ اندازه‌گیریِ سرعت از جمله‌ی بعد
         final String hyp = pendingHyp;
         if (hyp == null || hyp.isEmpty()) return;
         final int n = words(hyp).length;
@@ -3005,6 +3458,7 @@ public class BubbleService extends Service {
     }
 
     private void flushPartial(boolean pause) {
+        syncSentenceLang();
         final Entry e = live;
         if (e == null || pendingHyp.isEmpty()) return;
         final String next = smoothHyp(e.src, pendingHyp);
@@ -3063,7 +3517,7 @@ public class BubbleService extends Service {
             if (",.;:?!\u061F\u060C".indexOf(c) >= 0) return i;
         }
         for (int i = maxEnd - 1; i >= from + 4; i--) {                 // بعد: قبل از حرفِ ربط
-            if (BREAK_BEFORE.contains(w[i].toLowerCase(Locale.ROOT))) return i;
+            if (activeBreak.contains(w[i].toLowerCase(Locale.ROOT))) return i;
         }
         for (int i = maxEnd; i >= from + CHUNK_MIN_WORDS; i--) {       // تکه را به «the/of/to/and…» ختم نکن
             if (!endsDangling(w[i - 1])) return i;
@@ -3396,6 +3850,12 @@ public class BubbleService extends Service {
         boolean on = yt != null && yt.isActive();
         tvYt.setTextColor(on ? COLOR_GOLD : Color.WHITE);
         tvYt.setAlpha(on ? 1f : 0.6f);
+        if (tvYtRestart != null) tvYtRestart.setVisibility(on && !ytFullMode ? View.VISIBLE : View.GONE);
+        if (tvYtAll != null) {
+            tvYtAll.setVisibility(on && ytFullMode ? View.VISIBLE : View.GONE);
+            tvYtAll.setText(fullLoop ? "\u23F9" : "\uD83D\uDD02");
+            tvYtAll.setTextColor(fullLoop ? COLOR_GOLD : Color.WHITE);
+        }
         if (tvSave != null) tvSave.setVisibility(View.VISIBLE);
     }
 
@@ -3437,8 +3897,49 @@ public class BubbleService extends Service {
             //    کاربر بعداً همان برنامه/لینک را دوباره باز کند.
             JSONArray lines = new JSONArray();
             if (!hasSource) {
-                showNotice(msg("برای ذخیره‌ی اینستاگرام/تیک‌تاک/…: در همان برنامه «Share ← Hope» را بزن",
-                        "For Instagram/TikTok/…: use “Share → Hope” inside that app"));
+                // اینستاگرام/تیک‌تاک/… اطلاعاتِ پخش نمی‌دهند → لینکِ کپی‌شده‌ی پست را (Share ← Copy link) از کلیپ‌بورد می‌خوانیم.
+                // 1) همین الان یک ردیفِ «بدونِ لینک» ذخیره می‌شود (زمان + چند کلمه‌ی اولِ گفتار فقط برای شناختنِ آن)، تا چیزی گم نشود.
+                // 2) اگر لینکِ پست کپی شده باشد (Share ← Copy link)، همان ردیف با لینک کامل می‌شود. کلیپ‌بورد فقط از یک
+                //    Activityِ دارای فوکوس خوانده می‌شود؛ ShareReceiverActivity آن را یک لحظه باز می‌کند و برمی‌گردد.
+                String snippet = "";
+                for (Entry e : snap) {
+                    if (e == live || e.src == null || e.src.trim().isEmpty()) continue;
+                    String[] ws = words(e.src);
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < ws.length && i < 6; i++) { if (i > 0) sb.append(' '); sb.append(ws[i]); }
+                    snippet = sb.toString() + (ws.length > 6 ? "…" : "");
+                    break;
+                }
+                java.text.SimpleDateFormat tf = new java.text.SimpleDateFormat("MM/dd HH:mm", Locale.US);
+                String ptitle = msg("ویدیوی ذخیره‌شده", "Saved video") + " · " + tf.format(new java.util.Date())
+                        + (snippet.isEmpty() ? "" : " — " + snippet);
+                long pnow = System.currentTimeMillis();
+                java.text.SimpleDateFormat pfmt = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US);
+                pfmt.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+                String psrc = effectiveSource();
+                JSONObject pitem = new JSONObject()
+                        .put("key", liveKey)
+                        .put("live", true)
+                        .put("title", ptitle)
+                        .put("channel", msg("منبعِ نامشخص (بدونِ لینک)", "Unknown source (no link)"))
+                        .put("lang", psrc == null || "auto".equals(psrc) ? "en" : psrc)
+                        .put("targets", new JSONArray(ts))
+                        .put("rev", pnow)
+                        .put("savedAt", pfmt.format(new java.util.Date(pnow)))
+                        .put("lines", new JSONArray());
+                boolean pok = YtSaved.add(this, pitem);
+                try {
+                    Intent ci = new Intent(this, ShareReceiverActivity.class)
+                            .putExtra(ShareReceiverActivity.EXTRA_FROM_CLIP, true)
+                            .putExtra(ShareReceiverActivity.EXTRA_REPLACE_KEY, liveKey)
+                            .putExtra(ShareReceiverActivity.EXTRA_TITLE, ptitle)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+                    startActivity(ci);
+                } catch (Throwable ignored) {}
+                showNotice(pok
+                        ? msg("ذخیره شد ✓ (بدونِ لینک). برای لینک: در همان برنامه Share ← Copy link بزن و دوباره 💾",
+                              "Saved ✓ (no link). For the link: Share → Copy link in that app, then tap 💾 again")
+                        : msg("ذخیره نشد", "Save failed"));
                 return;
             }
             long now = System.currentTimeMillis();
@@ -3504,9 +4005,9 @@ public class BubbleService extends Service {
         if (yt != null && yt.isActive()) return;
         userHidden = false;
         if (!YtMedia.hasAccess(this)) {
-            showNotice(msg("برای زیرنویس یوتیوب، «دسترسی به اعلان‌ها» را برای این برنامه روشن کن و دوباره ▶ را بزن",
-                    "For YouTube subtitles, turn on “Notification access” for this app, then tap ▶ again"));
-            if (openSettingsIfNeeded) YtMedia.openAccessSettings(this);
+            showNotice(msg("برای زیرنویسِ همگام، «دسترسی به اعلان‌ها» لازم است؛ یا «فقط متنِ کامل» را انتخاب کن",
+                    "Synced subtitles need “Notification access”; or choose “Full text only”"));
+            if (openSettingsIfNeeded) askYoutubeAccessChoice();
             return;
         }
         if (recording) stopRecording();     // دو منبعِ هم‌زمان روی یک پنل نباشه
@@ -3515,18 +4016,101 @@ public class BubbleService extends Service {
         if (!engine.start()) {
             engine.stop();
             showNotice(msg("دسترسی به اعلان‌ها هنوز فعال نیست", "Notification access is not enabled yet"));
-            if (openSettingsIfNeeded) YtMedia.openAccessSettings(this);
+            if (openSettingsIfNeeded) askYoutubeAccessChoice();
             return;
         }
         yt = engine;
+        ytFullMode = false;
         ytEntries.clear();
         refreshHeader();
+        updateYtButton();
+    }
+
+    /** ▶ بدونِ دسترسیِ اعلان / نگه‌داشتنِ ▶: توضیحِ شفاف و انتخابِ «همگام با پخش» یا «فقط متنِ کامل». */
+    private void askYoutubeAccessChoice() {
+        try {
+            startActivity(new Intent(this, ShareReceiverActivity.class)
+                    .putExtra(ShareReceiverActivity.EXTRA_YT_CHOOSE, true)
+                    .putExtra(ShareReceiverActivity.EXTRA_FA, isFa())
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
+        } catch (Throwable t) {
+            YtMedia.openAccessSettings(this);
+        }
+    }
+
+    /** از ShareReceiverActivity (لینکِ کلیپ‌بورد): کلِ زیرنویسِ ویدیو را یک‌جا و بدونِ همگام‌سازی می‌آورد. */
+    static void startYoutubeFull(Context ctx, final String videoId) {
+        final BubbleService s = instance;
+        if (s == null) return;
+        s.main.post(() -> s.beginYoutubeFull(videoId));
+    }
+
+    private void beginYoutubeFull(String videoId) {
+        if (wm == null || bubble == null || !YtMedia.isValidYouTubeVideoId(videoId)) return;
+        if (yt != null) stopYoutube(false);
+        userHidden = false;
+        if (recording) stopRecording();
+        YtSubtitles engine = new YtSubtitles(this, ytHost, WORKER_BASE, HTTP_FAST);
+        yt = engine;
+        ytFullMode = true;
+        ytEntries.clear();
+        engine.startFullText(videoId, "");
+        refreshHeader();
+        updateYtButton();
+        showNotice(msg("در حال گرفتنِ زیرنویسِ کامل…", "Fetching the full subtitles…"));
+    }
+
+    // ─── 🔂 «متنِ کامل»: خواندنِ کلِ متن از اول؛ بعد از آخرین جمله دوباره از اول، تا دوباره بزنی ───
+
+    private void toggleFullText() {
+        if (fullLoop) { stopFullText(); return; }
+        if (history.isEmpty()) return;
+        stopPanelSpeech();
+        fullLoop = true;
+        fullIdx = 0;
+        fullToken++;
+        updateYtButton();
+        speakFull(fullToken, 0);
+    }
+
+    private void speakFull(final int my, final int empties) {
+        if (!fullLoop || my != fullToken) return;
+        if (history.isEmpty() || empties > history.size()) { stopFullText(); return; }
+        if (fullIdx >= history.size()) {
+            fullIdx = 0;                                           // تمام شد → از اولِ متن
+            main.postDelayed(() -> speakFull(my, 0), 700);
+            return;
+        }
+        final Entry e = history.get(fullIdx);
+        String t = e.src == null ? "" : e.src.trim();
+        if (t.isEmpty()) { fullIdx++; speakFull(my, empties + 1); return; }
+        scrollToEntry(e);
+        panelSpeaking = true;
+        PanelTts.speak(this, t, e.srcLang, 1.0f, ok -> {
+            if (!fullLoop || my != fullToken) return;
+            if (!ok) { stopFullText(); return; }
+            fullIdx++;
+            speakFull(my, 0);
+        });
+    }
+
+    private void stopFullText() {
+        boolean was = fullLoop;
+        fullLoop = false;
+        fullToken++;
+        if (was) {
+            PanelTts.stop(this);
+            panelSpeaking = false;
+            panelQuietUntil = SystemClock.uptimeMillis() + 800;
+        }
         updateYtButton();
     }
 
     private void stopYoutube(boolean notify) {
         YtSubtitles engine = yt;
         yt = null;
+        ytFullMode = false;
+        stopFullText();
         ytEntries.clear();
         ytListMode = false; ytListGen++; ytCur = -1;
         if (scroll != null) scroll.ytMode = false;
@@ -3608,7 +4192,7 @@ public class BubbleService extends Service {
         for (int i = from; i < end; i++) {
             Entry e = newEntry();
             e.ytIdx = i;
-            if (e.ytReplayBtn != null) e.ytReplayBtn.setVisibility(View.VISIBLE);
+            if (e.ytReplayBtn != null && !ytFullMode) e.ytReplayBtn.setVisibility(View.VISIBLE);
             e.src = sents.get(i);
             e.srcLang = currentSrcLang();
             for (Map.Entry<String, String[]> x : tr.entrySet()) {
@@ -3633,9 +4217,10 @@ public class BubbleService extends Service {
 
     private void styleYtEntry(Entry e, boolean current) {
         if (e == null || e.box == null) return;
-        e.box.setAlpha(current ? 1f : YT_DIM);
+        if (ytFullMode) current = false;                    // 📄 متنِ کامل: همه‌ی جمله‌ها یکسان، بدونِ کم‌رنگ/پررنگ
+        e.box.setAlpha(current || ytFullMode ? 1f : YT_DIM);
         e.tvSrc.setTextColor(current ? Color.WHITE : Color.parseColor("#C8CCD8"));
-        e.tvSrc.setTag(new float[]{13f, current ? 1f : 0f});
+        e.tvSrc.setTag(new float[]{13f, current ? 1f : 0f, 1f});   // ۱ = «متنِ محتوا»؛ بدونِ آن فونتِ انتخابیِ کادر روی متنِ اصلیِ یوتیوب اعمال نمی‌شد
         applyStyle(e.tvSrc);
     }
 
