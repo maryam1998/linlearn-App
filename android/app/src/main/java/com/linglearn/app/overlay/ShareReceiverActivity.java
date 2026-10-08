@@ -1,6 +1,7 @@
 package com.linglearn.app.overlay;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -35,10 +36,19 @@ public class ShareReceiverActivity extends Activity {
     static final String EXTRA_TITLE = "com.linglearn.app.TITLE";
     private boolean fromClip = false, clipDone = false;
 
+    /** از ▶ حباب (وقتی «دسترسی به اعلان‌ها» نیست): توضیحِ شفاف + انتخابِ «همگام با پخش» یا «فقط متنِ کامل». */
+    static final String EXTRA_YT_CHOOSE = "com.linglearn.app.YT_CHOOSE";
+    static final String EXTRA_FA = "com.linglearn.app.FA";
+    private boolean ytFullClip = false;
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         fromClip = getIntent() != null && getIntent().getBooleanExtra(EXTRA_FROM_CLIP, false);
+        if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_YT_CHOOSE, false)) {
+            showYtChoice(getIntent().getBooleanExtra(EXTRA_FA, true));
+            return;
+        }
         if (fromClip) {
             // کلیپ‌بورد فقط وقتی خوانده می‌شود که پنجره فوکوس داشته باشد؛ اگر فوکوس دیر آمد، بعد از ۱.۲ ثانیه هم امتحان می‌کنیم
             new Handler(Looper.getMainLooper()).postDelayed(this::finishFromClip, 1200);
@@ -59,10 +69,54 @@ public class ShareReceiverActivity extends Activity {
         if (hasFocus && fromClip) finishFromClip();
     }
 
+    private void showYtChoice(final boolean fa) {
+        String msg = fa
+                ? "۱) همگام با پخش: جمله‌ی در حال پخش پررنگ می‌شود و دکمه‌های ⏮ و ↺ کار می‌کنند. این روش «دسترسی به اعلان‌ها» می‌خواهد. "
+                + "فقط اعلانِ خودِ یوتیوب برای تشخیصِ ویدیو و زمانِ پخش بررسی می‌شود؛ اعلان‌های برنامه‌های دیگر خوانده یا ذخیره نمی‌شوند، "
+                + "و هر وقت خواستی از تنظیماتِ اندروید خاموشش کن.\n\n"
+                + "۲) فقط متنِ کامل: بدونِ هیچ دسترسی. لینکِ ویدیو را در یوتیوب کپی کن (Share ← Copy link)، بعد «فقط متنِ کامل» را بزن؛ "
+                + "کلِ زیرنویس یک‌جا می‌آید، بدونِ پررنگ‌شدن، با دکمه‌ی تکرارِ کلِ متن."
+                : "1) Synced: highlights the sentence being played; ⏮ and ↺ work. Needs “Notification access”. "
+                + "Only YouTube's own notification is checked (to detect the video and its play time); other apps' notifications are not read or stored. "
+                + "You can turn it off anytime in Android settings.\n\n"
+                + "2) Full text only: no permission. Copy the video link in YouTube (Share → Copy link), then tap “Full text only”; "
+                + "all subtitles load at once, with no highlighting, plus a repeat-all-text button.";
+        AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(fa ? "زیرنویس یوتیوب" : "YouTube subtitles")
+                .setMessage(msg)
+                .setPositiveButton(fa ? "فقط متنِ کامل" : "Full text only", (dlg, w) -> {
+                    ytFullClip = true; fromClip = true; clipDone = false;
+                    // کلیپ‌بورد فقط وقتی خوانده می‌شود که پنجره فوکوس داشته باشد
+                    new Handler(Looper.getMainLooper()).postDelayed(this::finishFromClip, 900);
+                })
+                .setNeutralButton(fa ? "همگام‌سازی" : "Synced", (dlg, w) -> {
+                    YtMedia.openAccessSettings(this);
+                    finish();
+                })
+                .setNegativeButton(fa ? "بستن" : "Close", (dlg, w) -> finish())
+                .create();
+        d.setOnCancelListener(x -> finish());
+        d.show();
+    }
+
     private void finishFromClip() {
         if (clipDone) return;
         clipDone = true;
         boolean ok = false;
+        if (ytFullClip) {
+            try {
+                ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                ClipData cd = cm == null ? null : cm.getPrimaryClip();
+                CharSequence t = cd != null && cd.getItemCount() > 0 ? cd.getItemAt(0).coerceToText(this) : null;
+                String id = t == null ? null : YtMedia.idFromText(t.toString());
+                if (id == null && t != null && YtMedia.isValidYouTubeVideoId(t.toString().trim())) id = t.toString().trim();
+                if (id != null) { BubbleService.startYoutubeFull(getApplicationContext(), id); ok = true; }
+            } catch (Throwable ignored) {}
+            if (!ok) Toast.makeText(this, "لینکِ یوتیوب در کلیپ‌بورد نیست — در یوتیوب Share ← Copy link را بزن و دوباره ▶",
+                    Toast.LENGTH_LONG).show();
+            finish();
+            return;
+        }
         try {
             ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             ClipData cd = cm == null ? null : cm.getPrimaryClip();

@@ -117,7 +117,19 @@ final class YtSubtitles {
     private String trackLang = "en";
     String trackLang() { return trackLang; }
     /** ویدیوی یوتیوب همین الان در حالِ پخش است؟ (برای باز/بسته‌شدنِ خودکارِ کادر) */
-    boolean isPlaying() { YtMedia.State s = last; return s != null && s.hasSession && s.playing; }
+    boolean isPlaying() { if (fullText) return true; YtMedia.State s = last; return s != null && s.hasSession && s.playing; }
+
+    // 📄 «متنِ کامل»: بدونِ MediaSession و بدونِ دسترسیِ اعلان؛ زیرنویسِ کلِ ویدیو از روی videoId یک‌جا می‌آید، همگام‌سازی/پررنگ‌شدن نیست.
+    private volatile boolean fullText = false;
+    boolean isFullText() { return fullText; }
+
+    boolean startFullText(String videoId, String title) {
+        if (active) return true;
+        fullText = true;
+        active = true;
+        loadCaptions(videoId, title == null ? "" : title);
+        return true;
+    }
     private final HashMap<String, String[]> trs = new HashMap<>();   // lang -> ترجمه‌ی هر خط (null = هنوز نه)
     // ── ترجمه در سطحِ «جمله»: تکه‌های زیرنویس یوتیوب وسطِ جمله بریده می‌شن و ترجمه‌ی جدا‌جدایِ هر تکه غلط درمی‌آد.
     //    پس جمله‌ی کامل ترجمه می‌شه و بعد کلمه‌های ترجمه بینِ همون تکه‌ها (به نسبتِ طولِ متنِ اصلی) پخش می‌شه.
@@ -200,7 +212,7 @@ final class YtSubtitles {
      * times: تعداد کلِ پخش‌ها (۱ = یک بار)، یا -1 = بی‌نهایت تا وقتی کاربر دوباره بزند.
      */
     boolean replaySentence(int sentIdx, int times) {
-        if (!active || sentIdx < 0 || sentIdx >= sentFirstCue.length) return false;
+        if (!active || fullText || sentIdx < 0 || sentIdx >= sentFirstCue.length) return false;
         int c = sentFirstCue[sentIdx], c2 = sentLastCue[sentIdx];
         if (c < 0 || c >= cues.size() || c2 < c) return false;
         loopStartMs = Math.max(0L, cues.get(c).startMs - offsetMs);
@@ -213,6 +225,16 @@ final class YtSubtitles {
         loopCooldownUntil = android.os.SystemClock.uptimeMillis() + 900;
         if (times == 1 || times == 0) stopLoop();
         else { loopSent = sentIdx; loopLeft = times < 0 ? -1 : times - 1; }
+        return true;
+    }
+
+    /** کلِ ویدیو را از ثانیه‌ی صفر و بدونِ هیچ حلقه‌ی جمله‌ای پخش می‌کند. false = پلیر در دسترس نیست. */
+    boolean restartVideo() {
+        if (!active || fullText) return false;
+        stopLoop();
+        if (!tracker.seekTo(0L)) return false;
+        tracker.play();
+        loopCooldownUntil = android.os.SystemClock.uptimeMillis() + 900;
         return true;
     }
 
@@ -247,6 +269,7 @@ final class YtSubtitles {
     void stop() {
         stopLoop();
         active = false;
+        fullText = false;
         YtMedia.setActive(null);
         main.removeCallbacksAndMessages(null);
         tracker.stop();

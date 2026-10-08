@@ -303,6 +303,11 @@ public class BubbleService extends Service {
     private Entry live;                   // sentence currently being spoken (partial result)
     private YtSubtitles yt;               // 📺 حالت یوتیوب (null = خاموش)
     private TextView tvYt;                // دکمه‌ی ▶ در هدرِ پنل
+    private TextView tvYtRestart;         // دکمه‌ی ⏮ : کلِ ویدیوی یوتیوب از اول
+    private TextView tvYtAll;             // دکمه‌ی 🔂 : (حالتِ «متنِ کامل») خواندنِ کلِ متن از اول و تکرارِ آن
+    private boolean ytFullMode = false;   // 📄 زیرنویسِ کامل بدونِ دسترسیِ اعلان و بدونِ پررنگ‌شدن
+    private volatile boolean fullLoop = false;
+    private int fullIdx = 0, fullToken = 0;
     private TextView tvSave;              // دکمه‌ی 💾 (هم حالت یوتیوب، هم ترجمه‌ی زنده)
     private String lastSourceKey = "";     // پلیر|عنوانِ آخرین منبعِ صدا؛ برای نگه داشتنِ تاریخچه وقتی همان فایل ادامه پیدا می‌کند
     private String liveKey = null;        // شناسه‌ی جلسه‌ی ترجمه‌ی زنده برای ذخیره (با پاک کردنِ تاریخچه ریست می‌شود)
@@ -1305,6 +1310,15 @@ public class BubbleService extends Service {
         header.addView(tvHeader, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         tvYt = headerButton("\u25B6", v -> toggleYoutube());
         header.addView(tvYt);
+        tvYtRestart = headerButton("\u23EE", v -> restartYoutubeFromStart());   // ⏮ فقط در حالتِ یوتیوب دیده می‌شود
+        tvYtRestart.setPadding(dp(8), dp(6), dp(8), dp(6));
+        tvYtRestart.setVisibility(View.GONE);
+        header.addView(tvYtRestart);
+        tvYtAll = headerButton("\uD83D\uDD02", v -> toggleFullText());   // 🔂 فقط در حالتِ «متنِ کامل»
+        tvYtAll.setPadding(dp(8), dp(6), dp(8), dp(6));
+        tvYtAll.setVisibility(View.GONE);
+        header.addView(tvYtAll);
+        tvYt.setOnLongClickListener(v -> { askYoutubeAccessChoice(); return true; });   // نگه‌داشتنِ ▶ = انتخابِ «همگام» یا «فقط متنِ کامل»
         tvSave = headerButton("\uD83D\uDCBE", v -> saveCurrent());
         header.addView(tvSave);
         loadRepeatPref();
@@ -1743,6 +1757,7 @@ public class BubbleService extends Service {
     private void toggleSpeak(final TextView b, final String text, final String lang, final TextView hl,
                              final Entry ent, final String kind) {
         if (text == null || text.trim().isEmpty() || text.equals("…")) return;
+        if (fullLoop) stopFullText();
         if (speakingBtn == b) { stopPanelSpeech(); return; }
         if (speakTv != null) clearSpeakHighlight();
         setSpeaking(b);
@@ -1843,7 +1858,18 @@ public class BubbleService extends Service {
                     : msg("تکرار " + times + " بار با صدای یوتیوب", "Repeat " + times + "× with YouTube audio"));
     }
 
+    /** ⏮ کلِ ویدیوی یوتیوب را از ثانیه‌ی صفر دوباره پخش می‌کند (تکرارِ جمله، اگر فعال بود، متوقف می‌شود). */
+    private void restartYoutubeFromStart() {
+        if (yt == null || !yt.isActive()) return;
+        stopPanelSpeech();                                   // صدای برنامه با صدای یوتیوب قاطی نشود
+        if (yt.restartVideo())
+            showNotice(msg("ویدیو از اول پخش شد", "Video restarted from the beginning"));
+        else
+            showNotice(msg("پلیر یوتیوب در دسترس نیست", "YouTube player not available"));
+    }
+
     private void stopPanelSpeech() {
+        if (fullLoop) stopFullText();
         if (speakingBtn == null && !panelSpeaking && speakTv == null) return;
         speakToken++;
         run = null;
@@ -2198,6 +2224,8 @@ public class BubbleService extends Service {
         final float sizeMul;
         boolean resolved;
         Typeface reg, bold;
+        String[] sysKeys;                       // اگر فایلِ assets/fonts نبود: فونتِ عربی/فارسیِ خودِ گوشی (/system/fonts) با این کلیدواژه‌ها
+        FontOpt sys(String... k) { this.sysKeys = k; return this; }
 
         FontOpt(String id, String faLabel, String enLabel, String sys, String[] keys,
                 boolean noBold, boolean tall, float sizeMul, boolean optional) {
@@ -2215,6 +2243,11 @@ public class BubbleService extends Service {
             new FontOpt("fa_vazir", "وزیرمتن", "Vazirmatn", null, new String[]{"vazir"}, false, false, 1f, true),
             new FontOpt("fa_serif", "سریف", "Serif", "serif", null, false, false, 1f, false),
             new FontOpt("fa_medium", "متوسط", "Medium", "sans-serif-medium", null, false, false, 1f, false),
+            // فونت‌های فارسیِ خودِ گوشی؛ «serif/medium» اندروید روی حروفِ فارسی اثری ندارد و همه با یک فونتِ fallback رسم می‌شوند
+            new FontOpt("fa_sysnaskh", "نسخ", "Naskh", null, null, false, false, 1.05f, false).sys("notonaskharabic", "droidnaskh", "naskh"),
+            new FontOpt("fa_syssans", "ساده", "Sans", null, null, false, false, 1f, false).sys("notosansarabic", "droidsansarabic", "sansarabic"),
+            new FontOpt("fa_syskufi", "کوفی", "Kufi", null, null, false, false, 1f, false).sys("kufi"),
+            new FontOpt("fa_sysnastaliq", "نستعلیق", "Nastaliq", null, null, true, true, 1.1f, false).sys("nastaliq", "nastaleeq"),
     };
 
     private static final FontOpt[] EN_FONTS = {
@@ -2235,12 +2268,19 @@ public class BubbleService extends Service {
         boolean inter = fontById(EN_FONTS, "en_inter").id.equals("en_inter") && fontAvailable(fontById(EN_FONTS, "en_inter"));
         boolean lora = fontById(EN_FONTS, "en_lora").id.equals("en_lora") && fontAvailable(fontById(EN_FONTS, "en_lora"));
         switch (id == null ? "default" : id) {
-            case "classic": case "elegant": return new String[]{"fa_serif", "en_serif"};
-            case "rounded": return new String[]{"fa_medium", "en_medium"};
-            case "modern":  return new String[]{vazir ? "fa_vazir" : "fa_default", inter ? "en_inter" : "en_default"};
-            case "warm":    return new String[]{vazir ? "fa_vazir" : "fa_default", "en_default"};
+            case "classic": return new String[]{pickFa("fa_sysnaskh", "fa_serif"), "en_serif"};
+            case "elegant": return new String[]{pickFa("fa_sysnastaliq", "fa_sysnaskh", "fa_serif"), "en_serif"};
+            case "rounded": return new String[]{pickFa("fa_syskufi", "fa_medium"), "en_medium"};
+            case "modern":  return new String[]{vazir ? "fa_vazir" : pickFa("fa_syssans", "fa_default"), inter ? "en_inter" : "en_default"};
+            case "warm":    return new String[]{vazir ? "fa_vazir" : pickFa("fa_sysnaskh", "fa_default"), "en_default"};
             default:        return new String[]{vazir ? "fa_vazir" : "fa_default", lora ? "en_lora" : "en_default"};
         }
+    }
+
+    /** اولین فونتِ فارسی از لیست که واقعاً روی این گوشی/برنامه موجود است (آخری = پشتیبان). */
+    private String pickFa(String... ids) {
+        for (String i : ids) if (fontAvailable(fontById(FA_FONTS, i))) return i;
+        return ids[ids.length - 1];
     }
 
     private String currentAppFont() {
@@ -2361,12 +2401,53 @@ public class BubbleService extends Service {
         return s.toLowerCase(Locale.ROOT).replaceAll("\\.(ttf|otf)$", "").replaceAll("[^a-z0-9]", "");
     }
 
+    private static final String[] SYS_FONT_DIRS = {"/system/fonts", "/system/product/fonts", "/product/fonts", "/system_ext/fonts", "/vendor/fonts"};
+
+    private static boolean isBoldName(String n) { return n.endsWith("bd") || n.contains("bold"); }
+
+    /** فایلِ فونتِ فارسی/عربیِ خودِ گوشی؛ regular و bold جدا. نسخه‌ی «UI» فقط وقتی استفاده می‌شود که غیرِ UI نباشد. */
+    private void resolveSystemFont(FontOpt o) {
+        java.io.File reg = null, bold = null, regUi = null, boldUi = null;
+        for (String d : SYS_FONT_DIRS) {
+            java.io.File[] fs = new java.io.File(d).listFiles();
+            if (fs == null) continue;
+            Arrays.sort(fs);
+            for (java.io.File f : fs) {
+                String lf = f.getName().toLowerCase(Locale.ROOT);
+                if (!lf.endsWith(".ttf") && !lf.endsWith(".otf")) continue;
+                String n = normName(f.getName());
+                boolean hit = false;
+                for (String k : o.sysKeys) if (n.contains(k)) { hit = true; break; }
+                if (!hit) continue;
+                if (n.contains("italic") || n.contains("light") || n.contains("thin") || n.contains("black")
+                        || n.contains("medium") || n.contains("semi") || n.contains("extra")) continue;
+                boolean ui = n.contains("ui");
+                if (isBoldName(n)) { if (!ui) { if (bold == null) bold = f; } else if (boldUi == null) boldUi = f; }
+                else if (ui) { if (regUi == null) regUi = f; }
+                else if (reg == null) reg = f;
+            }
+        }
+        if (reg == null) reg = regUi;
+        if (bold == null) bold = boldUi;
+        if (reg == null) reg = bold;
+        if (reg == null) { Log.w(TAG, "no system font for " + o.id); return; }
+        try {
+            o.reg = Typeface.createFromFile(reg);
+            o.bold = bold != null && !bold.equals(reg) ? Typeface.createFromFile(bold)
+                    : (o.noBold ? o.reg : Typeface.create(o.reg, Typeface.BOLD));
+            Log.i(TAG, "font " + o.id + " <- " + reg.getAbsolutePath());
+        } catch (Throwable t) {
+            Log.w(TAG, "system font load failed: " + reg, t);
+            o.reg = null; o.bold = null;
+        }
+    }
+
     private void resolveFont(FontOpt o) {
         if (o.resolved) return;
         o.resolved = true;
-        if (o.keys == null) return;
+        if (o.keys == null && o.sysKeys == null) return;
         String regFile = null, boldFile = null;
-        for (String f : fontAssetList()) {
+        if (o.keys != null) for (String f : fontAssetList()) {
             String lf = f.toLowerCase(Locale.ROOT);
             if (!lf.endsWith(".ttf") && !lf.endsWith(".otf")) continue;
             String n = normName(f);
@@ -2378,7 +2459,11 @@ public class BubbleService extends Service {
             else if (regFile == null) regFile = f;
         }
         if (regFile == null) regFile = boldFile;            // مثلاً BTitrBd.ttf تنها فایلِ موجود است
-        if (regFile == null) { Log.w(TAG, "font file not found in assets/fonts for " + o.id); return; }
+        if (regFile == null) {
+            if (o.sysKeys != null) resolveSystemFont(o);
+            else Log.w(TAG, "font file not found in assets/fonts for " + o.id);
+            return;
+        }
         try {
             o.reg = Typeface.createFromAsset(getAssets(), "fonts/" + regFile);
             if (boldFile != null && !boldFile.equals(regFile)) o.bold = Typeface.createFromAsset(getAssets(), "fonts/" + boldFile);
@@ -2390,13 +2475,13 @@ public class BubbleService extends Service {
     }
 
     private boolean fontAvailable(FontOpt o) {
-        if (o.keys == null) return true;                    // فونتِ سیستم
+        if (o.keys == null && o.sysKeys == null) return true;   // فونتِ سیستم
         resolveFont(o);
         return o.reg != null;
     }
 
     private Typeface typefaceOf(FontOpt o, boolean bold) {
-        if (o.keys != null) {
+        if (o.keys != null || o.sysKeys != null) {
             resolveFont(o);
             if (o.reg != null) return bold && o.bold != null ? o.bold : o.reg;
         }
@@ -3765,6 +3850,12 @@ public class BubbleService extends Service {
         boolean on = yt != null && yt.isActive();
         tvYt.setTextColor(on ? COLOR_GOLD : Color.WHITE);
         tvYt.setAlpha(on ? 1f : 0.6f);
+        if (tvYtRestart != null) tvYtRestart.setVisibility(on && !ytFullMode ? View.VISIBLE : View.GONE);
+        if (tvYtAll != null) {
+            tvYtAll.setVisibility(on && ytFullMode ? View.VISIBLE : View.GONE);
+            tvYtAll.setText(fullLoop ? "\u23F9" : "\uD83D\uDD02");
+            tvYtAll.setTextColor(fullLoop ? COLOR_GOLD : Color.WHITE);
+        }
         if (tvSave != null) tvSave.setVisibility(View.VISIBLE);
     }
 
@@ -3914,9 +4005,9 @@ public class BubbleService extends Service {
         if (yt != null && yt.isActive()) return;
         userHidden = false;
         if (!YtMedia.hasAccess(this)) {
-            showNotice(msg("برای زیرنویس یوتیوب، «دسترسی به اعلان‌ها» را برای این برنامه روشن کن و دوباره ▶ را بزن",
-                    "For YouTube subtitles, turn on “Notification access” for this app, then tap ▶ again"));
-            if (openSettingsIfNeeded) YtMedia.openAccessSettings(this);
+            showNotice(msg("برای زیرنویسِ همگام، «دسترسی به اعلان‌ها» لازم است؛ یا «فقط متنِ کامل» را انتخاب کن",
+                    "Synced subtitles need “Notification access”; or choose “Full text only”"));
+            if (openSettingsIfNeeded) askYoutubeAccessChoice();
             return;
         }
         if (recording) stopRecording();     // دو منبعِ هم‌زمان روی یک پنل نباشه
@@ -3925,18 +4016,101 @@ public class BubbleService extends Service {
         if (!engine.start()) {
             engine.stop();
             showNotice(msg("دسترسی به اعلان‌ها هنوز فعال نیست", "Notification access is not enabled yet"));
-            if (openSettingsIfNeeded) YtMedia.openAccessSettings(this);
+            if (openSettingsIfNeeded) askYoutubeAccessChoice();
             return;
         }
         yt = engine;
+        ytFullMode = false;
         ytEntries.clear();
         refreshHeader();
+        updateYtButton();
+    }
+
+    /** ▶ بدونِ دسترسیِ اعلان / نگه‌داشتنِ ▶: توضیحِ شفاف و انتخابِ «همگام با پخش» یا «فقط متنِ کامل». */
+    private void askYoutubeAccessChoice() {
+        try {
+            startActivity(new Intent(this, ShareReceiverActivity.class)
+                    .putExtra(ShareReceiverActivity.EXTRA_YT_CHOOSE, true)
+                    .putExtra(ShareReceiverActivity.EXTRA_FA, isFa())
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
+        } catch (Throwable t) {
+            YtMedia.openAccessSettings(this);
+        }
+    }
+
+    /** از ShareReceiverActivity (لینکِ کلیپ‌بورد): کلِ زیرنویسِ ویدیو را یک‌جا و بدونِ همگام‌سازی می‌آورد. */
+    static void startYoutubeFull(Context ctx, final String videoId) {
+        final BubbleService s = instance;
+        if (s == null) return;
+        s.main.post(() -> s.beginYoutubeFull(videoId));
+    }
+
+    private void beginYoutubeFull(String videoId) {
+        if (wm == null || bubble == null || !YtMedia.isValidYouTubeVideoId(videoId)) return;
+        if (yt != null) stopYoutube(false);
+        userHidden = false;
+        if (recording) stopRecording();
+        YtSubtitles engine = new YtSubtitles(this, ytHost, WORKER_BASE, HTTP_FAST);
+        yt = engine;
+        ytFullMode = true;
+        ytEntries.clear();
+        engine.startFullText(videoId, "");
+        refreshHeader();
+        updateYtButton();
+        showNotice(msg("در حال گرفتنِ زیرنویسِ کامل…", "Fetching the full subtitles…"));
+    }
+
+    // ─── 🔂 «متنِ کامل»: خواندنِ کلِ متن از اول؛ بعد از آخرین جمله دوباره از اول، تا دوباره بزنی ───
+
+    private void toggleFullText() {
+        if (fullLoop) { stopFullText(); return; }
+        if (history.isEmpty()) return;
+        stopPanelSpeech();
+        fullLoop = true;
+        fullIdx = 0;
+        fullToken++;
+        updateYtButton();
+        speakFull(fullToken, 0);
+    }
+
+    private void speakFull(final int my, final int empties) {
+        if (!fullLoop || my != fullToken) return;
+        if (history.isEmpty() || empties > history.size()) { stopFullText(); return; }
+        if (fullIdx >= history.size()) {
+            fullIdx = 0;                                           // تمام شد → از اولِ متن
+            main.postDelayed(() -> speakFull(my, 0), 700);
+            return;
+        }
+        final Entry e = history.get(fullIdx);
+        String t = e.src == null ? "" : e.src.trim();
+        if (t.isEmpty()) { fullIdx++; speakFull(my, empties + 1); return; }
+        scrollToEntry(e);
+        panelSpeaking = true;
+        PanelTts.speak(this, t, e.srcLang, 1.0f, ok -> {
+            if (!fullLoop || my != fullToken) return;
+            if (!ok) { stopFullText(); return; }
+            fullIdx++;
+            speakFull(my, 0);
+        });
+    }
+
+    private void stopFullText() {
+        boolean was = fullLoop;
+        fullLoop = false;
+        fullToken++;
+        if (was) {
+            PanelTts.stop(this);
+            panelSpeaking = false;
+            panelQuietUntil = SystemClock.uptimeMillis() + 800;
+        }
         updateYtButton();
     }
 
     private void stopYoutube(boolean notify) {
         YtSubtitles engine = yt;
         yt = null;
+        ytFullMode = false;
+        stopFullText();
         ytEntries.clear();
         ytListMode = false; ytListGen++; ytCur = -1;
         if (scroll != null) scroll.ytMode = false;
@@ -4018,7 +4192,7 @@ public class BubbleService extends Service {
         for (int i = from; i < end; i++) {
             Entry e = newEntry();
             e.ytIdx = i;
-            if (e.ytReplayBtn != null) e.ytReplayBtn.setVisibility(View.VISIBLE);
+            if (e.ytReplayBtn != null && !ytFullMode) e.ytReplayBtn.setVisibility(View.VISIBLE);
             e.src = sents.get(i);
             e.srcLang = currentSrcLang();
             for (Map.Entry<String, String[]> x : tr.entrySet()) {
@@ -4043,9 +4217,10 @@ public class BubbleService extends Service {
 
     private void styleYtEntry(Entry e, boolean current) {
         if (e == null || e.box == null) return;
-        e.box.setAlpha(current ? 1f : YT_DIM);
+        if (ytFullMode) current = false;                    // 📄 متنِ کامل: همه‌ی جمله‌ها یکسان، بدونِ کم‌رنگ/پررنگ
+        e.box.setAlpha(current || ytFullMode ? 1f : YT_DIM);
         e.tvSrc.setTextColor(current ? Color.WHITE : Color.parseColor("#C8CCD8"));
-        e.tvSrc.setTag(new float[]{13f, current ? 1f : 0f});
+        e.tvSrc.setTag(new float[]{13f, current ? 1f : 0f, 1f});   // ۱ = «متنِ محتوا»؛ بدونِ آن فونتِ انتخابیِ کادر روی متنِ اصلیِ یوتیوب اعمال نمی‌شد
         applyStyle(e.tvSrc);
     }
 
