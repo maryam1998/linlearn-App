@@ -31,7 +31,7 @@ final class SherpaEngine implements PcmSink {
     private volatile boolean released = false;
     private volatile boolean failed = false;
     private String lastPartial = "";
-    // صدا از thread ضبط فقط وارد صف می‌شود؛ رمزگشایی در thread جدا انجام می‌شود تا ضبط/UI هیچ‌وقت منتظر مدل نماند
+    // صدا از thread ضبط فقط وارد صف می‌شود؛ رمزگشایی در thread جدا انجام می‌شود تا ضبط/UI هیچ‌وقت منتظر بسته نماند
     private final LinkedBlockingQueue<float[]> queue = new LinkedBlockingQueue<>(500);
     private Thread worker;
 
@@ -95,7 +95,7 @@ final class SherpaEngine implements PcmSink {
             short s = (short) ((pcm16k[2 * i] & 0xff) | (pcm16k[2 * i + 1] << 8));
             f[i] = s / 32768f;
         }
-        if (!queue.offer(f)) { queue.poll(); queue.offer(f); }   // صف پر شد (مدل خیلی عقب است) → قدیمی‌ترین تکه دور ریخته می‌شود
+        if (!queue.offer(f)) { queue.poll(); queue.offer(f); }   // صف پر شد (موتور خیلی عقب است) → قدیمی‌ترین تکه دور ریخته می‌شود
     }
 
     private void runWorker() {

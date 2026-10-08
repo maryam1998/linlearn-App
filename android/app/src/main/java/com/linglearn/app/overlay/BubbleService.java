@@ -4245,7 +4245,7 @@ public class BubbleService extends Service {
         } else {
             if (eng != null) eng.release();
             if (stillActive) {
-                main.post(() -> fallbackToServer(msg("بارگذاری مدل آفلاین ناموفق بود؛ حالت سرور فعال شد",
+                main.post(() -> fallbackToServer(msg("بارگذاری بسته آفلاین ناموفق بود؛ حالت سرور فعال شد",
                         "Offline model failed to load; using server")));
             }
             stillActive = false;
@@ -4697,7 +4697,7 @@ public class BubbleService extends Service {
         return stripThink(raw);
     }
 
-    /** بلوکِ <think>…</think> (فکرِ مدل) را حذف می‌کند و فقط پاسخ را نگه می‌دارد. */
+    /** بلوکِ <think>…</think> (فکرِ سرویس) را حذف می‌کند و فقط پاسخ را نگه می‌دارد. */
     private static String stripThink(String s) {
         if (s == null) return "";
         return s.replaceAll("(?is)<think(ing)?>.*?</think(ing)?>", "")

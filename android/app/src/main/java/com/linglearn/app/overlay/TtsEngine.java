@@ -141,7 +141,7 @@ final class TtsEngine {
         }
         try (java.io.FileInputStream in = new java.io.FileInputStream(model)) {
             int b = in.read();
-            // HTML / JSON / متن (مثلاً صفحه‌ی خطای آینه یا pointer ی git-lfs) → مدل نیست
+            // HTML / JSON / متن (مثلاً صفحه‌ی خطای آینه یا pointer ی git-lfs) → بسته نیست
             if (b == '<' || b == '{' || b == 'v' || b == ' ' || b == '\n' || b == '\r') {
                 model.delete();
                 return "model.onnx is not an ONNX file";
@@ -193,7 +193,7 @@ final class TtsEngine {
             OfflineTtsVitsModelConfig vitsConfig = new OfflineTtsVitsModelConfig();
             vitsConfig.setModel(new File(dir, "model.onnx").getAbsolutePath());
             vitsConfig.setTokens(new File(dir, "tokens.txt").getAbsolutePath());
-            // espeak-ng-dataِ مشترکِ همه‌ی مدل‌ها (یک بار دانلود می‌شه)
+            // espeak-ng-dataِ مشترکِ همه‌ی بسته‌ها (یک بار دانلود می‌شه)
             vitsConfig.setDataDir(SherpaModelManager.getEspeakDataDir(ctx).getAbsolutePath());
 
             int cores = Runtime.getRuntime().availableProcessors();
@@ -211,7 +211,7 @@ final class TtsEngine {
             int sr;
             synchronized (NATIVE_LOCK) {
                 engine = new OfflineTts(null, config);
-                // نرخ نمونه‌برداری رو از خودِ مدل بخون (مدل‌های Piper همه ۲۲۰۵۰ نیستن)
+                // نرخ نمونه‌برداری رو از خودِ بسته بخون (بسته‌های Piper همه ۲۲۰۵۰ نیستن)
                 sr = engine.sampleRate();
             }
             if (sr <= 0) sr = 22050;

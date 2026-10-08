@@ -19,8 +19,8 @@ import okhttp3.Request;
 import okhttp3.Response;
 
 /**
- * مدل‌های Whisper (MIT) برای تشخیص گفتارِ آهنگ‌ها — کاملاً جدا از SherpaModelManager.
- * مدل‌ها از HuggingFace (همان میرورِ SherpaModelManager) توسط خودِ کاربر دانلود می‌شن
+ * بسته‌های Whisper (MIT) برای تشخیص گفتارِ آهنگ‌ها — کاملاً جدا از SherpaModelManager.
+ * بسته‌ها از HuggingFace (همان میرورِ SherpaModelManager) توسط خودِ کاربر دانلود می‌شن
  * و توی files/whisper/<id>/ ذخیره می‌شن. دانلود با Range قابل ادامه‌ست.
  */
 final class WhisperModelManager {
@@ -49,7 +49,7 @@ final class WhisperModelManager {
         String[] files() { return new String[]{encoder, decoder, tokens}; }
     }
 
-    // مدل‌های چندزبانه (نه .en) تا فارسی/عربی/ترکی هم کار کنن.
+    // بسته‌های چندزبانه (نه .en) تا فارسی/عربی/ترکی هم کار کنن.
     // نام فایل‌ها طبق مخزن‌های csukuangfj/sherpa-onnx-whisper-* هست؛ اگه نسخه‌ی جدیدی
     // نام‌ها رو عوض کرد، فقط همین‌جا اصلاح کن.
     private static final Map<String, Spec> SPECS;
@@ -85,7 +85,7 @@ final class WhisperModelManager {
         return new File(new File(ctx.getFilesDir(), "whisper"), model);
     }
 
-    /** پوشه‌ی مدل اگه کامل دانلود شده باشه، وگرنه null. */
+    /** پوشه‌ی بسته اگه کامل دانلود شده باشه، وگرنه null. */
     static File getModelDir(Context ctx, String model) {
         Spec s = model == null ? null : SPECS.get(model);
         if (s == null) return null;

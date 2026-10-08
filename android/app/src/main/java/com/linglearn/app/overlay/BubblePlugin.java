@@ -309,7 +309,7 @@ public class BubblePlugin extends Plugin {
     }
 
     // ================================================================
-    // ============ STT: مدل‌های تشخیص گفتار (Zipformer) ==============
+    // ============ STT: بسته‌های تشخیص گفتار (Zipformer) ==============
     // ================================================================
 
     // checkModelStatus({ lang: "en" })
@@ -327,7 +327,7 @@ public class BubblePlugin extends Plugin {
         call.resolve(ret);
     }
 
-    // cancelModelDownload() — توقفِ دانلودِ مدلِ تشخیص گفتار (فایل .part می‌مونه تا ادامه پیدا کنه)
+    // cancelModelDownload() — توقفِ دانلودِ بسته‌ی تشخیص گفتار (فایل .part می‌مونه تا ادامه پیدا کنه)
     @PluginMethod
     public void cancelModelDownload(PluginCall call) {
         SherpaModelManager.cancelDownload();
@@ -512,7 +512,7 @@ public class BubblePlugin extends Plugin {
     }
 
     // getTtsCatalog() → { languages: [{lang, downloaded}], downloading, downloadingLang }
-    // یک‌جا وضعیتِ همه‌ی زبان‌هایی که مدلِ آفلاین دارن (برای صفحه‌ی تنظیمات)
+    // یک‌جا وضعیتِ همه‌ی زبان‌هایی که بسته‌ی آفلاین دارن (برای صفحه‌ی تنظیمات)
     @PluginMethod
     public void getTtsCatalog(PluginCall call) {
         Context ctx = getContext();
@@ -607,7 +607,7 @@ public class BubblePlugin extends Plugin {
     public void deleteTtsModel(PluginCall call) {
         Context ctx = getContext();
         String lang = call.getString("lang", "en");
-        // اگه همین زبان الان توی حافظه لوده، اول آزادش کن (وگرنه فایلِ مدل درگیره)
+        // اگه همین زبان الان توی حافظه لوده، اول آزادش کن (وگرنه فایلِ بسته درگیره)
         String n = SherpaModelManager.normalize(lang);
         if (n != null) {
             TtsClient.releaseLang(n);

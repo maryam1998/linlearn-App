@@ -83,7 +83,7 @@ final class SherpaModelManager {
         m.put("ru", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-small-ru-vosk-2025-08-16",
                 "encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"));
-        // فرانسوی / آلمانی / اسپانیایی: مدل‌های جریانی Kroko (Zipformer2)
+        // فرانسوی / آلمانی / اسپانیایی: بسته‌های جریانی Kroko (Zipformer2)
         m.put("fr", new Spec(
                 "csukuangfj/sherpa-onnx-streaming-zipformer-fr-kroko-2025-08-06",
                 "encoder.onnx", "decoder.onnx", "joiner.onnx", "tokens.txt"));
@@ -147,7 +147,7 @@ final class SherpaModelManager {
         m.put("hi", new TtsSpec(
                 "csukuangfj/vits-piper-hi_IN-rohan-medium",
                 "hi_IN-rohan-medium.onnx", "tokens.txt", "espeak-ng-data"));
-        // he (عبری), ja (ژاپنی), ko (کره‌ای): مدل Piper رسمی ندارن؛
+        // he (عبری), ja (ژاپنی), ko (کره‌ای): بسته Piper رسمی ندارن؛
         // اگه پیدا کردی همینجا اضافه کن.
 
         TTS_SPECS = Collections.unmodifiableMap(m);
@@ -184,7 +184,7 @@ final class SherpaModelManager {
         if (l != null && TTS_CANCEL.contains(l)) throw new DownloadCancelled();
     }
 
-    /** حجمِ بخشِ دانلودشده‌ی ناتمامِ مدلِ یه زبان (برای دکمه‌ی «ادامه»). */
+    /** حجمِ بخشِ دانلودشده‌ی ناتمامِ بسته‌ی یه زبان (برای دکمه‌ی «ادامه»). */
     static long getTtsPartialBytes(Context ctx, String lang) {
         String l = normalize(lang);
         if (l == null) return 0;
@@ -249,12 +249,12 @@ final class SherpaModelManager {
         return new File(new File(ctx.getFilesDir(), "tts"), l);
     }
 
-    /** زبان‌هایی که مدل TTS آفلاین دارن (به ترتیب تعریف). */
+    /** زبان‌هایی که بسته TTS آفلاین دارن (به ترتیب تعریف). */
     static List<String> ttsLanguages() {
         return new ArrayList<>(TTS_SPECS.keySet());
     }
 
-    /** زبان‌هایی که مدل TTS‌شون همین الان در حال دانلوده. */
+    /** زبان‌هایی که بسته TTS‌شون همین الان در حال دانلوده. */
     static List<String> getTtsDownloadingLangs() {
         return new ArrayList<>(TTS_ACTIVE);
     }
@@ -266,7 +266,7 @@ final class SherpaModelManager {
         return l != null && TTS_ACTIVE.contains(l);
     }
 
-    /** espeak-ng-data مشترکِ همه‌ی مدل‌های Piper (یک بار دانلود می‌شه). */
+    /** espeak-ng-data مشترکِ همه‌ی بسته‌های Piper (یک بار دانلود می‌شه). */
     static File getEspeakDataDir(Context ctx) {
         return new File(new File(ctx.getFilesDir(), "tts"), "espeak-ng-data");
     }
@@ -302,13 +302,13 @@ final class SherpaModelManager {
     private static volatile boolean STT_CANCEL = false;
     private static volatile String STT_ACTIVE = null;
 
-    /** توقفِ دانلودِ مدلِ تشخیص گفتار (بخشِ دانلودشده می‌مونه). */
+    /** توقفِ دانلودِ بسته‌ی تشخیص گفتار (بخشِ دانلودشده می‌مونه). */
     static void cancelDownload() { if (DOWNLOADING.get()) STT_CANCEL = true; }
 
-    /** زبانی که همین الان مدلش دانلود می‌شه (یا null). */
+    /** زبانی که همین الان بسته‌اش دانلود می‌شه (یا null). */
     static String activeDownloadLang() { return STT_ACTIVE; }
 
-    /** حجمِ بخشِ دانلودشده‌ی ناتمامِ مدلِ یه زبان (برای دکمه‌ی «ادامه»). */
+    /** حجمِ بخشِ دانلودشده‌ی ناتمامِ بسته‌ی یه زبان (برای دکمه‌ی «ادامه»). */
     static long getSttPartialBytes(Context ctx, String lang) {
         String l = normalize(lang);
         Spec s = l == null ? null : SPECS.get(l);
@@ -367,7 +367,7 @@ final class SherpaModelManager {
         t.start();
     }
 
-    /** یک فایلِ مدلِ STT رو با امکانِ ادامه (Range) و توقفِ کاربر می‌گیره. done[0] = مجموعِ بایت‌های همه‌ی فایل‌ها. */
+    /** یک فایلِ بسته‌ی STT رو با امکانِ ادامه (Range) و توقفِ کاربر می‌گیره. done[0] = مجموعِ بایت‌های همه‌ی فایل‌ها. */
     private static void downloadSttFile(String url, File target, ProgressCallback cb, String l, long[] done) throws Exception {
         File part = new File(target.getParentFile(), target.getName() + ".part");
         long existing = part.isFile() ? part.length() : 0;
