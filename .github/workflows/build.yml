@@ -97,7 +97,7 @@ jobs:
         run: |
           if [ ! -f android/gradle/wrapper/gradle.zip ]; then
             mkdir -p android/gradle/wrapper
-            curl -L -o android/gradle/wrapper/gradle.zip https://services.gradle.org/distributions/gradle-8.7-bin.zip
+            curl -L -o android/gradle/wrapper/gradle.zip https://services.gradle.org/distributions/gradle-8.14.3-bin.zip
           fi
 
       - name: Download Sherpa-ONNX AAR
