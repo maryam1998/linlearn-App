@@ -1227,6 +1227,12 @@ public class BubbleService extends Service {
         }
     }
 
+    /** ضبطِ shadowing: اگر «اجازه‌ی ضبطِ صدای سیستم» قبلاً داده شده، صدای در حالِ پخشِ گوشی هم با ولومِ کم مخلوط می‌شود. */
+    static MediaProjection shadowProjection() {
+        BubbleService s = instance;
+        return s == null ? null : s.mediaProjection;
+    }
+
     static void shadowDone(final String path) {
         final BubbleService s = instance;
         if (s == null) return;
@@ -2259,6 +2265,9 @@ public class BubbleService extends Service {
             new FontOpt("en_mono", "تک‌فاصله", "Mono", "monospace", null, false, false, 1f, false),
             new FontOpt("en_inter", "Inter", "Inter", null, new String[]{"inter"}, false, false, 1f, true),
             new FontOpt("en_lora", "Lora", "Lora", null, new String[]{"lora"}, false, false, 1f, true),
+            // خانواده‌های داخلیِ اندروید (بدونِ نیاز به فایل): تا هر شش گزینه‌ی «نوع فونت» روی متنِ لاتین هم واقعاً فرق کند
+            new FontOpt("en_cursive", "دست‌نویس", "Cursive", "cursive", null, false, false, 1.1f, false),
+            new FontOpt("en_casual", "غیررسمی", "Casual", "casual", null, false, false, 1f, false),
     };
 
     /** «نوع فونت» تنظیماتِ اپ (default/modern/classic/elegant/rounded/warm) → نزدیک‌ترین فونتِ قابل‌استفاده در کادر.
@@ -2269,10 +2278,10 @@ public class BubbleService extends Service {
         boolean lora = fontById(EN_FONTS, "en_lora").id.equals("en_lora") && fontAvailable(fontById(EN_FONTS, "en_lora"));
         switch (id == null ? "default" : id) {
             case "classic": return new String[]{pickFa("fa_sysnaskh", "fa_serif"), "en_serif"};
-            case "elegant": return new String[]{pickFa("fa_sysnastaliq", "fa_sysnaskh", "fa_serif"), "en_serif"};
-            case "rounded": return new String[]{pickFa("fa_syskufi", "fa_medium"), "en_medium"};
-            case "modern":  return new String[]{vazir ? "fa_vazir" : pickFa("fa_syssans", "fa_default"), inter ? "en_inter" : "en_default"};
-            case "warm":    return new String[]{vazir ? "fa_vazir" : pickFa("fa_sysnaskh", "fa_default"), "en_default"};
+            case "elegant": return new String[]{pickFa("fa_sysnastaliq", "fa_sysnaskh", "fa_serif"), "en_cursive"};
+            case "rounded": return new String[]{pickFa("fa_syskufi", "fa_medium"), "en_casual"};
+            case "modern":  return new String[]{vazir ? "fa_vazir" : pickFa("fa_syssans", "fa_default"), inter ? "en_inter" : "en_light"};
+            case "warm":    return new String[]{vazir ? "fa_vazir" : pickFa("fa_sysnaskh", "fa_default"), "en_cond"};
             default:        return new String[]{vazir ? "fa_vazir" : "fa_default", lora ? "en_lora" : "en_default"};
         }
     }
