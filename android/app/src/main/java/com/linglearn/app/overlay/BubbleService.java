@@ -4287,9 +4287,116 @@ public class BubbleService extends Service {
 
     private String msg(String fa, String en) { return isFa() ? fa : en; }
 
+    // ───────── 📦 ترجمه‌ی زنده فقط با تشخیص گفتارِ آفلاین (بدونِ سرور و بدونِ تشخیص‌دهنده‌ی آنلاین) ─────────
+
+    /** بسته‌ای که برای زبانِ مبدأ لازم است ولی روی گوشی نیست: {نوع، شناسه}؛ null = بسته آماده است. */
+    private String[] missingOfflinePack(String src) {
+        if (whisperModelPref() != null) return null;                       // «حالت آهنگ»ِ انتخابیِ کاربر
+        boolean sherpaLang = src != null && !"auto".equals(src) && SherpaModelManager.isAvailable(src);
+        if (sherpaLang) {
+            if (SherpaModelManager.getModelDir(this, src) != null) return null;
+            String n = SherpaModelManager.normalize(src);
+            return new String[]{"sherpa", n != null ? n : src};
+        }
+        if (anyWhisperModel() != null) return null;                        // زبان‌های بدونِ بسته‌ی اختصاصی + «خودکار»
+        return new String[]{"whisper", "base"};
+    }
+
+    private String anyWhisperModel() {
+        for (String m : new String[]{"base", "small", "tiny"}) {
+            if (WhisperModelManager.getModelDir(this, m) != null) return m;
+        }
+        return null;
+    }
+
+    /** true = می‌شود شروع کرد؛ false = یا دانلود در جریان است یا پیامِ تأییدِ دانلود نشان داده شد. */
+    private boolean offlinePackReady() {
+        if (SherpaModelManager.isDownloading() || WhisperModelManager.isDownloading()) {
+            showNotice(msg("دانلودِ بسته‌ی آفلاین در حال انجام است؛ کمی صبر کنید",
+                    "The offline pack is still downloading — please wait"));
+            return false;
+        }
+        String[] need = missingOfflinePack(effectiveSource());
+        if (need == null) return true;
+        askOfflinePack(need[0], need[1]);
+        return false;
+    }
+
+    private void askOfflinePack(String kind, String id) {
+        try {
+            String name = LANG_NAMES.containsKey(id) ? LANG_NAMES.get(id) : id;
+            startActivity(new Intent(this, ShareReceiverActivity.class)
+                    .putExtra(ShareReceiverActivity.EXTRA_ASR_PACK, true)
+                    .putExtra(ShareReceiverActivity.EXTRA_PACK_KIND, kind)
+                    .putExtra(ShareReceiverActivity.EXTRA_PACK_ID, id)
+                    .putExtra(ShareReceiverActivity.EXTRA_PACK_NAME, name)
+                    .putExtra(ShareReceiverActivity.EXTRA_PACK_MB, "whisper".equals(kind) ? WhisperModelManager.approxMb(id) : 0)
+                    .putExtra(ShareReceiverActivity.EXTRA_FA, isFa())
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
+        } catch (Throwable t) {
+            showNotice(msg("برای ترجمه‌ی زنده، بسته‌ی آفلاین را از تنظیماتِ اپ دانلود کنید",
+                    "For live translation, download the offline pack from the app settings"));
+        }
+    }
+
+    /** از ShareReceiverActivity، بعد از «دانلود» زدنِ کاربر. */
+    static void startAsrPackDownload(Context ctx, final String kind, final String id) {
+        final BubbleService s = instance;
+        if (s == null) return;
+        s.main.post(() -> s.downloadAsrPack(kind, id));
+    }
+
+    private void downloadAsrPack(final String kind, final String id) {
+        if (SherpaModelManager.isDownloading() || WhisperModelManager.isDownloading()) {
+            showNotice(msg("یک دانلود دیگر در حال انجام است", "Another download is already running"));
+            return;
+        }
+        if (!hasInternet()) {
+            showNotice(msg("برای دانلودِ بسته به اینترنت نیاز است", "An internet connection is needed to download the pack"));
+            return;
+        }
+        showNotice(msg("دانلودِ بسته‌ی آفلاین شروع شد…", "Offline pack download started…"));
+        final long[] last = {0};
+        if ("whisper".equals(kind)) {
+            WhisperModelManager.download(this, id, new WhisperModelManager.Callback() {
+                @Override public void onProgress(String m, long done, long total) { packProgress(done, total, last); }
+                @Override public void onDone(String m) { packDone(); }
+                @Override public void onError(String m, Exception e) { packFailed(e); }
+            });
+        } else {
+            SherpaModelManager.downloadModel(this, id, new SherpaModelManager.ProgressCallback() {
+                @Override public void onProgress(String l, long done, long total) { packProgress(done, total, last); }
+                @Override public void onDone(String l) { packDone(); }
+                @Override public void onError(String l, Exception e) { packFailed(e); }
+            });
+        }
+    }
+
+    private void packProgress(long done, long total, long[] last) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - last[0] < 1500) return;
+        last[0] = now;
+        final String p = total > 0 ? (int) (done * 100 / total) + "٪" : (done / (1024 * 1024)) + " MB";
+        main.post(() -> showNotice(msg("دانلودِ بسته‌ی آفلاین… ", "Downloading offline pack… ") + p));
+    }
+
+    private void packDone() {
+        main.post(() -> showNotice(msg("بسته‌ی آفلاین آماده شد ✓ — دوباره روی 🎙 بزنید",
+                "Offline pack ready ✓ — tap 🎙 again")));
+    }
+
+    private void packFailed(final Exception e) {
+        final boolean cancelled = e instanceof java.io.IOException && String.valueOf(e.getMessage()).contains("cancelled");
+        main.post(() -> showNotice(cancelled
+                ? msg("دانلود لغو شد", "Download cancelled")
+                : msg("دانلود ناموفق بود؛ اتصال را بررسی کنید و دوباره امتحان کنید (ادامه از همان‌جا)",
+                        "Download failed — check your connection and try again (it resumes)")));
+    }
+
     private void toggleRecording() {
         if (recording) { stopRecording(); return; }
         userHidden = false;
+        if (!offlinePackReady()) return;                      // پیش از درخواستِ مجوزِ ضبطِ صفحه
         if (mediaProjection == null) {
             Intent i = new Intent(this, ProjectionActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             try { startActivity(i); }
@@ -4339,20 +4446,14 @@ public class BubbleService extends Service {
         speechHostRestarts = 0;
         gotAsrText = false; voicedSinceText = 0;
         final String src = effectiveSource();
-        final String wModel = whisperModelPref();
-        if (wModel != null) {
-            // Song mode: offline Whisper (any language, incl. "auto"); falls through to the old paths if it can't start
-            if (startSherpaEngine(src, wModel)) return;
-        }
-        if (src != null && !"auto".equals(src) && SherpaModelManager.isAvailable(src)) {
-            // Sherpa path: feedLoop feeds the OnlineStream (no SpeechHostActivity)
-            if (startSherpaEngine(src, null)) return;
-        }
-        boolean micOk = Build.VERSION.SDK_INT >= 33
-                && src != null && !src.isEmpty() && !"auto".equals(src)
-                && SpeechRecognizer.isRecognitionAvailable(this);
-        if (micOk && startMicEngine(src)) return;
-        beginCapture();
+        // 📦 فقط موتورِ آفلاین (Sherpa یا Whisper). بدونِ بسته: پیامِ تأییدِ دانلود، نه سرور و نه تشخیص‌دهنده‌ی آنلاین.
+        String[] need = missingOfflinePack(src);
+        if (need != null) { askOfflinePack(need[0], need[1]); return; }
+        String wModel = whisperModelPref();
+        final boolean sherpaLang = src != null && !"auto".equals(src) && SherpaModelManager.isAvailable(src);
+        if (wModel == null && !sherpaLang) wModel = anyWhisperModel();
+        if (startSherpaEngine(src, wModel)) return;           // wModel == null ← بسته‌ی Sherpa
+        showNotice(msg("راه‌اندازیِ موتورِ آفلاین ممکن نشد", "Could not start the offline engine"));
     }
 
     /**
@@ -4429,8 +4530,8 @@ public class BubbleService extends Service {
         } else {
             if (eng != null) eng.release();
             if (stillActive) {
-                main.post(() -> fallbackToServer(msg("بارگذاری بسته آفلاین ناموفق بود؛ حالت سرور فعال شد",
-                        "Offline model failed to load; using server")));
+                main.post(() -> fallbackToServer(msg("بسته‌ی آفلاین بارگذاری نشد؛ دوباره دانلودش کنید",
+                        "The offline pack failed to load — please download it again")));
             }
             stillActive = false;
         }
@@ -4516,8 +4617,8 @@ public class BubbleService extends Service {
                     if (voicedSinceText >= wd) {
                         voicedSinceText = 0;
                         main.post(() -> fallbackToServer(
-                                msg("تشخیص گفتار روی صدای سیستم کار نکرد؛ حالت سرور فعال شد",
-                                        "Recognizer can't hear system audio; using server")));
+                                msg("گفتاری تشخیص داده نشد؛ زبانِ مبدأ را بررسی کنید",
+                                        "No speech recognized — check the source language")));
                         break;
                     }
                 }
@@ -4567,16 +4668,10 @@ public class BubbleService extends Service {
     }
 
     /** Leaves the recognizer engine and uses the server (chunked transcribe) path instead. */
+    /** ☁ حالتِ سرور حذف شده؛ اگر موتورِ آفلاین نتوانست کار کند، ضبط متوقف می‌شود و دلیلش نشان داده می‌شود. */
     private void fallbackToServer(String notice) {
         if (!micEngine) return;
-        micEngine = false;
-        recording = false;
-        releaseSherpa();
-        SpeechHostActivity.finishIfRunning();
-        PcmFeed.close();
-        AudioRecord r = record; record = null;
-        if (r != null) { try { r.stop(); } catch (Exception ignored) {} }
-        beginCapture();
+        stopRecording();
         if (notice != null) showNotice(notice);
     }
 

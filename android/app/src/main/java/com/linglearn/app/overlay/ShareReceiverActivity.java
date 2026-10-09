@@ -41,10 +41,23 @@ public class ShareReceiverActivity extends Activity {
     static final String EXTRA_FA = "com.linglearn.app.FA";
     private boolean ytFullClip = false;
 
+    /** از 🎙 حباب، وقتی بسته‌ی تشخیص گفتارِ آفلاین روی گوشی نیست: پیامِ تأییدِ دانلود. */
+    static final String EXTRA_ASR_PACK = "com.linglearn.app.ASR_PACK";
+    static final String EXTRA_PACK_KIND = "com.linglearn.app.PACK_KIND";
+    static final String EXTRA_PACK_ID = "com.linglearn.app.PACK_ID";
+    static final String EXTRA_PACK_NAME = "com.linglearn.app.PACK_NAME";
+    static final String EXTRA_PACK_MB = "com.linglearn.app.PACK_MB";
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         fromClip = getIntent() != null && getIntent().getBooleanExtra(EXTRA_FROM_CLIP, false);
+        if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_ASR_PACK, false)) {
+            Intent in = getIntent();
+            showAsrPackDialog(in.getBooleanExtra(EXTRA_FA, true), in.getStringExtra(EXTRA_PACK_KIND),
+                    in.getStringExtra(EXTRA_PACK_ID), in.getStringExtra(EXTRA_PACK_NAME), in.getIntExtra(EXTRA_PACK_MB, 0));
+            return;
+        }
         if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_YT_CHOOSE, false)) {
             showYtChoice(getIntent().getBooleanExtra(EXTRA_FA, true));
             return;
@@ -67,6 +80,36 @@ public class ShareReceiverActivity extends Activity {
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
         if (hasFocus && fromClip) finishFromClip();
+    }
+
+    private void showAsrPackDialog(final boolean fa, final String kind, final String id, String name, int mb) {
+        final boolean whisper = "whisper".equals(kind);
+        String size = mb > 0 ? (fa ? "حدود " + mb + " مگابایت" : "about " + mb + " MB")
+                : (fa ? "چند ده تا چند صد مگابایت" : "tens to a few hundred MB");
+        String msg = fa
+                ? "ترجمه‌ی زنده با تشخیص گفتارِ آفلاین انجام می‌شود: پردازش کاملاً روی گوشی شماست، صدا به هیچ سروری ارسال نمی‌شود و صفحه روان می‌ماند.\n\n"
+                + (whisper
+                    ? "برای این زبان (یا حالت «خودکار») بسته‌ی چندزبانه‌ی Whisper لازم است. این بسته از بسته‌های اختصاصیِ هر زبان کندتر است و ترجمه ممکن است با چند ثانیه تأخیر نمایش داده شود.\n\n"
+                    : "برای زبان «" + name + "» لازم است بسته‌ی آفلاین یک‌بار دانلود شود.\n\n")
+                + "حجم بسته: " + size + " — پیشنهاد می‌شود با Wi‑Fi وصل باشید. دانلود در صورت قطع شدن از همان‌جا ادامه پیدا می‌کند.\n\n"
+                + "بدون این بسته، ترجمه‌ی زنده کار نمی‌کند. دانلود شود؟"
+                : "Live translation uses offline speech recognition: processing happens entirely on your phone, no audio is sent to any server, and the screen stays smooth.\n\n"
+                + (whisper
+                    ? "This language (or “Auto”) needs the multilingual Whisper pack. It is slower than the per-language packs, so translations may appear a few seconds late.\n\n"
+                    : "A one-time offline pack is required for “" + name + "”.\n\n")
+                + "Pack size: " + size + ". We recommend Wi‑Fi. An interrupted download resumes where it stopped.\n\n"
+                + "Without this pack, live translation will not work. Download it now?";
+        AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(fa ? "دانلود بسته‌ی تشخیص گفتار آفلاین" : "Download offline speech pack")
+                .setMessage(msg)
+                .setPositiveButton(fa ? "دانلود" : "Download", (dlg, w) -> {
+                    BubbleService.startAsrPackDownload(getApplicationContext(), kind, id);
+                    finish();
+                })
+                .setNegativeButton(fa ? "فعلاً نه" : "Not now", (dlg, w) -> finish())
+                .create();
+        d.setOnCancelListener(x -> finish());
+        d.show();
     }
 
     private void showYtChoice(final boolean fa) {
