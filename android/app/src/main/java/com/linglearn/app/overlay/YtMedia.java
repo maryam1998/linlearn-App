@@ -437,6 +437,69 @@ public class YtMedia extends NotificationListenerService {
         return n;
     }
 
+    // ───────── ⏩ سرعتِ پخشِ هر برنامه (یوتیوب، اینستاگرام، پلیر گوشی، …) ─────────
+
+    /** پلیرِ در حالِ پخش (یا اولین sessionِ دارایِ عنوان). null = دسترسی نیست یا sessionی نیست. */
+    private static MediaController pickPlayer(Context ctx) {
+        try {
+            Context app = ctx.getApplicationContext();
+            MediaSessionManager msm = (MediaSessionManager) app.getSystemService(Context.MEDIA_SESSION_SERVICE);
+            if (msm == null) return null;
+            List<MediaController> list = msm.getActiveSessions(new ComponentName(app, YtMedia.class));
+            if (list == null || list.isEmpty()) return null;
+            for (MediaController c : list) {
+                PlaybackState ps = c.getPlaybackState();
+                if (ps != null && ps.getState() == PlaybackState.STATE_PLAYING) return c;
+            }
+            for (MediaController c : list) {
+                MediaMetadata md = c.getMetadata();
+                if (md != null && md.getString(MediaMetadata.METADATA_KEY_TITLE) != null) return c;
+            }
+            return list.get(0);
+        } catch (Throwable e) {
+            return null;
+        }
+    }
+
+    /** نامِ پکیجِ پلیرِ فعلی (مثلاً com.google.android.youtube)؛ "" = نامشخص. */
+    public static String playerPackage(Context ctx) {
+        MediaController c = pickPlayer(ctx);
+        return c == null || c.getPackageName() == null ? "" : c.getPackageName();
+    }
+
+    /** سرعتِ فعلیِ پلیرِ بیرونی؛ -1 = نامشخص (sessionی نیست / دسترسیِ اعلان‌ها نیست). */
+    public static float currentSpeed(Context ctx) {
+        MediaController c = pickPlayer(ctx);
+        if (c == null) return -1f;
+        try {
+            PlaybackState ps = c.getPlaybackState();
+            if (ps == null) return -1f;
+            float sp = ps.getPlaybackSpeed();
+            return sp > 0f ? sp : 1f;
+        } catch (Throwable e) {
+            return -1f;
+        }
+    }
+
+    /**
+     * سرعتِ پخشِ برنامه‌ی در حالِ پخش رو عوض می‌کنه (از طریقِ MediaSession).
+     * 1 = درخواست فرستاده شد، 0 = هیچ پلیری پیدا نشد، -1 = «دسترسی به اعلان‌ها» داده نشده.
+     * نتیجه‌ی واقعی رو با [currentSpeed] چند لحظه بعد چک کن (بعضی برنامه‌ها درخواست رو نادیده می‌گیرن).
+     */
+    public static int setSpeed(Context ctx, float speed) {
+        if (!hasAccess(ctx)) return -1;
+        MediaController c = pickPlayer(ctx);
+        if (c == null) return 0;
+        try {
+            float sp = Math.max(0.25f, Math.min(4f, speed));
+            c.getTransportControls().setPlaybackSpeed(sp);
+            return 1;
+        } catch (Throwable e) {
+            Log.d(TAG, "setSpeed failed: " + e);
+            return 0;
+        }
+    }
+
     // seek از بیرون (متدِ ytSeek در BubblePlugin) — روی tracker فعالِ BubbleService
     private static volatile Tracker active;
     static void setActive(Tracker t) { active = t; }

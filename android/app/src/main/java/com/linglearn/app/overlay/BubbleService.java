@@ -1337,6 +1337,9 @@ public class BubbleService extends Service {
         tvFont.setTypeface(Typeface.DEFAULT_BOLD);
         tvFont.setOnLongClickListener(v -> { resetView(); return true; });
         header.addView(tvFont);
+        TextView tvSpeed = headerButton("\u23E9", v -> toggleSpeedRow());   // سرعتِ پخشِ ویدیو/صدای برنامه‌ی دیگر
+        tvSpeed.setPadding(dp(8), dp(6), dp(8), dp(6));
+        header.addView(tvSpeed);
         TextView tvOpacity = headerButton("\uD83C\uDF13", v -> toggleOpacityRow());
         tvOpacity.setPadding(dp(8), dp(6), dp(8), dp(6));
         header.addView(tvOpacity);
@@ -1375,6 +1378,9 @@ public class BubbleService extends Service {
         opacityRow.addView(opacityBar, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         opacityRow.addView(opacityPct, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         panel.addView(opacityRow, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        panel.addView(buildSpeedRow(), new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         panel.addView(buildFontRow(), new LinearLayout.LayoutParams(
@@ -2330,6 +2336,10 @@ public class BubbleService extends Service {
     private float panelWFrac = -1f;            // -1 = تمام‌عرض
     private float panelAlpha = 1f;             // شفافیتِ پس‌زمینه‌ی کادر: ۱ = کاملاً مات (solid)، ۰ = کاملاً شفاف
     private LinearLayout opacityRow;
+    private LinearLayout speedRow;
+    private TextView tvSpeedVal;
+    private float speedWanted = 1f;
+    private int speedGen = 0;
     private LinearLayout fontRow;
     private final ArrayList<TextView> faChips = new ArrayList<>();
     private final ArrayList<TextView> enChips = new ArrayList<>();
@@ -2367,6 +2377,7 @@ public class BubbleService extends Service {
         boolean show = opacityRow.getVisibility() != View.VISIBLE;
         opacityRow.setVisibility(show ? View.VISIBLE : View.GONE);
         if (show && fontRow != null) fontRow.setVisibility(View.GONE);
+        if (show && speedRow != null) speedRow.setVisibility(View.GONE);
         refreshLayout();
     }
 
@@ -2376,7 +2387,137 @@ public class BubbleService extends Service {
         boolean show = fontRow.getVisibility() != View.VISIBLE;
         fontRow.setVisibility(show ? View.VISIBLE : View.GONE);
         if (show && opacityRow != null) opacityRow.setVisibility(View.GONE);
+        if (show && speedRow != null) speedRow.setVisibility(View.GONE);
         refreshLayout();
+    }
+
+    // ───────── ⏩ سرعتِ پخش (ویدیو/صدای هر برنامه: یوتیوب، اینستاگرام، پلیر گوشی …) ─────────
+
+    private static final float[] SPEED_PRESETS = {0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f};
+
+    private View buildSpeedRow() {
+        speedRow = new LinearLayout(this);
+        speedRow.setOrientation(LinearLayout.VERTICAL);
+        speedRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        speedRow.setVisibility(View.GONE);
+
+        LinearLayout ctl = new LinearLayout(this);
+        ctl.setOrientation(LinearLayout.HORIZONTAL);
+        ctl.setGravity(Gravity.CENTER);
+        ctl.addView(speedChip("\u2212", v -> bumpSpeed(-0.1f)));
+        tvSpeedVal = new TextView(this);
+        tvSpeedVal.setTextColor(COLOR_GOLD);
+        tvSpeedVal.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        tvSpeedVal.setTypeface(Typeface.DEFAULT_BOLD);
+        tvSpeedVal.setGravity(Gravity.CENTER);
+        tvSpeedVal.setMinWidth(dp(80));
+        tvSpeedVal.setText("1.0\u00D7");
+        ctl.addView(tvSpeedVal);
+        ctl.addView(speedChip("+", v -> bumpSpeed(0.1f)));
+        speedRow.addView(ctl, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout presets = new LinearLayout(this);
+        presets.setOrientation(LinearLayout.HORIZONTAL);
+        presets.setGravity(Gravity.CENTER);
+        for (final float sp : SPEED_PRESETS) {
+            TextView c = speedChip(fmtSpeed(sp), v -> applySpeed(sp));
+            c.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            c.setPadding(dp(7), dp(5), dp(7), dp(5));
+            presets.addView(c, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        }
+        speedRow.addView(presets, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return speedRow;
+    }
+
+    private TextView speedChip(String label, View.OnClickListener l) {
+        TextView t = headerButton(label, l);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        t.setTypeface(Typeface.DEFAULT_BOLD);
+        return t;
+    }
+
+    private static String fmtSpeed(float sp) {
+        String t = String.format(Locale.US, "%.2f", sp);
+        if (t.endsWith("0")) t = t.substring(0, t.length() - 1);
+        return t + "\u00D7";
+    }
+
+    private void toggleSpeedRow() {
+        if (speedRow == null) return;
+        boolean show = speedRow.getVisibility() != View.VISIBLE;
+        speedRow.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show) {
+            if (opacityRow != null) opacityRow.setVisibility(View.GONE);
+            if (fontRow != null) fontRow.setVisibility(View.GONE);
+            float cur = YtMedia.currentSpeed(this);
+            if (cur > 0f) speedWanted = cur;
+            if (tvSpeedVal != null) tvSpeedVal.setText(fmtSpeed(speedWanted));
+        }
+        refreshLayout();
+    }
+
+    private void bumpSpeed(float delta) {
+        float base = speedWanted;
+        float cur = YtMedia.currentSpeed(this);
+        if (cur > 0f) base = cur;
+        applySpeed(Math.round((base + delta) * 100f) / 100f);
+    }
+
+    private void applySpeed(float sp) {
+        sp = Math.max(0.25f, Math.min(3f, sp));
+        speedWanted = sp;
+        if (tvSpeedVal != null) tvSpeedVal.setText(fmtSpeed(sp));
+        int r = YtMedia.setSpeed(this, sp);
+        if (r < 0) {
+            showNotice(msg("برای تغییر سرعت، «دسترسی به اعلان‌ها» رو برای این برنامه روشن کن.",
+                    "Turn on Notification access for this app to change playback speed."));
+            YtMedia.openAccessSettings(this);
+            return;
+        }
+        if (r == 0) {
+            showNotice(msg("هیچ ویدیو یا صدایی در حال پخش پیدا نشد.", "No playing video or audio found."));
+            return;
+        }
+        // چند لحظه بعد چک می‌کنیم برنامه واقعاً سرعت رو عوض کرد یا نه
+        final int gen = ++speedGen;
+        final float want = sp;
+        main.postDelayed(() -> {
+            if (gen != speedGen) return;
+            float got = YtMedia.currentSpeed(this);
+            if (got > 0f && Math.abs(got - want) > 0.03f) {
+                if (YtMedia.YT_PKG.equals(YtMedia.playerPackage(this))) { speedViaAccessibility(want); return; }
+                if (tvSpeedVal != null) tvSpeedVal.setText(fmtSpeed(got));
+                speedWanted = got;
+                showNotice(msg("این برنامه اجازه‌ی تغییر سرعت از بیرون رو نمی‌ده.",
+                        "This app doesn't allow changing speed from outside."));
+                main.postDelayed(() -> { if (gen == speedGen) clearStatus(); }, 3500);
+            }
+        }, 800);
+    }
+
+    /** یوتیوب سرعت رو از MediaSession قبول نکرد → از منوی خودِ یوتیوب (سرویسِ دسترسی‌پذیری). */
+    private void speedViaAccessibility(final float want) {
+        if (!SpeedAccessibilityService.isEnabled(this)) {
+            showNotice(msg("برای تغییرِ سرعتِ یوتیوب، سرویسِ «دسترسی‌پذیری» این برنامه رو روشن کن.",
+                    "To change YouTube speed, turn on this app's Accessibility service."));
+            SpeedAccessibilityService.openSettings(this);
+            return;
+        }
+        showNotice(msg("در حال تنظیمِ سرعتِ یوتیوب…", "Setting YouTube speed…"));
+        boolean sent = SpeedAccessibilityService.request(want, (ok, applied) -> {
+            if (ok) {
+                speedWanted = applied;
+                if (tvSpeedVal != null) tvSpeedVal.setText(fmtSpeed(applied));
+                clearStatus();
+            } else {
+                showNotice(msg("نشد؛ ویدیوی یوتیوب باید روی صفحه باز باشه.",
+                        "Failed; the YouTube video must be on screen."));
+            }
+        });
+        if (!sent) showNotice(msg("سرویسِ دسترسی‌پذیری هنوز وصل نشده؛ یک بار خاموش/روشنش کن.",
+                "Accessibility service isn't connected yet; toggle it off/on once."));
     }
 
     private int panelMaxH() { return Math.max(dp(60), (int) (screenH() * panelHFrac)); }
