@@ -116,7 +116,11 @@
         <service
             android:name=".overlay.BubbleService"
             android:exported="false"
-            android:foregroundServiceType="mediaProjection|specialUse" />
+            android:foregroundServiceType="mediaProjection|specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Displays a floating overlay with live subtitles and translation over other apps to help users learn languages; the user starts and stops it at any time" />
+        </service>
 
         <provider
             android:name="androidx.core.content.FileProvider"
