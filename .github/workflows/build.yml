@@ -135,3 +135,19 @@ jobs:
         with:
           name: LingoLearn-release-apk
           path: android/app/build/outputs/apk/release/app-release.apk
+
+      # ✅ Build Release AAB (برای Google Play؛ با همان کلید امضا می‌شود)
+      - name: Build Release AAB
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cd android
+          ./gradlew bundleRelease --stacktrace
+
+      - name: Upload Release AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: LingoLearn-release-aab
+          path: android/app/build/outputs/bundle/release/app-release.aab
