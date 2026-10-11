@@ -1,5 +1,8 @@
 apply plugin: 'com.android.application'
 
+// شماره‌ی نسخه از متغیر VERSION_CODE (ورک‌فلو: شماره‌ی اجرا)؛ اگه نبود، ۱
+def appVersionCode = (System.getenv("VERSION_CODE") ?: "1").toInteger()
+
 android {
     namespace = "com.linglearn.app"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -7,8 +10,8 @@ android {
         applicationId "com.linglearn.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode (System.getenv("VERSION_CODE") ?: "1").toInteger()
-        versionName "1.0." + (System.getenv("VERSION_CODE") ?: "1")
+        versionCode appVersionCode
+        versionName "1.0.${appVersionCode}"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
