@@ -127,6 +127,12 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
+        <!-- 🔍 حبابِ ذره‌بین: ضربه روی متن ← ترجمه (عکسِ صفحه فقط به‌درخواستِ کاربر و فقط برای خواندنِ متنِ کنارِ انگشت؛ ذخیره یا ارسال نمی‌شود) -->
+        <service
+            android:name=".overlay.MagnifierService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
         <service
             android:name=".overlay.BubbleService"
             android:exported="false"
