@@ -1,5 +1,6 @@
 package com.linglearn.app.overlay;
 
+import android.animation.ValueAnimator;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -94,8 +95,8 @@ public class MagnifierService extends Service {
     private static final Set<String> LATIN = new HashSet<>(Arrays.asList(
             "en", "de", "fr", "es", "it", "pt", "nl", "tr"));
 
-    // اندازه‌ی ذره‌بین (dp): پنجره‌ی 88، مرکزِ شیشه در (38,38) با شعاعِ 32
-    private static final float LENS_SIZE = 88f, LENS_C = 38f, LENS_R = 32f;
+    // اندازه‌ی ذره‌بین (dp): هم‌اندازه‌ی حبابِ ترجمه‌ی زنده (60)؛ مرکزِ شیشه در (26,26) با شعاعِ 20
+    private static final float LENS_SIZE = 60f, LENS_C = 26f, LENS_R = 20f;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -116,6 +117,10 @@ public class MagnifierService extends Service {
     private WindowManager.LayoutParams lensLp;
     private CloseTargetView closeView;
     private boolean overTarget = false;
+    private boolean lensMode = false;      // true = حلقه‌ی شفاف (موقعِ کشیدن/رها)؛ false = حبابِ کنارِ صفحه
+    private boolean docked = true;
+    private ValueAnimator dockAnim;
+    private final Runnable dockRun = () -> dockLens();
     private boolean busy = false;
 
     private TextRecognizer latinRec, devaRec;
@@ -138,6 +143,9 @@ public class MagnifierService extends Service {
     private String cardWord = "", cardMeaning = "", cardMeaningLang = "fa";
     private boolean cardStoryDone, cardGrammarDone, cardLeitnerDone;
     private int cardSeq = 0;
+    private TextView cardSpeak;
+    private boolean speaking = false;
+    private int speakTok = 0;
 
     // ───────────────────────── چرخه‌ی عمر ─────────────────────────
 
@@ -176,6 +184,7 @@ public class MagnifierService extends Service {
     public void onDestroy() {
         running = false;
         main.removeCallbacksAndMessages(null);
+        if (dockAnim != null) dockAnim.cancel();
         clearSelection();
         try { if (closeView != null) wm.removeViewImmediate(closeView); } catch (Exception ignored) {}
         closeView = null;
@@ -315,20 +324,28 @@ public class MagnifierService extends Service {
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         lensLp.gravity = Gravity.TOP | Gravity.START;
-        lensLp.x = capW / 2 - dp(LENS_C);
-        lensLp.y = capH / 3;
+        // شروع: کنارِ راستِ صفحه، نیمه‌پنهان (مثلِ حبابِ ترجمه‌ی زنده)
+        lensLp.x = capW - (int) (size * 0.58f);
+        lensLp.y = (int) (capH * 0.42f);
+        lens.setAlpha(0.62f);
+        docked = true;
         lens.setOnTouchListener(new View.OnTouchListener() {
-            float dx, dy, startX, startY; boolean moved;
+            float dx, dy, startX, startY; boolean moved; boolean wasDocked;
             @Override public boolean onTouch(View v, MotionEvent e) {
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
+                        main.removeCallbacks(dockRun);
+                        if (dockAnim != null) dockAnim.cancel();
                         startX = e.getRawX(); startY = e.getRawY();
                         dx = lensLp.x - startX; dy = lensLp.y - startY;
-                        moved = false;
+                        moved = false; wasDocked = docked;
+                        lens.setAlpha(1f);
                         return true;
                     case MotionEvent.ACTION_MOVE:
                         if (!moved && Math.hypot(e.getRawX() - startX, e.getRawY() - startY) > dp(8)) {
                             moved = true;
+                            docked = false;
+                            setLensMode(true);
                             showCloseTarget();
                         }
                         if (moved) {
@@ -343,11 +360,22 @@ public class MagnifierService extends Service {
                         boolean up = e.getActionMasked() == MotionEvent.ACTION_UP;
                         boolean onX = overTarget;
                         hideCloseTarget();
-                        if (up && onX) {
+                        if (!up) { scheduleDock(600); return true; }
+                        if (moved && onX) {
                             toast(msg("ذره‌بین بسته شد", "Magnifier closed"));
                             stopSelf();
-                        } else if (up) {
+                        } else if (moved) {
                             onLensDropped();
+                        } else if (wasDocked) {
+                            // ضربه روی حبابِ کنارِ صفحه: بیاید داخلِ صفحه و به ذره‌بین تبدیل شود
+                            docked = false;
+                            setLensMode(true);
+                            lensLp.x = capW - lensLp.width - dp(24);
+                            clampLens();
+                            toast(msg("ذره‌بین را روی متن بکشید و رها کنید", "Drag the magnifier over a text and release"));
+                            scheduleDock(6000);
+                        } else {
+                            onLensDropped();          // ضربه روی ذره‌بین: دوباره بخوان
                         }
                         return true;
                 }
@@ -355,6 +383,35 @@ public class MagnifierService extends Service {
             }
         });
         wm.addView(lens, lensLp);
+    }
+
+    private void setLensMode(boolean on) {
+        lensMode = on;
+        if (lens != null) lens.invalidate();
+    }
+
+    /** چند لحظه بعد، ذره‌بین به کنارِ نزدیک‌ترین لبه برمی‌گردد (مثلِ حبابِ ترجمه‌ی زنده). */
+    private void scheduleDock(long ms) {
+        main.removeCallbacks(dockRun);
+        main.postDelayed(dockRun, ms);
+    }
+
+    private void dockLens() {
+        if (lens == null || lensLp == null || busy) return;
+        if (dockAnim != null) dockAnim.cancel();
+        final boolean left = lensLp.x + lensLp.width / 2 < capW / 2;
+        final int target = left ? -(int) (lensLp.width * 0.42f) : capW - (int) (lensLp.width * 0.58f);
+        setLensMode(false);
+        dockAnim = ValueAnimator.ofInt(lensLp.x, target);
+        dockAnim.setDuration(220);
+        dockAnim.addUpdateListener(a -> {
+            if (lens == null) return;
+            lensLp.x = (Integer) a.getAnimatedValue();
+            try { wm.updateViewLayout(lens, lensLp); } catch (Exception ignored) {}
+        });
+        dockAnim.start();
+        docked = true;
+        lens.setAlpha(0.62f);
     }
 
     private void clampLens() {
@@ -414,6 +471,8 @@ public class MagnifierService extends Service {
     private void onLensDropped() {
         if (busy) return;
         busy = true;
+        main.removeCallbacks(dockRun);
+        setLensMode(true);
         clearSelection();                         // هایلایت و کادرِ قبلی از فریم محو شود
         if (lens != null) lens.setBusy(true);
         main.postDelayed(() -> {
@@ -533,6 +592,7 @@ public class MagnifierService extends Service {
             busy = false;
             if (lens != null) lens.setBusy(false);
             showSelection(rf, elems, fo, fsrc, results);
+            scheduleDock(2500);
         });
     }
 
@@ -541,6 +601,7 @@ public class MagnifierService extends Service {
             busy = false;
             if (lens != null) lens.setBusy(false);
             toast(message);
+            scheduleDock(2000);
         });
     }
 
@@ -554,6 +615,7 @@ public class MagnifierService extends Service {
 
     private void clearSelection() {
         cardSeq++;
+        stopSpeech();
         if (selView != null) { try { wm.removeViewImmediate(selView); } catch (Exception ignored) {} selView = null; }
         if (popup != null) { try { wm.removeViewImmediate(popup); } catch (Exception ignored) {} popup = null; }
         wordCard = null;
@@ -592,6 +654,7 @@ public class MagnifierService extends Service {
             placePopup();
         } catch (Exception ex) { popup = null; }
         bringLensToFront();
+        if (selView != null) selView.selectAll();   // کادرِ سورمه‌ای (لغت/خوانش/ذخیره) از همان اول با کلِ متن باز می‌شود
     }
 
     private void placePopup() {
@@ -702,9 +765,19 @@ public class MagnifierService extends Service {
         wlp.topMargin = dp(8);
         wordCard.setLayoutParams(wlp);
 
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
         cardTerm = txt("", Color.WHITE, 17);
         cardTerm.setTypeface(cardTerm.getTypeface(), android.graphics.Typeface.BOLD);
-        wordCard.addView(cardTerm);
+        top.addView(cardTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        cardSpeak = txt("\uD83D\uDD0A", Color.WHITE, 18);
+        cardSpeak.setGravity(Gravity.CENTER);
+        cardSpeak.setMinWidth(dp(44));
+        cardSpeak.setMinHeight(dp(40));
+        cardSpeak.setOnClickListener(v -> onSpeakClick());
+        top.addView(cardSpeak);
+        wordCard.addView(top);
 
         cardMeaningTv = txt("", Color.parseColor("#E8EAF2"), 15);
         cardMeaningTv.setPadding(0, dp(2), 0, dp(6));
@@ -737,6 +810,27 @@ public class MagnifierService extends Service {
         styleCardAction(cardBtnLeitner, cardLeitnerDone);
     }
 
+    // 🔊 خوانشِ لغت/متنِ کادرِ سورمه‌ای (همان موتورِ حبابِ ترجمه‌ی زنده: Piper یا TTS گوشی)
+    private void stopSpeech() {
+        speakTok++;
+        speaking = false;
+        if (cardSpeak != null) cardSpeak.setText("\uD83D\uDD0A");
+        try { PanelTts.stop(this); } catch (Throwable ignored) {}
+    }
+
+    private void onSpeakClick() {
+        if (cardWord == null || cardWord.isEmpty() || cardSpeak == null) return;
+        if (speaking) { stopSpeech(); return; }
+        final int my = ++speakTok;
+        speaking = true;
+        cardSpeak.setText("\u23F9");
+        PanelTts.speak(this, cardWord, selSrc, 1.0f, ok -> {
+            if (my != speakTok) return;
+            speaking = false;
+            if (cardSpeak != null) cardSpeak.setText("\uD83D\uDD0A");
+        });
+    }
+
     /** لغت/محدوده‌ی انتخاب‌شده ← کادرِ لغت را باز کن و معنی را بگیر. */
     private void onRangePicked(int i, int j, ArrayList<ElemInfo> el) {
         if (wordCard == null || el == null || el.isEmpty()) return;
@@ -747,6 +841,7 @@ public class MagnifierService extends Service {
         }
         final String word = sb.toString().trim().replaceAll("^[\\p{Punct}\\u2018\\u2019\\u201C\\u201D]+|[\\p{Punct}\\u2018\\u2019\\u201C\\u201D]+$", "");
         if (word.isEmpty()) return;
+        stopSpeech();
         final int my = ++cardSeq;
         cardWord = word;
         cardMeaning = "";
@@ -884,8 +979,9 @@ public class MagnifierService extends Service {
         }
     }
 
-    /** ذره‌بینِ حلقه‌ای: وسطِ شیشه شفاف است تا متنِ زیرش دیده و خوانده شود. */
+    /** ذره‌بین: کنارِ صفحه = حبابِ گرد (هم‌سبکِ حبابِ ترجمه‌ی زنده)؛ هنگامِ کشیدن = حلقه‌ی با وسطِ شفاف تا متنِ زیرش خوانده شود. */
     private final class LensView extends View {
+        private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint outline = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint gold = new Paint(Paint.ANTI_ALIAS_FLAG);
         private boolean working;
@@ -901,16 +997,37 @@ public class MagnifierService extends Service {
         void setBusy(boolean b) { working = b; invalidate(); }
 
         @Override protected void onDraw(Canvas cv) {
+            if (lensMode) drawRing(cv); else drawDisc(cv);
+        }
+
+        private void drawRing(Canvas cv) {
             float cx = dp(LENS_C), cy = dp(LENS_C), r = dp(LENS_R);
-            float hx0 = cx + r * 0.72f, hy0 = cy + r * 0.72f, hx1 = hx0 + dp(16), hy1 = hy0 + dp(16);
+            float hx0 = cx + r * 0.72f, hy0 = cy + r * 0.72f, hx1 = hx0 + dp(10), hy1 = hy0 + dp(10);
             outline.setColor(COLOR_INK);
-            outline.setStrokeWidth(dp(8));
+            outline.setStrokeWidth(dp(6));
             cv.drawCircle(cx, cy, r, outline);
             cv.drawLine(hx0, hy0, hx1, hy1, outline);
             gold.setColor(working ? Color.WHITE : COLOR_GOLD);
-            gold.setStrokeWidth(dp(4));
+            gold.setStrokeWidth(dp(3));
             cv.drawCircle(cx, cy, r, gold);
             cv.drawLine(hx0, hy0, hx1, hy1, gold);
+        }
+
+        private void drawDisc(Canvas cv) {
+            float d = getResources().getDisplayMetrics().density;
+            float w = getWidth(), h = getHeight();
+            float r = Math.min(w, h) / 2f - 8 * d;
+            fill.setColor(COLOR_INK);
+            cv.drawCircle(w / 2f, h / 2f, r, fill);
+            gold.setColor(COLOR_GOLD);
+            gold.setStrokeWidth(2 * d);
+            cv.drawCircle(w / 2f, h / 2f, r, gold);
+            outline.setColor(Color.WHITE);
+            outline.setStrokeWidth(2.4f * d);
+            float cx = w / 2f - 2 * d, cy = h / 2f - 2 * d, lr = 6 * d;
+            cv.drawCircle(cx, cy, lr, outline);
+            float o = lr * 0.72f;
+            cv.drawLine(cx + o, cy + o, cx + o + 6 * d, cy + o + 6 * d, outline);
         }
     }
 
