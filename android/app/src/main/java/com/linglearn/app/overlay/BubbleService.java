@@ -224,10 +224,16 @@ public class BubbleService extends Service {
             if (s.yt != null) s.yt.onSettingsChanged();
             s.prepareLocalTranslator();
             s.applyAppFont();
+            s.applyPanelColor();
             s.refreshHeader();
             for (Entry e : new ArrayList<>(s.history)) s.renderEntry(e);
             s.refreshLayout();
         });
+    }
+
+    /** 🎨 رنگِ کادرِ حباب (مشترک با ذره‌بین)؛ rgb بدونِ آلفا. پیش‌فرض سورمه‌ای 0x1C2541. */
+    public static void savePanelColor(Context ctx, int rgb) {
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("panelColor", rgb & 0xFFFFFF).apply();
     }
 
     /** Translation tone: "neutral" (default), "formal" or "casual". */
@@ -2047,7 +2053,8 @@ public class BubbleService extends Service {
         wordCard.setOrientation(LinearLayout.VERTICAL);
         wordCard.setPadding(dp(10), dp(8), dp(10), dp(10));
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.parseColor("#26335F"));
+        bg.setColor(wordCardBgColor());
+        wordCardBgDrawable = bg;
         bg.setCornerRadius(dp(12));
         bg.setStroke(dp(1), COLOR_GOLD);
         wordCard.setBackground(bg);
@@ -2367,8 +2374,28 @@ public class BubbleService extends Service {
     private void applyPanelAlpha() {
         if (panelBgDrawable == null) return;
         int a = Math.round(Math.max(0f, Math.min(1f, panelAlpha)) * 255f);
-        panelBgDrawable.setColor((a << 24) | 0x1C2541);
+        panelBgDrawable.setColor((a << 24) | panelRgb());
         panel.invalidate();
+    }
+
+    private int panelRgb() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getInt("panelColor", 0x1C2541) & 0xFFFFFF;
+    }
+
+    /** رنگِ کادرِ لغتِ داخلِ پنل: پیش‌فرض همان #26335F؛ برای رنگ‌های دیگر کمی روشن‌تر از رنگِ پنل. */
+    private int wordCardBgColor() {
+        int c = panelRgb();
+        if (c == 0x1C2541) return Color.parseColor("#26335F");
+        int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+        r += Math.round((255 - r) * 0.10f); g += Math.round((255 - g) * 0.10f); b += Math.round((255 - b) * 0.10f);
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
+
+    private GradientDrawable wordCardBgDrawable;
+
+    private void applyPanelColor() {
+        applyPanelAlpha();
+        if (wordCardBgDrawable != null) wordCardBgDrawable.setColor(wordCardBgColor());
     }
 
     /** 🌓 نوارِ تنظیمِ شفافیت (۰ تا ۱۰۰٪) را باز/بسته می‌کند. */

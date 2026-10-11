@@ -217,6 +217,20 @@ public class BubblePlugin extends Plugin {
         call.resolve();
     }
 
+    // 🎨 setPanelColor({ color: "#RRGGBB" }) — رنگِ کادرِ حبابِ ترجمه‌ی زنده و ذره‌بین
+    @PluginMethod
+    public void setPanelColor(PluginCall call) {
+        String c = call.getString("color");
+        try {
+            int rgb = android.graphics.Color.parseColor(c == null ? "#1C2541" : c.trim()) & 0xFFFFFF;
+            BubbleService.savePanelColor(getContext(), rgb);
+            BubbleService.settingsChanged();
+            call.resolve();
+        } catch (Exception e) {
+            call.reject("bad color");
+        }
+    }
+
     // 🔍 حبابِ ذره‌بین: magnifierStart({ targetLang?, targetLangs?, sourceLang? }) — اول مجوزِ ضبطِ صفحه از کاربر می‌پرسد
     @PluginMethod
     public void magnifierStart(PluginCall call) {

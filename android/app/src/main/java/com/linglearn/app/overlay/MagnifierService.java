@@ -137,14 +137,14 @@ public class MagnifierService extends Service {
     private RectF selBox;
     private String selSrc = "en", selOrig = "";
 
-    // کادرِ لغت
-    private LinearLayout wordCard;
-    private TextView cardTerm, cardMeaningTv, cardBtnStory, cardBtnGrammar, cardBtnLeitner;
+    // کادرِ سورمه‌ای (هم‌سبکِ پنلِ حبابِ ترجمه‌ی زنده)
+    private LinearLayout rowsBox;
+    private TextView cardTerm, termSpeak, cardBtnStory, cardBtnGrammar, cardBtnLeitner;
     private String cardWord = "", cardMeaning = "", cardMeaningLang = "fa";
     private boolean cardStoryDone, cardGrammarDone, cardLeitnerDone;
     private int cardSeq = 0;
-    private TextView cardSpeak;
-    private boolean speaking = false;
+    private final ArrayList<String[]> wholeResults = new ArrayList<>();   // ترجمه‌ی کلِ متن: {کدِ زبان، متن}
+    private TextView speakingBtn;
     private int speakTok = 0;
 
     // ───────────────────────── چرخه‌ی عمر ─────────────────────────
@@ -511,6 +511,7 @@ public class MagnifierService extends Service {
             String t = prefs().getString("target", "fa");
             if (!t.equals(src)) out.add(t);
         }
+        if (out.isEmpty()) out.add("en".equals(src) ? "fa" : "en");
         return out;
     }
 
@@ -584,7 +585,7 @@ public class MagnifierService extends Service {
             String tr;
             try { tr = FreeTranslator.translate(http, orig, src, tgt); }
             catch (Exception ex) { tr = "—"; }
-            results.add(new String[]{tgt.toUpperCase(Locale.ROOT), tr});
+            results.add(new String[]{tgt, tr});
         }
         final String fo = orig, fsrc = src;
         final RectF rf = new RectF(box);
@@ -618,7 +619,7 @@ public class MagnifierService extends Service {
         stopSpeech();
         if (selView != null) { try { wm.removeViewImmediate(selView); } catch (Exception ignored) {} selView = null; }
         if (popup != null) { try { wm.removeViewImmediate(popup); } catch (Exception ignored) {} popup = null; }
-        wordCard = null;
+        rowsBox = null; cardTerm = null; termSpeak = null;
     }
 
     private void showSelection(RectF box, ArrayList<ElemInfo> elems, String orig, String src, List<String[]> results) {
@@ -626,6 +627,8 @@ public class MagnifierService extends Service {
         selBox = box;
         selSrc = src;
         selOrig = orig;
+        wholeResults.clear();
+        wholeResults.addAll(results);
 
         // پنجره‌ی هایلایت: فقط به‌اندازه‌ی متن، تا بقیه‌ی صفحه لمس‌پذیر بماند
         int pad = dp(6);
@@ -641,7 +644,7 @@ public class MagnifierService extends Service {
         selLp.y = (int) box.top - pad;
         try { wm.addView(selView, selLp); } catch (Exception ex) { selView = null; }
 
-        buildPopup(orig, results);
+        buildPopup();
         int w = Math.min(capW - dp(24), dp(360));
         popupLp = new WindowManager.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -654,7 +657,7 @@ public class MagnifierService extends Service {
             placePopup();
         } catch (Exception ex) { popup = null; }
         bringLensToFront();
-        if (selView != null) selView.selectAll();   // کادرِ سورمه‌ای (لغت/خوانش/ذخیره) از همان اول با کلِ متن باز می‌شود
+        if (selView != null) selView.selectAll();   // کادر از همان اول برای کلِ متن باز می‌شود (متن + ترجمه‌ها + 🔊 + ذخیره)
     }
 
     private void placePopup() {
@@ -673,6 +676,9 @@ public class MagnifierService extends Service {
         try { wm.updateViewLayout(popup, popupLp); } catch (Exception ignored) {}
     }
 
+    /** رنگِ کادر (قابلِ تنظیم در اپ، مشترک با حبابِ ترجمه‌ی زنده)؛ پیش‌فرض سورمه‌ای. */
+    private int panelRgb() { return prefs().getInt("panelColor", 0x1C2541) & 0xFFFFFF; }
+
     private TextView txt(String s, int color, float sp) {
         TextView t = new TextView(this);
         t.setText(s);
@@ -684,54 +690,72 @@ public class MagnifierService extends Service {
     }
 
     private TextView headBtn(String s, View.OnClickListener l) {
-        TextView t = txt(s, COLOR_INK, 17);
-        t.setPadding(dp(12), dp(2), dp(2), dp(2));
+        TextView t = txt(s, Color.WHITE, 17);
+        t.setGravity(Gravity.CENTER);
+        t.setMinWidth(dp(40));
+        t.setMinHeight(dp(36));
         t.setOnClickListener(l);
         return t;
     }
 
-    private void buildPopup(String orig, List<String[]> results) {
+    private TextView speakBtn() {
+        TextView t = headBtn("\uD83D\uDD0A", null);
+        t.setTextSize(18);
+        return t;
+    }
+
+    private void buildPopup() {
         popup = new LinearLayout(this);
         popup.setOrientation(LinearLayout.VERTICAL);
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.parseColor("#FFFBF0"));
+        bg.setColor(0xF0000000 | panelRgb());
         bg.setCornerRadius(dp(16));
-        bg.setStroke(dp(2), COLOR_GOLD);
+        bg.setStroke(dp(1), COLOR_GOLD);
         popup.setBackground(bg);
-        popup.setPadding(dp(14), dp(10), dp(14), dp(12));
+        popup.setPadding(dp(14), dp(8), dp(10), dp(12));
         popup.setElevation(dp(10));
 
+        // سربرگ: متنِ اصلی + 🔊 + 📄 (کلِ متن) + ✕
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
-        TextView o = txt(orig, Color.parseColor("#6B7280"), 12);
-        o.setMaxLines(3);
-        o.setEllipsize(TextUtils.TruncateAt.END);
-        head.addView(o, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        head.addView(headBtn("\uD83D\uDCC4", v -> { if (selView != null) selView.selectAll(); }));   // 📄 کلِ متن
-        head.addView(headBtn("\u2715", v -> clearSelection()));                                    // ✕ بستنِ کادر
+        head.setGravity(Gravity.CENTER_VERTICAL);
+        cardTerm = txt("", Color.WHITE, 17);
+        cardTerm.setTypeface(cardTerm.getTypeface(), android.graphics.Typeface.BOLD);
+        cardTerm.setMaxLines(6);
+        cardTerm.setEllipsize(TextUtils.TruncateAt.END);
+        head.addView(cardTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        termSpeak = speakBtn();
+        termSpeak.setOnClickListener(v -> toggleSpeak(termSpeak, cardWord, selSrc));
+        head.addView(termSpeak);
+        head.addView(headBtn("\uD83D\uDCC4", v -> { if (selView != null) selView.selectAll(); }));
+        head.addView(headBtn("\u2715", v -> clearSelection()));
         popup.addView(head);
 
-        for (String[] r : results) {
-            TextView tv = txt(r[0] + " · " + r[1], COLOR_INK, 16);
+        // ترجمه‌ها به همه‌ی زبان‌های انتخابی (هر ردیف 🔊 دارد)
+        rowsBox = new LinearLayout(this);
+        rowsBox.setOrientation(LinearLayout.VERTICAL);
+        popup.addView(rowsBox, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        cardBtnStory = cardAction(v -> onCardStory());
+        cardBtnGrammar = cardAction(v -> onCardGrammar());
+        cardBtnLeitner = cardAction(v -> onCardLeitner());
+        for (TextView b : new TextView[]{cardBtnStory, cardBtnGrammar, cardBtnLeitner}) {
             LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.topMargin = dp(8);
-            popup.addView(tv, lp);
+            lp.topMargin = dp(6);
+            lp.rightMargin = dp(4);
+            popup.addView(b, lp);
         }
 
         TextView hint = txt(msg("روی یک لغت یا محدوده‌ی هایلایت‌شده بزنید (انگشت را روی چند لغت بکشید)",
                 "Tap a word, or drag across several words in the highlighted text"),
-                Color.parseColor("#8A8F98"), 11);
+                Color.parseColor("#8F98B8"), 11);
         LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         hlp.topMargin = dp(8);
         popup.addView(hint, hlp);
-
-        buildWordCard();
-        popup.addView(wordCard);
     }
-
-    // ───────── کادرِ لغت: معنی + «داستان بعدی / گرامر / لایتنر» (همان صفِ حبابِ ترجمه‌ی زنده) ─────────
 
     private TextView cardAction(View.OnClickListener l) {
         TextView b = txt("", Color.WHITE, 12);
@@ -750,52 +774,8 @@ public class MagnifierService extends Service {
         b.setTextColor(done ? COLOR_GOLD : Color.WHITE);
     }
 
-    private void buildWordCard() {
-        wordCard = new LinearLayout(this);
-        wordCard.setOrientation(LinearLayout.VERTICAL);
-        wordCard.setPadding(dp(10), dp(8), dp(10), dp(10));
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.parseColor("#26335F"));
-        bg.setCornerRadius(dp(12));
-        bg.setStroke(dp(1), COLOR_GOLD);
-        wordCard.setBackground(bg);
-        wordCard.setVisibility(View.GONE);
-        LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        wlp.topMargin = dp(8);
-        wordCard.setLayoutParams(wlp);
-
-        LinearLayout top = new LinearLayout(this);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-        cardTerm = txt("", Color.WHITE, 17);
-        cardTerm.setTypeface(cardTerm.getTypeface(), android.graphics.Typeface.BOLD);
-        top.addView(cardTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        cardSpeak = txt("\uD83D\uDD0A", Color.WHITE, 18);
-        cardSpeak.setGravity(Gravity.CENTER);
-        cardSpeak.setMinWidth(dp(44));
-        cardSpeak.setMinHeight(dp(40));
-        cardSpeak.setOnClickListener(v -> onSpeakClick());
-        top.addView(cardSpeak);
-        wordCard.addView(top);
-
-        cardMeaningTv = txt("", Color.parseColor("#E8EAF2"), 15);
-        cardMeaningTv.setPadding(0, dp(2), 0, dp(6));
-        wordCard.addView(cardMeaningTv);
-
-        cardBtnStory = cardAction(v -> onCardStory());
-        cardBtnGrammar = cardAction(v -> onCardGrammar());
-        cardBtnLeitner = cardAction(v -> onCardLeitner());
-        for (TextView b : new TextView[]{cardBtnStory, cardBtnGrammar, cardBtnLeitner}) {
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.topMargin = dp(5);
-            wordCard.addView(b, lp);
-        }
-    }
-
     private void refreshCardButtons() {
-        if (wordCard == null) return;
+        if (cardBtnStory == null) return;
         cardBtnStory.setText(cardStoryDone
                 ? msg("\uD83D\uDD16 ذخیره شد برای داستان بعدی", "\uD83D\uDD16 Saved for next story")
                 : msg("\uD83D\uDD16 ذخیره برای داستان بعدی", "\uD83D\uDD16 Save for next story"));
@@ -810,72 +790,118 @@ public class MagnifierService extends Service {
         styleCardAction(cardBtnLeitner, cardLeitnerDone);
     }
 
-    // 🔊 خوانشِ لغت/متنِ کادرِ سورمه‌ای (همان موتورِ حبابِ ترجمه‌ی زنده: Piper یا TTS گوشی)
+    /** ردیف‌های ترجمه: [کدِ زبان، متن]؛ هر ردیف 🔊ِ همان زبان دارد. */
+    private void setRows(List<String[]> rows) {
+        if (rowsBox == null) return;
+        rowsBox.removeAllViews();
+        for (String[] r : rows) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            final String lg = r[0], tx = r[1];
+            if (!lg.isEmpty()) {
+                TextView lab = txt(lg.toUpperCase(Locale.ROOT), COLOR_GOLD, 11);
+                lab.setTypeface(lab.getTypeface(), android.graphics.Typeface.BOLD);
+                lab.setMinWidth(dp(28));
+                row.addView(lab);
+            }
+            TextView t = txt(tx, Color.parseColor("#E8EAF2"), 15);
+            row.addView(t, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            if (!lg.isEmpty()) {
+                final TextView sp = speakBtn();
+                sp.setOnClickListener(v -> toggleSpeak(sp, tx, lg));
+                row.addView(sp);
+            }
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = dp(4);
+            rowsBox.addView(row, lp);
+        }
+    }
+
+    // 🔊 خوانش با همان سیستمِ خوانشِ اپ (Piper اگر بسته‌ی زبان دانلود شده، وگرنه TTS گوشی) — برای هر زبانی
     private void stopSpeech() {
         speakTok++;
-        speaking = false;
-        if (cardSpeak != null) cardSpeak.setText("\uD83D\uDD0A");
+        if (speakingBtn != null) { speakingBtn.setText("\uD83D\uDD0A"); speakingBtn = null; }
         try { PanelTts.stop(this); } catch (Throwable ignored) {}
     }
 
-    private void onSpeakClick() {
-        if (cardWord == null || cardWord.isEmpty() || cardSpeak == null) return;
-        if (speaking) { stopSpeech(); return; }
+    private void toggleSpeak(final TextView b, String text, String lang) {
+        if (text == null || text.trim().isEmpty() || "…".equals(text) || "—".equals(text)) return;
+        if (speakingBtn == b) { stopSpeech(); return; }
+        stopSpeech();
+        speakingBtn = b;
+        b.setText("\u23F9");
         final int my = ++speakTok;
-        speaking = true;
-        cardSpeak.setText("\u23F9");
-        PanelTts.speak(this, cardWord, selSrc, 1.0f, ok -> {
+        PanelTts.speak(this, text, lang, 1.0f, ok -> {
             if (my != speakTok) return;
-            speaking = false;
-            if (cardSpeak != null) cardSpeak.setText("\uD83D\uDD0A");
+            if (speakingBtn != null) { speakingBtn.setText("\uD83D\uDD0A"); speakingBtn = null; }
         });
     }
 
-    /** لغت/محدوده‌ی انتخاب‌شده ← کادرِ لغت را باز کن و معنی را بگیر. */
+    /** لغت/محدوده‌ی انتخاب‌شده (یا کلِ متن) ← عنوان، ترجمه‌ها و دکمه‌های ذخیره به‌روز می‌شود. */
     private void onRangePicked(int i, int j, ArrayList<ElemInfo> el) {
-        if (wordCard == null || el == null || el.isEmpty()) return;
-        StringBuilder sb = new StringBuilder();
-        for (int k = i; k <= j && k < el.size(); k++) {
-            if (sb.length() > 0) sb.append(' ');
-            sb.append(el.get(k).t);
+        if (popup == null || cardTerm == null || el == null || el.isEmpty()) return;
+        final boolean whole = (i == 0 && j == el.size() - 1);
+        String word;
+        if (whole) {
+            word = selOrig;
+        } else {
+            StringBuilder sb = new StringBuilder();
+            for (int k = i; k <= j && k < el.size(); k++) {
+                if (sb.length() > 0) sb.append(' ');
+                sb.append(el.get(k).t);
+            }
+            word = sb.toString().trim().replaceAll("^[\\p{Punct}\\u2018\\u2019\\u201C\\u201D]+|[\\p{Punct}\\u2018\\u2019\\u201C\\u201D]+$", "");
         }
-        final String word = sb.toString().trim().replaceAll("^[\\p{Punct}\\u2018\\u2019\\u201C\\u201D]+|[\\p{Punct}\\u2018\\u2019\\u201C\\u201D]+$", "");
         if (word.isEmpty()) return;
         stopSpeech();
         final int my = ++cardSeq;
         cardWord = word;
         cardMeaning = "";
+        cardMeaningLang = "fa";
         cardStoryDone = cardGrammarDone = cardLeitnerDone = false;
-        String nativeL = prefs().getString("target", "fa");
-        final String from = selSrc;
-        final String to = from.equals(nativeL) ? "en" : nativeL;
-        cardMeaningLang = to;
-
         cardTerm.setText(word);
-        cardMeaningTv.setText("…");
         refreshCardButtons();
-        wordCard.setVisibility(View.VISIBLE);
+
+        if (whole && !wholeResults.isEmpty()) {           // ترجمه‌ی کلِ متن را از قبل داریم
+            setRows(wholeResults);
+            adoptMeaning(wholeResults);
+            placePopup();
+            return;
+        }
+        ArrayList<String[]> wait = new ArrayList<>();
+        wait.add(new String[]{"", "…"});
+        setRows(wait);
         placePopup();
 
+        final String from = selSrc, w2 = word;
+        final List<String> tg = targets(from);
         worker.execute(() -> {
-            String out;
-            try { out = FreeTranslator.translate(http, word, from, to); }
-            catch (Exception ex) { out = ""; }
-            final String res = out == null ? "" : out.trim();
-            main.post(() -> onCardMeaning(my, res));
+            final ArrayList<String[]> out = new ArrayList<>();
+            for (String t : tg) {
+                String r;
+                try { r = FreeTranslator.translate(http, w2, from, t); }
+                catch (Exception ex) { r = ""; }
+                out.add(new String[]{t, (r == null || r.trim().isEmpty()) ? "—" : r.trim()});
+            }
+            main.post(() -> onWordMeanings(my, out));
         });
     }
 
-    private void onCardMeaning(int token, String meaning) {
-        if (token != cardSeq || cardMeaningTv == null) return;
-        if (meaning == null || meaning.isEmpty()) {
-            cardMeaningTv.setText(msg("ترجمه در دسترس نیست — ذخیره بدون معنی هم کار می‌کند", "No translation — saving still works"));
-        } else {
-            cardMeaning = meaning;
-            cardMeaningTv.setText(meaning);
-            if (cardStoryDone) queueWord("story");
-            if (cardLeitnerDone) queueWord("leitner");
+    private void adoptMeaning(List<String[]> rows) {
+        for (String[] r : rows) {
+            if (!"—".equals(r[1]) && !r[1].isEmpty()) { cardMeaningLang = r[0]; cardMeaning = r[1]; return; }
         }
+    }
+
+    private void onWordMeanings(int token, List<String[]> rows) {
+        if (token != cardSeq || rowsBox == null) return;
+        setRows(rows);
+        adoptMeaning(rows);
+        // اگر قبل از رسیدنِ معنی دکمه‌ای زده شده بود، همان ردیف با معنی به‌روز می‌شود
+        if (cardStoryDone) queueWord("story");
+        if (cardLeitnerDone) queueWord("leitner");
         placePopup();
     }
 
