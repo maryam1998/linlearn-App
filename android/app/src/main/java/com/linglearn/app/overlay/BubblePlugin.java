@@ -808,4 +808,69 @@ public class BubblePlugin extends Plugin {
         TtsClient.releaseAll();
         call.resolve();
     }
+
+    // ================================================================
+    // ============ مترجمِ آفلاینِ ML Kit =============================
+    // ================================================================
+
+    // mlkitStatus({ src, tgt }) → { supported, ready, downloading }
+    @PluginMethod
+    public void mlkitStatus(final PluginCall call) {
+        final String src = call.getString("src", "");
+        final String tgt = call.getString("tgt", "");
+        final JSObject ret = new JSObject();
+        final boolean supported = MlKitTranslator.isSupported(src, tgt);
+        ret.put("supported", supported);
+        ret.put("downloading", MlKitTranslator.isDownloading(src, tgt));
+        if (!supported) { ret.put("ready", false); call.resolve(ret); return; }
+        new Thread(new Runnable() {
+            @Override public void run() {
+                ret.put("ready", MlKitTranslator.refreshReadyBlocking(src, tgt));
+                call.resolve(ret);
+            }
+        }, "mlkit-status").start();
+    }
+
+    // mlkitDownload({ src, tgt, wifiOnly }) — وقتی مدل‌ها آماده شد resolve می‌شود
+    @PluginMethod
+    public void mlkitDownload(final PluginCall call) {
+        MlKitTranslator.download(call.getString("src", ""), call.getString("tgt", ""),
+                Boolean.TRUE.equals(call.getBoolean("wifiOnly", false)),
+                new MlKitTranslator.DoneCb() {
+                    @Override public void ok() { call.resolve(); }
+                    @Override public void fail(Exception e) { call.reject(String.valueOf(e.getMessage())); }
+                });
+    }
+
+    // mlkitTranslate({ text, src, tgt }) → { text }
+    @PluginMethod
+    public void mlkitTranslate(final PluginCall call) {
+        String text = call.getString("text", "");
+        if (text == null || text.trim().isEmpty()) { call.reject("empty text"); return; }
+        MlKitTranslator.translateAsync(call.getString("src", ""), call.getString("tgt", ""), text,
+                new MlKitTranslator.Cb() {
+                    @Override public void ok(String r) {
+                        JSObject ret = new JSObject();
+                        ret.put("text", r);
+                        call.resolve(ret);
+                    }
+                    @Override public void fail(Exception e) { call.reject(String.valueOf(e.getMessage())); }
+                });
+    }
+
+    // mlkitDelete({ lang }) — حذفِ مدلِ یک زبان
+    @PluginMethod
+    public void mlkitDelete(final PluginCall call) {
+        MlKitTranslator.deleteModel(call.getString("lang", ""), new MlKitTranslator.DoneCb() {
+            @Override public void ok() { call.resolve(); }
+            @Override public void fail(Exception e) { call.reject(String.valueOf(e.getMessage())); }
+        });
+    }
+
+    // mlkitSetEnabled({ enabled }) — کلیدِ خاموش/روشنِ «اول آفلاین» برای حباب/ذره‌بین
+    @PluginMethod
+    public void mlkitSetEnabled(PluginCall call) {
+        MlKitTranslator.enabled = !Boolean.FALSE.equals(call.getBoolean("enabled", true));
+        call.resolve();
+    }
 }

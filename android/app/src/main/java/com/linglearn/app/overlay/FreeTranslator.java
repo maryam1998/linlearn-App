@@ -87,6 +87,21 @@ final class FreeTranslator {
             if (c != null) return c;
         }
 
+        // مترجمِ آفلاینِ ML Kit — اگر مدلِ این جفت‌زبان روی دستگاه هست، اول از آن (آنی، رایگان، بدونِ سقف).
+        // اگر نبود، دانلودِ پس‌زمینه (فقط Wi‑Fi) شروع می‌شود و همین‌بار از سرویس‌های آنلاین ترجمه می‌شود.
+        if (MlKitTranslator.canUseOffline(s, tgt, t)) {
+            try {
+                String o = MlKitTranslator.translateBlocking(s, tgt, t, 4000);
+                o = o == null ? "" : o.trim();
+                if (!o.isEmpty() && !looksUntranslated(t, o, s, tgt)) {
+                    synchronized (CACHE) { CACHE.put(key, o); }
+                    return o;
+                }
+            } catch (Exception e) {
+                Log.d(TAG, "ML Kit offline failed, falling back online: " + e);
+            }
+        }
+
         // services not in cool-down first; if all are cooling down, try them all anyway
         final long now = SystemClock.elapsedRealtime();
         List<Integer> order = new ArrayList<>();
