@@ -41,6 +41,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.LinearLayout;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -138,8 +139,12 @@ public class MagnifierService extends Service {
     private String selSrc = "en", selOrig = "";
 
     // کادرِ سورمه‌ای (هم‌سبکِ پنلِ حبابِ ترجمه‌ی زنده)
-    private LinearLayout rowsBox;
-    private TextView cardTerm, termSpeak, cardBtnStory, cardBtnGrammar, cardBtnLeitner;
+    private static final int REPEAT_INF = -1;                 // همان مقدارِ حبابِ ترجمه‌ی زنده
+    private LinearLayout rowsBox, wordCard, wordRows, opacityRow;
+    private TextView cardTerm, termSpeak, wordTerm, wordSpeak, tvRepeat;
+    private TextView cardBtnStory, cardBtnGrammar, cardBtnLeitner;
+    private GradientDrawable popupBg;
+    private float panelAlpha = 1f;
     private String cardWord = "", cardMeaning = "", cardMeaningLang = "fa";
     private boolean cardStoryDone, cardGrammarDone, cardLeitnerDone;
     private int cardSeq = 0;
@@ -619,7 +624,8 @@ public class MagnifierService extends Service {
         stopSpeech();
         if (selView != null) { try { wm.removeViewImmediate(selView); } catch (Exception ignored) {} selView = null; }
         if (popup != null) { try { wm.removeViewImmediate(popup); } catch (Exception ignored) {} popup = null; }
-        rowsBox = null; cardTerm = null; termSpeak = null;
+        rowsBox = null; wordCard = null; wordRows = null; opacityRow = null;
+        cardTerm = null; termSpeak = null; wordTerm = null; wordSpeak = null; tvRepeat = null; popupBg = null;
     }
 
     private void showSelection(RectF box, ArrayList<ElemInfo> elems, String orig, String src, List<String[]> results) {
@@ -657,7 +663,7 @@ public class MagnifierService extends Service {
             placePopup();
         } catch (Exception ex) { popup = null; }
         bringLensToFront();
-        if (selView != null) selView.selectAll();   // کادر از همان اول برای کلِ متن باز می‌شود (متن + ترجمه‌ها + 🔊 + ذخیره)
+        // کادرِ «ذخیره برای داستان بعدی / گرامر / لایتنر» فقط وقتی باز می‌شود که کاربر روی لغت یا محدوده بزند (یا 📄)
     }
 
     private void placePopup() {
@@ -678,6 +684,15 @@ public class MagnifierService extends Service {
 
     /** رنگِ کادر (قابلِ تنظیم در اپ، مشترک با حبابِ ترجمه‌ی زنده)؛ پیش‌فرض سورمه‌ای. */
     private int panelRgb() { return prefs().getInt("panelColor", 0x1C2541) & 0xFFFFFF; }
+
+    /** رنگِ کادرِ لغت: همان منطقِ حبابِ ترجمه‌ی زنده. */
+    private int wordCardBgColor() {
+        int c = panelRgb();
+        if (c == 0x1C2541) return Color.parseColor("#26335F");
+        int r = (c >> 16) & 0xFF, g = (c >> 8) & 0xFF, b = c & 0xFF;
+        r += Math.round((255 - r) * 0.10f); g += Math.round((255 - g) * 0.10f); b += Math.round((255 - b) * 0.10f);
+        return 0xFF000000 | (r << 16) | (g << 8) | b;
+    }
 
     private TextView txt(String s, int color, float sp) {
         TextView t = new TextView(this);
@@ -704,57 +719,132 @@ public class MagnifierService extends Service {
         return t;
     }
 
+    private LinearLayout.LayoutParams matchWrap(int topDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = dp(topDp);
+        return lp;
+    }
+
+    private void applyPopupAlpha() {
+        if (popupBg == null) return;
+        int a = Math.round(Math.max(0f, Math.min(1f, panelAlpha)) * 255f);
+        popupBg.setColor((a << 24) | panelRgb());
+    }
+
     private void buildPopup() {
+        panelAlpha = Math.max(0f, Math.min(1f, prefs().getFloat("panelAlphaV2", 1f)));
         popup = new LinearLayout(this);
         popup.setOrientation(LinearLayout.VERTICAL);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xF0000000 | panelRgb());
-        bg.setCornerRadius(dp(16));
-        bg.setStroke(dp(1), COLOR_GOLD);
-        popup.setBackground(bg);
-        popup.setPadding(dp(14), dp(8), dp(10), dp(12));
+        popupBg = new GradientDrawable();
+        popupBg.setCornerRadius(dp(16));
+        popupBg.setStroke(dp(1), COLOR_GOLD);
+        popup.setBackground(popupBg);
+        applyPopupAlpha();
+        popup.setPadding(dp(12), dp(4), dp(10), dp(12));
         popup.setElevation(dp(10));
 
-        // سربرگ: متنِ اصلی + 🔊 + 📄 (کلِ متن) + ✕
+        // نوارِ ابزار: 🔁 تکرار (۲× / ۳× / ∞) · 🌓 شفافیت · 📄 کلِ متن · ✕ بستن
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        tvRepeat = headBtn("\uD83D\uDD01", v -> cycleRepeat());
+        bar.addView(tvRepeat);
+        bar.addView(headBtn("\uD83C\uDF13", v -> toggleOpacityRow()));
+        bar.addView(headBtn("\uD83D\uDCC4", v -> { if (selView != null) selView.selectAll(); }));
+        View sp = new View(this);
+        bar.addView(sp, new LinearLayout.LayoutParams(0, 1, 1f));
+        bar.addView(headBtn("\u2715", v -> clearSelection()));
+        popup.addView(bar);
+        updateRepeatButton();
+
+        // نوارِ شفافیت (مثلِ حبابِ ترجمه‌ی زنده)
+        opacityRow = new LinearLayout(this);
+        opacityRow.setOrientation(LinearLayout.HORIZONTAL);
+        opacityRow.setGravity(Gravity.CENTER_VERTICAL);
+        opacityRow.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
+        opacityRow.setVisibility(View.GONE);
+        SeekBar ob = new SeekBar(this);
+        ob.setMax(100);
+        ob.setProgress(Math.round(panelAlpha * 100f));
+        ob.setProgressTintList(android.content.res.ColorStateList.valueOf(COLOR_GOLD));
+        ob.setThumbTintList(android.content.res.ColorStateList.valueOf(COLOR_GOLD));
+        final TextView pct = txt(Math.round(panelAlpha * 100f) + "%", Color.WHITE, 12);
+        pct.setMinWidth(dp(44));
+        pct.setGravity(Gravity.CENTER);
+        ob.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
+                panelAlpha = progress / 100f;
+                pct.setText(progress + "%");
+                applyPopupAlpha();
+            }
+            @Override public void onStartTrackingTouch(SeekBar sb) {}
+            @Override public void onStopTrackingTouch(SeekBar sb) {
+                prefs().edit().putFloat("panelAlphaV2", panelAlpha).apply();
+            }
+        });
+        opacityRow.addView(ob, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        opacityRow.addView(pct);
+        popup.addView(opacityRow, matchWrap(0));
+
+        // متنِ اصلی + 🔊
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
-        cardTerm = txt("", Color.WHITE, 17);
+        cardTerm = txt(selOrig, Color.WHITE, 16);
         cardTerm.setTypeface(cardTerm.getTypeface(), android.graphics.Typeface.BOLD);
         cardTerm.setMaxLines(6);
         cardTerm.setEllipsize(TextUtils.TruncateAt.END);
         head.addView(cardTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         termSpeak = speakBtn();
-        termSpeak.setOnClickListener(v -> toggleSpeak(termSpeak, cardWord, selSrc));
+        termSpeak.setOnClickListener(v -> toggleSpeak(termSpeak, selOrig, selSrc));
         head.addView(termSpeak);
-        head.addView(headBtn("\uD83D\uDCC4", v -> { if (selView != null) selView.selectAll(); }));
-        head.addView(headBtn("\u2715", v -> clearSelection()));
-        popup.addView(head);
+        popup.addView(head, matchWrap(2));
 
-        // ترجمه‌ها به همه‌ی زبان‌های انتخابی (هر ردیف 🔊 دارد)
+        // ترجمه به همه‌ی زبان‌های انتخابی (هر ردیف 🔊 دارد)
         rowsBox = new LinearLayout(this);
         rowsBox.setOrientation(LinearLayout.VERTICAL);
-        popup.addView(rowsBox, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        popup.addView(rowsBox, matchWrap(0));
+        fillRows(rowsBox, wholeResults);
 
-        cardBtnStory = cardAction(v -> onCardStory());
-        cardBtnGrammar = cardAction(v -> onCardGrammar());
-        cardBtnLeitner = cardAction(v -> onCardLeitner());
-        for (TextView b : new TextView[]{cardBtnStory, cardBtnGrammar, cardBtnLeitner}) {
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.topMargin = dp(6);
-            lp.rightMargin = dp(4);
-            popup.addView(b, lp);
-        }
+        // کادرِ لغت (اول بسته): لغت/محدوده + ترجمه‌ها + «ذخیره برای داستان بعدی / گرامر / لایتنر»
+        buildWordCard();
+        popup.addView(wordCard);
 
         TextView hint = txt(msg("روی یک لغت یا محدوده‌ی هایلایت‌شده بزنید (انگشت را روی چند لغت بکشید)",
                 "Tap a word, or drag across several words in the highlighted text"),
                 Color.parseColor("#8F98B8"), 11);
-        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        hlp.topMargin = dp(8);
-        popup.addView(hint, hlp);
+        popup.addView(hint, matchWrap(8));
+    }
+
+    private void toggleOpacityRow() {
+        if (opacityRow == null) return;
+        opacityRow.setVisibility(opacityRow.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
+        placePopup();
+    }
+
+    // 🔁 تکرارِ خوانش: خاموش ← ۲ ← ۳ ← ∞ (همان تنظیمِ حبابِ ترجمه‌ی زنده)
+    private int repeatSetting() {
+        int v = prefs().getInt("repeatSetting", 0);
+        return (v == 2 || v == 3 || v == REPEAT_INF) ? v : 0;
+    }
+
+    private void cycleRepeat() {
+        int r = repeatSetting();
+        r = r == 0 ? 2 : r == 2 ? 3 : r == 3 ? REPEAT_INF : 0;
+        prefs().edit().putInt("repeatSetting", r).apply();
+        updateRepeatButton();
+        toast(r == 0 ? msg("تکرار خاموش", "Repeat off")
+                : r == REPEAT_INF ? msg("تکرار ∞ — تا وقتی ⏹ نزنید", "Repeat ∞ — until you press ⏹")
+                : msg("هر خوانش " + r + " بار", "Each reading " + r + "×"));
+    }
+
+    private void updateRepeatButton() {
+        if (tvRepeat == null) return;
+        int r = repeatSetting();
+        tvRepeat.setText(r == 0 ? "\uD83D\uDD01" : r == REPEAT_INF ? "\uD83D\uDD01\u221E" : "\uD83D\uDD01" + r);
+        tvRepeat.setTextColor(r == 0 ? Color.WHITE : COLOR_GOLD);
+        tvRepeat.setAlpha(r == 0 ? 0.6f : 1f);
     }
 
     private TextView cardAction(View.OnClickListener l) {
@@ -774,6 +864,43 @@ public class MagnifierService extends Service {
         b.setTextColor(done ? COLOR_GOLD : Color.WHITE);
     }
 
+    private void buildWordCard() {
+        wordCard = new LinearLayout(this);
+        wordCard.setOrientation(LinearLayout.VERTICAL);
+        wordCard.setPadding(dp(10), dp(6), dp(8), dp(10));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(wordCardBgColor());
+        bg.setCornerRadius(dp(12));
+        bg.setStroke(dp(1), COLOR_GOLD);
+        wordCard.setBackground(bg);
+        wordCard.setVisibility(View.GONE);
+        wordCard.setLayoutParams(matchWrap(10));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        wordTerm = txt("", Color.WHITE, 17);
+        wordTerm.setTypeface(wordTerm.getTypeface(), android.graphics.Typeface.BOLD);
+        top.addView(wordTerm, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        wordSpeak = speakBtn();
+        wordSpeak.setOnClickListener(v -> toggleSpeak(wordSpeak, cardWord, selSrc));
+        top.addView(wordSpeak);
+        wordCard.addView(top);
+
+        wordRows = new LinearLayout(this);
+        wordRows.setOrientation(LinearLayout.VERTICAL);
+        wordCard.addView(wordRows, matchWrap(0));
+
+        cardBtnStory = cardAction(v -> onCardStory());
+        cardBtnGrammar = cardAction(v -> onCardGrammar());
+        cardBtnLeitner = cardAction(v -> onCardLeitner());
+        for (TextView b : new TextView[]{cardBtnStory, cardBtnGrammar, cardBtnLeitner}) {
+            LinearLayout.LayoutParams lp = matchWrap(6);
+            lp.rightMargin = dp(2);
+            wordCard.addView(b, lp);
+        }
+    }
+
     private void refreshCardButtons() {
         if (cardBtnStory == null) return;
         cardBtnStory.setText(cardStoryDone
@@ -791,9 +918,9 @@ public class MagnifierService extends Service {
     }
 
     /** ردیف‌های ترجمه: [کدِ زبان، متن]؛ هر ردیف 🔊ِ همان زبان دارد. */
-    private void setRows(List<String[]> rows) {
-        if (rowsBox == null) return;
-        rowsBox.removeAllViews();
+    private void fillRows(LinearLayout box, List<String[]> rows) {
+        if (box == null) return;
+        box.removeAllViews();
         for (String[] r : rows) {
             LinearLayout row = new LinearLayout(this);
             row.setOrientation(LinearLayout.HORIZONTAL);
@@ -812,14 +939,11 @@ public class MagnifierService extends Service {
                 sp.setOnClickListener(v -> toggleSpeak(sp, tx, lg));
                 row.addView(sp);
             }
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.topMargin = dp(4);
-            rowsBox.addView(row, lp);
+            box.addView(row, matchWrap(4));
         }
     }
 
-    // 🔊 خوانش با همان سیستمِ خوانشِ اپ (Piper اگر بسته‌ی زبان دانلود شده، وگرنه TTS گوشی) — برای هر زبانی
+    // 🔊 خوانش با همان سیستمِ خوانشِ اپ (Piper اگر بسته‌ی زبان دانلود شده، وگرنه TTS گوشی) — برای هر زبانی؛ با تکرارِ 🔁
     private void stopSpeech() {
         speakTok++;
         if (speakingBtn != null) { speakingBtn.setText("\uD83D\uDD0A"); speakingBtn = null; }
@@ -832,16 +956,26 @@ public class MagnifierService extends Service {
         stopSpeech();
         speakingBtn = b;
         b.setText("\u23F9");
-        final int my = ++speakTok;
-        PanelTts.speak(this, text, lang, 1.0f, ok -> {
-            if (my != speakTok) return;
-            if (speakingBtn != null) { speakingBtn.setText("\uD83D\uDD0A"); speakingBtn = null; }
-        });
+        speakLoop(b, text, lang, ++speakTok, 0);
     }
 
-    /** لغت/محدوده‌ی انتخاب‌شده (یا کلِ متن) ← عنوان، ترجمه‌ها و دکمه‌های ذخیره به‌روز می‌شود. */
+    private void speakLoop(final TextView b, final String text, final String lang, final int token, final int done) {
+        PanelTts.speak(this, text, lang, 1.0f, ok -> main.post(() -> {
+            if (token != speakTok) return;
+            int rep = repeatSetting();
+            int cap = rep == 0 ? 1 : rep == REPEAT_INF ? Integer.MAX_VALUE : rep;
+            final int n = done + 1;
+            if (ok && n < cap) {
+                main.postDelayed(() -> { if (token == speakTok) speakLoop(b, text, lang, token, n); }, 700);
+            } else {
+                if (speakingBtn != null) { speakingBtn.setText("\uD83D\uDD0A"); speakingBtn = null; }
+            }
+        }));
+    }
+
+    /** لغت/محدوده‌ی انتخاب‌شده (یا کلِ متن با 📄) ← کادرِ لغت باز می‌شود. */
     private void onRangePicked(int i, int j, ArrayList<ElemInfo> el) {
-        if (popup == null || cardTerm == null || el == null || el.isEmpty()) return;
+        if (popup == null || wordCard == null || el == null || el.isEmpty()) return;
         final boolean whole = (i == 0 && j == el.size() - 1);
         String word;
         if (whole) {
@@ -861,18 +995,19 @@ public class MagnifierService extends Service {
         cardMeaning = "";
         cardMeaningLang = "fa";
         cardStoryDone = cardGrammarDone = cardLeitnerDone = false;
-        cardTerm.setText(word);
+        wordTerm.setText(word);
+        wordCard.setVisibility(View.VISIBLE);
         refreshCardButtons();
 
         if (whole && !wholeResults.isEmpty()) {           // ترجمه‌ی کلِ متن را از قبل داریم
-            setRows(wholeResults);
+            fillRows(wordRows, wholeResults);
             adoptMeaning(wholeResults);
             placePopup();
             return;
         }
         ArrayList<String[]> wait = new ArrayList<>();
         wait.add(new String[]{"", "…"});
-        setRows(wait);
+        fillRows(wordRows, wait);
         placePopup();
 
         final String from = selSrc, w2 = word;
@@ -896,10 +1031,9 @@ public class MagnifierService extends Service {
     }
 
     private void onWordMeanings(int token, List<String[]> rows) {
-        if (token != cardSeq || rowsBox == null) return;
-        setRows(rows);
+        if (token != cardSeq || wordRows == null) return;
+        fillRows(wordRows, rows);
         adoptMeaning(rows);
-        // اگر قبل از رسیدنِ معنی دکمه‌ای زده شده بود، همان ردیف با معنی به‌روز می‌شود
         if (cardStoryDone) queueWord("story");
         if (cardLeitnerDone) queueWord("leitner");
         placePopup();
