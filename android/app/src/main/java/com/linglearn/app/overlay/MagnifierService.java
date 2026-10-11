@@ -30,6 +30,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.provider.Settings;
+import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
@@ -38,7 +39,6 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
-import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -49,6 +49,8 @@ import com.google.mlkit.vision.text.TextRecognition;
 import com.google.mlkit.vision.text.TextRecognizer;
 import com.google.mlkit.vision.text.devanagari.DevanagariTextRecognizerOptions;
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions;
+
+import org.json.JSONObject;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -64,9 +66,11 @@ import java.util.concurrent.TimeUnit;
 import okhttp3.OkHttpClient;
 
 /**
- * 🔍 حبابِ ذره‌بین: کاربر حباب را روشن می‌کند، روی هر متنی (در هر اپی) می‌زند،
- * از صفحه عکس گرفته می‌شود (MediaProjection)، متنِ نزدیکِ انگشت با ML Kit خوانده
- * (OCR) و با FreeTranslator ترجمه می‌شود و در یک کادرِ شناور کنارِ متن نشان داده می‌شود.
+ * 🔍 حبابِ ذره‌بین: یک ذره‌بینِ حلقه‌ای که کاربر روی متنِ هر اپی می‌کشد و رها می‌کند.
+ * رها که شد: از صفحه عکس گرفته می‌شود (MediaProjection)، متنِ زیرِ ذره‌بین با ML Kit خوانده (OCR)،
+ * هایلایت می‌شود و ترجمه‌اش به همه‌ی زبان‌های انتخابی در یک کادر می‌آید.
+ * ضربه روی یک لغت (یا کشیدنِ انگشت روی چند لغت) کادرِ «ذخیره برای داستان بعدی / گرامر / لایتنر» را باز می‌کند.
+ * خروج: ذره‌بین را بکش روی ✕ی پایینِ صفحه (مثلِ حبابِ ترجمه‌ی زنده) یا «بستن» در اعلان.
  *
  * زبان‌ها از همان SharedPreferencesِ حبابِ ترجمه‌ی زنده خوانده می‌شود
  * (source = «زبان صدا»، targets = زبان‌های مقصد).
@@ -86,8 +90,12 @@ public class MagnifierService extends Service {
     private static final int NOTIF_ID = 4720;
     private static final int COLOR_INK = Color.parseColor("#1C2541");
     private static final int COLOR_GOLD = Color.parseColor("#C9A227");
+    private static final int COLOR_REC = Color.parseColor("#E53935");
     private static final Set<String> LATIN = new HashSet<>(Arrays.asList(
             "en", "de", "fr", "es", "it", "pt", "nl", "tr"));
+
+    // اندازه‌ی ذره‌بین (dp): پنجره‌ی 88، مرکزِ شیشه در (38,38) با شعاعِ 32
+    private static final float LENS_SIZE = 88f, LENS_C = 38f, LENS_R = 32f;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -104,14 +112,32 @@ public class MagnifierService extends Service {
     private final Object frameLock = new Object();
     private Image lastImage;
 
-    private MagView bubble;
-    private WindowManager.LayoutParams bubbleLp;
-    private CaptureLayer layer;
-    private boolean active = false;
+    private LensView lens;
+    private WindowManager.LayoutParams lensLp;
+    private CloseTargetView closeView;
+    private boolean overTarget = false;
     private boolean busy = false;
-    private boolean layerAttached = false;
 
     private TextRecognizer latinRec, devaRec;
+
+    // انتخابِ فعلی
+    private static final class ElemInfo {
+        final Rect r; final String t;
+        ElemInfo(Rect r, String t) { this.r = r; this.t = t; }
+    }
+    private SelView selView;
+    private WindowManager.LayoutParams selLp;
+    private LinearLayout popup;
+    private WindowManager.LayoutParams popupLp;
+    private RectF selBox;
+    private String selSrc = "en", selOrig = "";
+
+    // کادرِ لغت
+    private LinearLayout wordCard;
+    private TextView cardTerm, cardMeaningTv, cardBtnStory, cardBtnGrammar, cardBtnLeitner;
+    private String cardWord = "", cardMeaning = "", cardMeaningLang = "fa";
+    private boolean cardStoryDone, cardGrammarDone, cardLeitnerDone;
+    private int cardSeq = 0;
 
     // ───────────────────────── چرخه‌ی عمر ─────────────────────────
 
@@ -134,10 +160,10 @@ public class MagnifierService extends Service {
         try {
             wm = (WindowManager) getSystemService(WINDOW_SERVICE);
             setupProjection(intent);
-            addBubble();
+            addLens();
             running = true;
-            toast(msg("ذره‌بین آماده است؛ حباب را بزنید و بعد روی متن بزنید",
-                    "Magnifier ready: tap the bubble, then tap a text"));
+            toast(msg("ذره‌بین را روی متن بکشید و رها کنید",
+                    "Drag the magnifier over a text and release"));
         } catch (Exception e) {
             Log.e(TAG, "start failed", e);
             toast("⚠ " + e.getMessage());
@@ -150,9 +176,11 @@ public class MagnifierService extends Service {
     public void onDestroy() {
         running = false;
         main.removeCallbacksAndMessages(null);
-        removeLayer();
-        try { if (bubble != null) wm.removeViewImmediate(bubble); } catch (Exception ignored) {}
-        bubble = null;
+        clearSelection();
+        try { if (closeView != null) wm.removeViewImmediate(closeView); } catch (Exception ignored) {}
+        closeView = null;
+        try { if (lens != null) wm.removeViewImmediate(lens); } catch (Exception ignored) {}
+        lens = null;
         synchronized (frameLock) {
             if (lastImage != null) { try { lastImage.close(); } catch (Exception ignored) {} lastImage = null; }
         }
@@ -172,6 +200,7 @@ public class MagnifierService extends Service {
         try {
             DisplayMetrics dm = realMetrics();
             if (dm.widthPixels == capW && dm.heightPixels == capH) return;
+            clearSelection();
             synchronized (frameLock) {
                 if (lastImage != null) { try { lastImage.close(); } catch (Exception ignored) {} lastImage = null; }
             }
@@ -181,7 +210,7 @@ public class MagnifierService extends Service {
             vd.resize(capW, capH, dpiVal);
             vd.setSurface(reader.getSurface());
             if (old != null) old.close();
-            clampBubble();
+            clampLens();
         } catch (Exception e) {
             Log.e(TAG, "rotate failed", e);
         }
@@ -202,7 +231,7 @@ public class MagnifierService extends Service {
         return new Notification.Builder(this, CHANNEL_ID)
                 .setSmallIcon(android.R.drawable.ic_menu_search)
                 .setContentTitle("LingoLearn")
-                .setContentText(msg("حباب ذره‌بین فعال است", "Magnifier bubble is active"))
+                .setContentText(msg("ذره‌بین فعال است", "Magnifier is active"))
                 .setOngoing(true)
                 .addAction(close)
                 .build();
@@ -274,118 +303,128 @@ public class MagnifierService extends Service {
         }
     }
 
-    // ───────────────────────── حباب ─────────────────────────
+    // ───────────────────────── ذره‌بین (کشیدن / رها کردن) ─────────────────────────
 
-    private void addBubble() {
-        bubble = new MagView(this);
-        int size = dp(52);
-        bubbleLp = new WindowManager.LayoutParams(size, size,
+    private void addLens() {
+        createCloseTarget();
+        lens = new LensView(this);
+        int size = dp(LENS_SIZE);
+        lensLp = new WindowManager.LayoutParams(size, size,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
-        bubbleLp.gravity = Gravity.TOP | Gravity.START;
-        bubbleLp.x = capW - size - dp(8);
-        bubbleLp.y = capH / 3;
-        bubble.setOnTouchListener(new View.OnTouchListener() {
-            float dx, dy, startX, startY; boolean moved, longFired;
-            final Runnable longPress = () -> { longFired = true; toast(msg("ذره‌بین بسته شد", "Magnifier closed")); stopSelf(); };
+        lensLp.gravity = Gravity.TOP | Gravity.START;
+        lensLp.x = capW / 2 - dp(LENS_C);
+        lensLp.y = capH / 3;
+        lens.setOnTouchListener(new View.OnTouchListener() {
+            float dx, dy, startX, startY; boolean moved;
             @Override public boolean onTouch(View v, MotionEvent e) {
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
                         startX = e.getRawX(); startY = e.getRawY();
-                        dx = bubbleLp.x - startX; dy = bubbleLp.y - startY;
-                        moved = false; longFired = false;
-                        main.postDelayed(longPress, 900);
+                        dx = lensLp.x - startX; dy = lensLp.y - startY;
+                        moved = false;
                         return true;
                     case MotionEvent.ACTION_MOVE:
                         if (!moved && Math.hypot(e.getRawX() - startX, e.getRawY() - startY) > dp(8)) {
                             moved = true;
-                            main.removeCallbacks(longPress);
+                            showCloseTarget();
                         }
                         if (moved) {
-                            bubbleLp.x = (int) (e.getRawX() + dx);
-                            bubbleLp.y = (int) (e.getRawY() + dy);
-                            clampBubble();
+                            lensLp.x = (int) (e.getRawX() + dx);
+                            lensLp.y = (int) (e.getRawY() + dy);
+                            clampLens();
+                            updateOverTarget();
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
-                        main.removeCallbacks(longPress);
-                        if (!moved && !longFired && e.getActionMasked() == MotionEvent.ACTION_UP) toggleActive();
+                        boolean up = e.getActionMasked() == MotionEvent.ACTION_UP;
+                        boolean onX = overTarget;
+                        hideCloseTarget();
+                        if (up && onX) {
+                            toast(msg("ذره‌بین بسته شد", "Magnifier closed"));
+                            stopSelf();
+                        } else if (up) {
+                            onLensDropped();
+                        }
                         return true;
                 }
                 return false;
             }
         });
-        wm.addView(bubble, bubbleLp);
+        wm.addView(lens, lensLp);
     }
 
-    private void clampBubble() {
-        if (bubble == null || bubbleLp == null) return;
-        bubbleLp.x = Math.max(0, Math.min(capW - bubbleLp.width, bubbleLp.x));
-        bubbleLp.y = Math.max(0, Math.min(capH - bubbleLp.height, bubbleLp.y));
-        try { wm.updateViewLayout(bubble, bubbleLp); } catch (Exception ignored) {}
+    private void clampLens() {
+        if (lens == null || lensLp == null) return;
+        lensLp.x = Math.max(0, Math.min(capW - lensLp.width, lensLp.x));
+        lensLp.y = Math.max(0, Math.min(capH - lensLp.height, lensLp.y));
+        try { wm.updateViewLayout(lens, lensLp); } catch (Exception ignored) {}
     }
 
-    private void toggleActive() {
-        active = !active;
-        bubble.setActive(active);
-        if (active) {
-            addLayer();
-            // حباب باید بالای لایه‌ی لمس بماند
-            try {
-                wm.removeViewImmediate(bubble);
-                wm.addView(bubble, bubbleLp);
-            } catch (Exception ignored) {}
-            toast(msg("روی متنِ مورد نظر بزنید", "Tap on a text"));
-        } else {
-            removeLayer();
-        }
+    private void bringLensToFront() {
+        if (lens == null) return;
+        try {
+            wm.removeViewImmediate(lens);
+            wm.addView(lens, lensLp);
+        } catch (Exception ignored) {}
     }
 
-    private void addLayer() {
-        if (layerAttached) return;
-        layer = new CaptureLayer(this);
-        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+    // ✕ی خروج: یک بار (نامرئی) قبل از ذره‌بین ساخته می‌شود تا زیرِ آن بماند؛ هنگامِ کشیدن ظاهر می‌شود.
+    private void createCloseTarget() {
+        int sz = dp(84);
+        closeView = new CloseTargetView(this);
+        WindowManager.LayoutParams lp = new WindowManager.LayoutParams(sz, sz,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START;
-        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
-        wm.addView(layer, lp);
-        layerAttached = true;
+        lp.x = capW / 2 - sz / 2;
+        lp.y = capH - dp(120) - sz / 2;
+        closeView.setVisibility(View.INVISIBLE);
+        try { wm.addView(closeView, lp); } catch (Exception ex) { closeView = null; }
     }
 
-    private void removeLayer() {
-        busy = false;
-        if (!layerAttached || layer == null) return;
-        try { wm.removeViewImmediate(layer); } catch (Exception ignored) {}
-        layerAttached = false;
-        layer = null;
+    private void showCloseTarget() {
+        if (closeView != null) closeView.setVisibility(View.VISIBLE);
     }
 
-    // ───────────────────────── لمس روی متن ─────────────────────────
+    private void hideCloseTarget() {
+        overTarget = false;
+        if (closeView == null) return;
+        closeView.setHot(false);
+        closeView.setVisibility(View.INVISIBLE);
+    }
 
-    private void onTapAt(final float x, final float y) {
-        if (busy || layer == null) return;
+    private void updateOverTarget() {
+        if (closeView == null) return;
+        double cx = lensLp.x + dp(LENS_C), cy = lensLp.y + dp(LENS_C);
+        double tx = capW / 2.0, ty = capH - dp(120);
+        boolean hot = Math.hypot(cx - tx, cy - ty) < dp(60);
+        if (hot != overTarget) { overTarget = hot; closeView.setHot(hot); }
+    }
+
+    // ───────────────────────── رها شدنِ ذره‌بین روی متن ─────────────────────────
+
+    private void onLensDropped() {
+        if (busy) return;
         busy = true;
-        layer.clearResult();
-        if (bubble != null) bubble.setVisibility(View.INVISIBLE);
-        // صبر می‌کنیم کادر/هایلایتِ قبلی از فریم محو شود
+        clearSelection();                         // هایلایت و کادرِ قبلی از فریم محو شود
+        if (lens != null) lens.setBusy(true);
         main.postDelayed(() -> {
             Bitmap bmp = frameBitmap();
-            if (bubble != null) bubble.setVisibility(View.VISIBLE);
             if (bmp == null) {
-                busy = false;
-                toast(msg("هنوز تصویری از صفحه نیست؛ دوباره بزنید", "No screen image yet, try again"));
+                finish(msg("هنوز تصویری از صفحه نیست؛ دوباره رها کنید", "No screen image yet, try again"));
                 return;
             }
-            if (layer != null) layer.showWorking(x, y);
+            final float cx = lensLp.x + dp(LENS_C), cy = lensLp.y + dp(LENS_C);
             final Bitmap b = bmp;
-            worker.execute(() -> process(b, x, y));
+            worker.execute(() -> process(b, cx, cy));
         }, 260);
     }
 
@@ -449,13 +488,14 @@ public class MagnifierService extends Service {
             double d = dist(r, x, y);
             if (d < bestD) { bestD = d; best = b; }
         }
-        if (best == null || bestD > dp(48)) {
-            finish(msg("متنی کنار انگشت پیدا نشد", "No text found near your tap"));
+        if (best == null || bestD > dp(40)) {
+            finish(msg("زیرِ ذره‌بین متنی پیدا نشد", "No text found under the magnifier"));
             return;
         }
         Rect box = best.getBoundingBox();
+        List<Text.Line> lines = best.getLines();
         String orig = best.getText().replace('\n', ' ').trim();
-        if (orig.length() > 500) {            // بلوکِ خیلی بلند: فقط خطِ نزدیک
+        if (orig.length() > 500) {                    // بلوکِ خیلی بلند: فقط خطِ نزدیک
             Text.Line bl = null; double bd = Double.MAX_VALUE;
             for (Text.Line l : best.getLines()) {
                 Rect lr = l.getBoundingBox();
@@ -463,29 +503,43 @@ public class MagnifierService extends Service {
                 double d = dist(lr, x, y);
                 if (d < bd) { bd = d; bl = l; }
             }
-            if (bl != null) { orig = bl.getText().trim(); box = bl.getBoundingBox(); }
+            if (bl != null) {
+                orig = bl.getText().trim();
+                box = bl.getBoundingBox();
+                lines = new ArrayList<>();
+                lines.add(bl);
+            }
         }
         if (orig.isEmpty() || box == null) { finish(msg("متنی پیدا نشد", "No text found")); return; }
+
+        final ArrayList<ElemInfo> elems = new ArrayList<>();
+        for (Text.Line l : lines) {
+            for (Text.Element e : l.getElements()) {
+                Rect er = e.getBoundingBox();
+                if (er != null && !e.getText().trim().isEmpty()) elems.add(new ElemInfo(new Rect(er), e.getText()));
+            }
+        }
 
         final ArrayList<String[]> results = new ArrayList<>();
         for (String tgt : targets(src)) {
             String tr;
             try { tr = FreeTranslator.translate(http, orig, src, tgt); }
-            catch (Exception e) { tr = "—"; }
+            catch (Exception ex) { tr = "—"; }
             results.add(new String[]{tgt.toUpperCase(Locale.ROOT), tr});
         }
-        final String fo = orig;
+        final String fo = orig, fsrc = src;
         final RectF rf = new RectF(box);
         main.post(() -> {
             busy = false;
-            if (layer != null) layer.showResult(rf, fo, results);
+            if (lens != null) lens.setBusy(false);
+            showSelection(rf, elems, fo, fsrc, results);
         });
     }
 
     private void finish(final String message) {
         main.post(() -> {
             busy = false;
-            if (layer != null) layer.clearResult();
+            if (lens != null) lens.setBusy(false);
             toast(message);
         });
     }
@@ -496,166 +550,406 @@ public class MagnifierService extends Service {
         return Math.hypot(dx, dy);
     }
 
+    // ───────────────────────── هایلایت + کادرِ ترجمه ─────────────────────────
+
+    private void clearSelection() {
+        cardSeq++;
+        if (selView != null) { try { wm.removeViewImmediate(selView); } catch (Exception ignored) {} selView = null; }
+        if (popup != null) { try { wm.removeViewImmediate(popup); } catch (Exception ignored) {} popup = null; }
+        wordCard = null;
+    }
+
+    private void showSelection(RectF box, ArrayList<ElemInfo> elems, String orig, String src, List<String[]> results) {
+        clearSelection();
+        selBox = box;
+        selSrc = src;
+        selOrig = orig;
+
+        // پنجره‌ی هایلایت: فقط به‌اندازه‌ی متن، تا بقیه‌ی صفحه لمس‌پذیر بماند
+        int pad = dp(6);
+        selView = new SelView(this, elems, (int) box.left - pad, (int) box.top - pad);
+        selLp = new WindowManager.LayoutParams(
+                (int) box.width() + 2 * pad, (int) box.height() + 2 * pad,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT);
+        selLp.gravity = Gravity.TOP | Gravity.START;
+        selLp.x = (int) box.left - pad;
+        selLp.y = (int) box.top - pad;
+        try { wm.addView(selView, selLp); } catch (Exception ex) { selView = null; }
+
+        buildPopup(orig, results);
+        int w = Math.min(capW - dp(24), dp(360));
+        popupLp = new WindowManager.LayoutParams(w, ViewGroup.LayoutParams.WRAP_CONTENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT);
+        popupLp.gravity = Gravity.TOP | Gravity.START;
+        try {
+            wm.addView(popup, popupLp);
+            placePopup();
+        } catch (Exception ex) { popup = null; }
+        bringLensToFront();
+    }
+
+    private void placePopup() {
+        if (popup == null || popupLp == null || selBox == null) return;
+        int w = popupLp.width;
+        popup.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+        int h = popup.getMeasuredHeight();
+        int pad = dp(6), gap = dp(8);
+        int left = Math.max(dp(12), Math.min(capW - w - dp(12), (int) (selBox.centerX() - w / 2f)));
+        int top;
+        if (selBox.bottom + pad + gap + h <= capH - dp(24)) top = (int) selBox.bottom + pad + gap;
+        else top = Math.max(dp(36), (int) selBox.top - pad - gap - h);
+        popupLp.x = left;
+        popupLp.y = top;
+        try { wm.updateViewLayout(popup, popupLp); } catch (Exception ignored) {}
+    }
+
+    private TextView txt(String s, int color, float sp) {
+        TextView t = new TextView(this);
+        t.setText(s);
+        t.setTextColor(color);
+        t.setTextSize(sp);
+        t.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
+        t.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
+        return t;
+    }
+
+    private TextView headBtn(String s, View.OnClickListener l) {
+        TextView t = txt(s, COLOR_INK, 17);
+        t.setPadding(dp(12), dp(2), dp(2), dp(2));
+        t.setOnClickListener(l);
+        return t;
+    }
+
+    private void buildPopup(String orig, List<String[]> results) {
+        popup = new LinearLayout(this);
+        popup.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.parseColor("#FFFBF0"));
+        bg.setCornerRadius(dp(16));
+        bg.setStroke(dp(2), COLOR_GOLD);
+        popup.setBackground(bg);
+        popup.setPadding(dp(14), dp(10), dp(14), dp(12));
+        popup.setElevation(dp(10));
+
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        TextView o = txt(orig, Color.parseColor("#6B7280"), 12);
+        o.setMaxLines(3);
+        o.setEllipsize(TextUtils.TruncateAt.END);
+        head.addView(o, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        head.addView(headBtn("\uD83D\uDCC4", v -> { if (selView != null) selView.selectAll(); }));   // 📄 کلِ متن
+        head.addView(headBtn("\u2715", v -> clearSelection()));                                    // ✕ بستنِ کادر
+        popup.addView(head);
+
+        for (String[] r : results) {
+            TextView tv = txt(r[0] + " · " + r[1], COLOR_INK, 16);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = dp(8);
+            popup.addView(tv, lp);
+        }
+
+        TextView hint = txt(msg("روی یک لغت یا محدوده‌ی هایلایت‌شده بزنید (انگشت را روی چند لغت بکشید)",
+                "Tap a word, or drag across several words in the highlighted text"),
+                Color.parseColor("#8A8F98"), 11);
+        LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hlp.topMargin = dp(8);
+        popup.addView(hint, hlp);
+
+        buildWordCard();
+        popup.addView(wordCard);
+    }
+
+    // ───────── کادرِ لغت: معنی + «داستان بعدی / گرامر / لایتنر» (همان صفِ حبابِ ترجمه‌ی زنده) ─────────
+
+    private TextView cardAction(View.OnClickListener l) {
+        TextView b = txt("", Color.WHITE, 12);
+        b.setPadding(dp(10), dp(6), dp(10), dp(6));
+        b.setOnClickListener(l);
+        styleCardAction(b, false);
+        return b;
+    }
+
+    private void styleCardAction(TextView b, boolean done) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Color.parseColor("#14FFFFFF"));
+        g.setCornerRadius(dp(8));
+        g.setStroke(dp(1), done ? COLOR_GOLD : Color.parseColor("#40FFFFFF"));
+        b.setBackground(g);
+        b.setTextColor(done ? COLOR_GOLD : Color.WHITE);
+    }
+
+    private void buildWordCard() {
+        wordCard = new LinearLayout(this);
+        wordCard.setOrientation(LinearLayout.VERTICAL);
+        wordCard.setPadding(dp(10), dp(8), dp(10), dp(10));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.parseColor("#26335F"));
+        bg.setCornerRadius(dp(12));
+        bg.setStroke(dp(1), COLOR_GOLD);
+        wordCard.setBackground(bg);
+        wordCard.setVisibility(View.GONE);
+        LinearLayout.LayoutParams wlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        wlp.topMargin = dp(8);
+        wordCard.setLayoutParams(wlp);
+
+        cardTerm = txt("", Color.WHITE, 17);
+        cardTerm.setTypeface(cardTerm.getTypeface(), android.graphics.Typeface.BOLD);
+        wordCard.addView(cardTerm);
+
+        cardMeaningTv = txt("", Color.parseColor("#E8EAF2"), 15);
+        cardMeaningTv.setPadding(0, dp(2), 0, dp(6));
+        wordCard.addView(cardMeaningTv);
+
+        cardBtnStory = cardAction(v -> onCardStory());
+        cardBtnGrammar = cardAction(v -> onCardGrammar());
+        cardBtnLeitner = cardAction(v -> onCardLeitner());
+        for (TextView b : new TextView[]{cardBtnStory, cardBtnGrammar, cardBtnLeitner}) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = dp(5);
+            wordCard.addView(b, lp);
+        }
+    }
+
+    private void refreshCardButtons() {
+        if (wordCard == null) return;
+        cardBtnStory.setText(cardStoryDone
+                ? msg("\uD83D\uDD16 ذخیره شد برای داستان بعدی", "\uD83D\uDD16 Saved for next story")
+                : msg("\uD83D\uDD16 ذخیره برای داستان بعدی", "\uD83D\uDD16 Save for next story"));
+        cardBtnGrammar.setText(cardGrammarDone
+                ? msg("\uD83E\uDDE9 ذخیره شد در گرامر", "\uD83E\uDDE9 Saved to grammar")
+                : msg("\uD83E\uDDE9 افزودن به یادگیری گرامر", "\uD83E\uDDE9 Add to grammar learning"));
+        cardBtnLeitner.setText(cardLeitnerDone
+                ? msg("\uD83D\uDD01 به جعبه‌ی لایتنر اضافه شد", "\uD83D\uDD01 Added to Leitner box")
+                : msg("\uD83D\uDD01 افزودن به جعبه‌ی لایتنر", "\uD83D\uDD01 Add to Leitner box"));
+        styleCardAction(cardBtnStory, cardStoryDone);
+        styleCardAction(cardBtnGrammar, cardGrammarDone);
+        styleCardAction(cardBtnLeitner, cardLeitnerDone);
+    }
+
+    /** لغت/محدوده‌ی انتخاب‌شده ← کادرِ لغت را باز کن و معنی را بگیر. */
+    private void onRangePicked(int i, int j, ArrayList<ElemInfo> el) {
+        if (wordCard == null || el == null || el.isEmpty()) return;
+        StringBuilder sb = new StringBuilder();
+        for (int k = i; k <= j && k < el.size(); k++) {
+            if (sb.length() > 0) sb.append(' ');
+            sb.append(el.get(k).t);
+        }
+        final String word = sb.toString().trim().replaceAll("^[\\p{Punct}\\u2018\\u2019\\u201C\\u201D]+|[\\p{Punct}\\u2018\\u2019\\u201C\\u201D]+$", "");
+        if (word.isEmpty()) return;
+        final int my = ++cardSeq;
+        cardWord = word;
+        cardMeaning = "";
+        cardStoryDone = cardGrammarDone = cardLeitnerDone = false;
+        String nativeL = prefs().getString("target", "fa");
+        final String from = selSrc;
+        final String to = from.equals(nativeL) ? "en" : nativeL;
+        cardMeaningLang = to;
+
+        cardTerm.setText(word);
+        cardMeaningTv.setText("…");
+        refreshCardButtons();
+        wordCard.setVisibility(View.VISIBLE);
+        placePopup();
+
+        worker.execute(() -> {
+            String out;
+            try { out = FreeTranslator.translate(http, word, from, to); }
+            catch (Exception ex) { out = ""; }
+            final String res = out == null ? "" : out.trim();
+            main.post(() -> onCardMeaning(my, res));
+        });
+    }
+
+    private void onCardMeaning(int token, String meaning) {
+        if (token != cardSeq || cardMeaningTv == null) return;
+        if (meaning == null || meaning.isEmpty()) {
+            cardMeaningTv.setText(msg("ترجمه در دسترس نیست — ذخیره بدون معنی هم کار می‌کند", "No translation — saving still works"));
+        } else {
+            cardMeaning = meaning;
+            cardMeaningTv.setText(meaning);
+            if (cardStoryDone) queueWord("story");
+            if (cardLeitnerDone) queueWord("leitner");
+        }
+        placePopup();
+    }
+
+    private void queueWord(String action) {
+        if (cardWord == null || cardWord.isEmpty()) return;
+        try {
+            JSONObject o = new JSONObject()
+                    .put("key", action + "|" + selSrc + "|" + cardWord.toLowerCase(Locale.ROOT))
+                    .put("action", action)
+                    .put("word", cardWord)
+                    .put("lang", selSrc)
+                    .put("meaning", cardMeaning == null ? "" : cardMeaning)
+                    .put("meaningLang", cardMeaningLang == null ? "fa" : cardMeaningLang)
+                    .put("sentence", selOrig == null || selOrig.isEmpty() ? cardWord : selOrig)
+                    .put("rev", System.currentTimeMillis());
+            WordQueue.add(this, o);
+            BubblePlugin.notifyWordQueued();
+        } catch (Throwable t) {
+            toast(msg("ذخیره نشد", "Save failed"));
+        }
+    }
+
+    private void onCardStory()   { if (cardStoryDone) return;   cardStoryDone = true;   queueWord("story");   refreshCardButtons(); }
+    private void onCardGrammar() { if (cardGrammarDone) return; cardGrammarDone = true; queueWord("grammar"); refreshCardButtons(); }
+    private void onCardLeitner() { if (cardLeitnerDone) return; cardLeitnerDone = true; queueWord("leitner"); refreshCardButtons(); }
+
     private void toast(String s) { Toast.makeText(getApplicationContext(), s, Toast.LENGTH_SHORT).show(); }
 
     private int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
 
     // ───────────────────────── نماها ─────────────────────────
 
-    /** لایه‌ی تمام‌صفحه‌ی شفاف: ضربه را می‌گیرد، هایلایت و کادرِ ترجمه را نشان می‌دهد. */
-    private final class CaptureLayer extends FrameLayout {
-        private RectF hl;
-        private final Paint fillP = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint strokeP = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private float downX, downY;
-        private View card;
+    /** پنجره‌ی هایلایت روی متنِ انتخاب‌شده؛ ضربه/کشیدن روی لغت‌ها = انتخابِ لغت یا محدوده. */
+    private final class SelView extends View {
+        private final ArrayList<ElemInfo> el;
+        private final int ox, oy;
+        private int a = -1, b = -1;
+        private final Paint blockP = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint blockStroke = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint selP = new Paint(Paint.ANTI_ALIAS_FLAG);
 
-        CaptureLayer(Context c) {
+        SelView(Context c, ArrayList<ElemInfo> el, int ox, int oy) {
             super(c);
-            setWillNotDraw(false);
-            fillP.setColor(Color.parseColor("#33C9A227"));
-            strokeP.setStyle(Paint.Style.STROKE);
-            strokeP.setStrokeWidth(dp(2));
-            strokeP.setColor(COLOR_GOLD);
+            this.el = el; this.ox = ox; this.oy = oy;
+            blockP.setColor(Color.parseColor("#33C9A227"));
+            blockStroke.setStyle(Paint.Style.STROKE);
+            blockStroke.setStrokeWidth(dp(2));
+            blockStroke.setColor(COLOR_GOLD);
+            selP.setColor(Color.parseColor("#8CC9A227"));
         }
 
         @Override protected void onDraw(Canvas cv) {
-            if (hl == null) return;
-            cv.drawRoundRect(hl, dp(6), dp(6), fillP);
-            cv.drawRoundRect(hl, dp(6), dp(6), strokeP);
+            RectF all = new RectF(dp(1), dp(1), getWidth() - dp(1), getHeight() - dp(1));
+            cv.drawRoundRect(all, dp(8), dp(8), blockP);
+            cv.drawRoundRect(all, dp(8), dp(8), blockStroke);
+            if (a >= 0 && b >= 0) {
+                int lo = Math.min(a, b), hi = Math.max(a, b);
+                for (int i = lo; i <= hi && i < el.size(); i++) {
+                    Rect r = el.get(i).r;
+                    RectF rf = new RectF(r.left - ox - dp(2), r.top - oy - dp(1), r.right - ox + dp(2), r.bottom - oy + dp(1));
+                    cv.drawRoundRect(rf, dp(4), dp(4), selP);
+                }
+            }
+        }
+
+        private int nearest(float x, float y) {
+            int best = -1; double bd = Double.MAX_VALUE;
+            for (int i = 0; i < el.size(); i++) {
+                Rect r = el.get(i).r;
+                double d = dist(new Rect(r.left - ox, r.top - oy, r.right - ox, r.bottom - oy), x, y);
+                if (d < bd) { bd = d; best = i; }
+            }
+            return best;
+        }
+
+        void selectAll() {
+            if (el.isEmpty()) return;
+            a = 0; b = el.size() - 1;
+            invalidate();
+            onRangePicked(0, el.size() - 1, el);
         }
 
         @Override public boolean onTouchEvent(MotionEvent e) {
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
-                    downX = e.getRawX(); downY = e.getRawY();
+                    a = b = nearest(e.getX(), e.getY());
+                    invalidate();
                     return true;
+                case MotionEvent.ACTION_MOVE: {
+                    int i = nearest(e.getX(), e.getY());
+                    if (i >= 0 && i != b) { b = i; invalidate(); }
+                    return true;
+                }
                 case MotionEvent.ACTION_UP:
-                    if (Math.hypot(e.getRawX() - downX, e.getRawY() - downY) < dp(12)) onTapAt(e.getRawX(), e.getRawY());
+                    if (a >= 0 && b >= 0) onRangePicked(Math.min(a, b), Math.max(a, b), el);
+                    return true;
+                case MotionEvent.ACTION_CANCEL:
                     return true;
             }
             return true;
         }
+    }
 
-        void clearResult() {
-            hl = null;
-            if (card != null) { removeView(card); card = null; }
-            invalidate();
+    /** ذره‌بینِ حلقه‌ای: وسطِ شیشه شفاف است تا متنِ زیرش دیده و خوانده شود. */
+    private final class LensView extends View {
+        private final Paint outline = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint gold = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private boolean working;
+
+        LensView(Context c) {
+            super(c);
+            outline.setStyle(Paint.Style.STROKE);
+            outline.setStrokeCap(Paint.Cap.ROUND);
+            gold.setStyle(Paint.Style.STROKE);
+            gold.setStrokeCap(Paint.Cap.ROUND);
         }
 
-        private LinearLayout newCard() {
-            LinearLayout c = new LinearLayout(getContext());
-            c.setOrientation(LinearLayout.VERTICAL);
-            GradientDrawable bg = new GradientDrawable();
-            bg.setColor(Color.parseColor("#FFFBF0"));
-            bg.setCornerRadius(dp(16));
-            bg.setStroke(dp(2), COLOR_GOLD);
-            c.setBackground(bg);
-            c.setPadding(dp(14), dp(10), dp(14), dp(12));
-            c.setElevation(dp(10));
-            c.setClickable(true);   // لمس روی کادر، ضربه‌ی تازه حساب نشود
-            return c;
-        }
+        void setBusy(boolean b) { working = b; invalidate(); }
 
-        void showWorking(float x, float y) {
-            clearResult();
-            LinearLayout c = newCard();
-            TextView t = new TextView(getContext());
-            t.setText(msg("در حال ترجمه…", "Translating…"));
-            t.setTextColor(COLOR_INK);
-            t.setTextSize(14);
-            c.addView(t);
-            place(c, new RectF(x - dp(4), y - dp(4), x + dp(4), y + dp(4)), dp(180));
-        }
-
-        void showResult(RectF rect, String orig, List<String[]> results) {
-            clearResult();
-            hl = rect;
-            LinearLayout c = newCard();
-
-            LinearLayout head = new LinearLayout(getContext());
-            head.setOrientation(LinearLayout.HORIZONTAL);
-            TextView o = new TextView(getContext());
-            o.setText(orig);
-            o.setTextColor(Color.parseColor("#6B7280"));
-            o.setTextSize(12);
-            o.setMaxLines(3);
-            o.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            o.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
-            head.addView(o, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-            TextView x = new TextView(getContext());
-            x.setText("✕");
-            x.setTextColor(COLOR_INK);
-            x.setTextSize(16);
-            x.setPadding(dp(10), 0, 0, 0);
-            x.setOnClickListener(v -> clearResult());
-            head.addView(x);
-            c.addView(head);
-
-            for (String[] r : results) {
-                TextView tv = new TextView(getContext());
-                tv.setText(r[0] + " · " + r[1]);
-                tv.setTextColor(COLOR_INK);
-                tv.setTextSize(16);
-                tv.setTextIsSelectable(false);
-                tv.setTextAlignment(View.TEXT_ALIGNMENT_TEXT_START);
-                tv.setTextDirection(View.TEXT_DIRECTION_FIRST_STRONG);
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-                lp.topMargin = dp(8);
-                c.addView(tv, lp);
-            }
-            place(c, rect, Math.min(capW - dp(24), dp(360)));
-            invalidate();
-        }
-
-        private void place(View c, RectF rect, int cardW) {
-            c.measure(MeasureSpec.makeMeasureSpec(cardW, MeasureSpec.EXACTLY),
-                    MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
-            int ch = c.getMeasuredHeight();
-            int left = Math.max(dp(12), Math.min(capW - cardW - dp(12), (int) (rect.centerX() - cardW / 2f)));
-            int top;
-            if (rect.bottom + dp(10) + ch <= capH - dp(24)) top = (int) rect.bottom + dp(10);
-            else top = Math.max(dp(36), (int) rect.top - dp(10) - ch);
-            FrameLayout.LayoutParams flp = new FrameLayout.LayoutParams(cardW, ViewGroup.LayoutParams.WRAP_CONTENT);
-            flp.leftMargin = left;
-            flp.topMargin = top;
-            addView(c, flp);
-            card = c;
+        @Override protected void onDraw(Canvas cv) {
+            float cx = dp(LENS_C), cy = dp(LENS_C), r = dp(LENS_R);
+            float hx0 = cx + r * 0.72f, hy0 = cy + r * 0.72f, hx1 = hx0 + dp(16), hy1 = hy0 + dp(16);
+            outline.setColor(COLOR_INK);
+            outline.setStrokeWidth(dp(8));
+            cv.drawCircle(cx, cy, r, outline);
+            cv.drawLine(hx0, hy0, hx1, hy1, outline);
+            gold.setColor(working ? Color.WHITE : COLOR_GOLD);
+            gold.setStrokeWidth(dp(4));
+            cv.drawCircle(cx, cy, r, gold);
+            cv.drawLine(hx0, hy0, hx1, hy1, gold);
         }
     }
 
-    /** دکمه‌ی گردِ حباب با نقشِ ذره‌بین (روشن = طلایی). */
-    private static final class MagView extends View {
+    /** ✕ی خروج (مثلِ حبابِ ترجمه‌ی زنده): ذره‌بین را رویش رها کنید. */
+    private static final class CloseTargetView extends View {
+        private final float d;
         private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final Paint glyph = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private boolean on;
+        private final Paint cross = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private boolean hot;
 
-        MagView(Context c) {
+        CloseTargetView(Context c) {
             super(c);
+            d = c.getResources().getDisplayMetrics().density;
+            setLayerType(LAYER_TYPE_SOFTWARE, null);
             ring.setStyle(Paint.Style.STROKE);
-            glyph.setStyle(Paint.Style.STROKE);
-            glyph.setStrokeCap(Paint.Cap.ROUND);
+            ring.setStrokeWidth(1.5f * d);
+            ring.setColor(0xE6FFFFFF);
+            cross.setStyle(Paint.Style.STROKE);
+            cross.setStrokeCap(Paint.Cap.ROUND);
+            cross.setStrokeWidth(2.4f * d);
+            cross.setColor(Color.WHITE);
         }
 
-        void setActive(boolean a) { on = a; invalidate(); }
+        void setHot(boolean h) { hot = h; invalidate(); }
 
         @Override protected void onDraw(Canvas cv) {
-            float d = getResources().getDisplayMetrics().density;
-            float w = getWidth(), h = getHeight();
-            float r = Math.min(w, h) / 2f - 3 * d;
-            fill.setColor(on ? COLOR_GOLD : COLOR_INK);
-            cv.drawCircle(w / 2f, h / 2f, r, fill);
-            ring.setColor(on ? COLOR_INK : COLOR_GOLD);
-            ring.setStrokeWidth(2 * d);
-            cv.drawCircle(w / 2f, h / 2f, r, ring);
-            glyph.setColor(on ? COLOR_INK : Color.WHITE);
-            glyph.setStrokeWidth(3 * d);
-            float cx = w / 2f - 3 * d, cy = h / 2f - 3 * d, lr = 8 * d;
-            cv.drawCircle(cx, cy, lr, glyph);
-            float o = lr * 0.72f;
-            cv.drawLine(cx + o, cy + o, cx + o + 8 * d, cy + o + 8 * d, glyph);
+            float cx = getWidth() / 2f, cy = getHeight() / 2f;
+            float sc = hot ? 1.22f : 1f;
+            cv.save();
+            cv.scale(sc, sc, cx, cy);
+            fill.setColor(hot ? COLOR_REC : 0xE61C2541);
+            fill.setShadowLayer(8f * d, 0f, 2f * d, 0x66000000);
+            cv.drawCircle(cx, cy, 26f * d, fill);
+            cv.drawCircle(cx, cy, 25f * d, ring);
+            float k = 7.5f * d;
+            cv.drawLine(cx - k, cy - k, cx + k, cy + k, cross);
+            cv.drawLine(cx - k, cy + k, cx + k, cy - k, cross);
+            cv.restore();
         }
     }
 }
