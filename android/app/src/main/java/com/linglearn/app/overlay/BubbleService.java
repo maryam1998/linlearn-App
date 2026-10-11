@@ -523,7 +523,7 @@ public class BubbleService extends Service {
         if (ACTION_PROJECTION_RESULT.equals(action)) {
             handleProjectionResult(intent);
         } else if (ACTION_PROJECTION_DENIED.equals(action)) {
-            showNotice(isFa() ? "مجوز ضبط صدا داده نشد" : "Audio capture permission denied");
+            showNotice(msg("مجوز ضبط صدا داده نشد", "Audio capture permission denied"));
         } else {
             running = true;
             lastActiveMs = SystemClock.elapsedRealtime();
@@ -657,11 +657,13 @@ public class BubbleService extends Service {
         return "fa".equals(ui);
     }
 
-    /** زبانِ رابطِ اپ ("fa" یا "en") را از وب‌اپ می‌گیرد و ذخیره می‌کند. */
+    /** زبانِ رابطِ اپ (fa / en / es / de / fr / ar) را از وب‌اپ می‌گیرد و ذخیره می‌کند. */
     public static void saveUiLang(Context ctx, String lang) {
         if (lang == null) return;
         String l = lang.trim().toLowerCase(java.util.Locale.ROOT);
-        if (!l.equals("fa") && !l.equals("en")) return;
+        // fa / en / es / de / fr / ar — همه‌ی زبان‌های رابطِ اپ (قبلاً فقط fa و en ذخیره می‌شد)
+        if (!l.equals("fa") && !l.equals("en") && !l.equals("es") && !l.equals("de")
+                && !l.equals("fr") && !l.equals("ar")) return;
         ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("uiLang", l).apply();
     }
 
@@ -798,9 +800,8 @@ public class BubbleService extends Service {
         lastActiveMs = SystemClock.elapsedRealtime();
         idlePinned = !somethingPlaying(lastActiveMs);   // در سکوت باز شد → تا وقتی خودت نبندی (▾ یا لمسِ حباب) می‌مونه تا بخونی
         if (history.isEmpty()) {
-            showNotice(isFa()
-                    ? "لمس: شروع/توقف ضبط  ·  نگه‌داشتن: تاریخچه  ·  ✕ یا کشیدن به پایین: بستن"
-                    : "Tap: start/stop  ·  Hold: history  ·  ✕ or drag down: close");
+            showNotice(msg("لمس: شروع/توقف ضبط  ·  نگه‌داشتن: تاریخچه  ·  ✕ یا کشیدن به پایین: بستن",
+                    "Tap: start/stop  ·  Hold: history  ·  ✕ or drag down: close"));
         } else showPanel();
     }
 
@@ -4227,6 +4228,7 @@ public class BubbleService extends Service {
             startActivity(new Intent(this, ShareReceiverActivity.class)
                     .putExtra(ShareReceiverActivity.EXTRA_YT_CHOOSE, true)
                     .putExtra(ShareReceiverActivity.EXTRA_FA, isFa())
+                    .putExtra(ShareReceiverActivity.EXTRA_LANG, NativeI18n.lang(this))
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
         } catch (Throwable t) {
             YtMedia.openAccessSettings(this);
@@ -4331,6 +4333,7 @@ public class BubbleService extends Service {
             return n != null ? n : code;
         }
         @Override public boolean fa() { return isFa(); }
+        @Override public String lang() { return NativeI18n.lang(BubbleService.this); }
 
         @Override public void notice(String m) {
             if (m == null || m.isEmpty()) { clearStatus(); return; }
@@ -4471,7 +4474,7 @@ public class BubbleService extends Service {
         if (!rec) scheduleIdleDock();
     }
 
-    private String msg(String fa, String en) { return isFa() ? fa : en; }
+    private String msg(String fa, String en) { return NativeI18n.tr(NativeI18n.lang(this), fa, en); }
 
     // ───────── 📦 ترجمه‌ی زنده فقط با تشخیص گفتارِ آفلاین (بدونِ سرور و بدونِ تشخیص‌دهنده‌ی آنلاین) ─────────
 
@@ -4518,6 +4521,7 @@ public class BubbleService extends Service {
                     .putExtra(ShareReceiverActivity.EXTRA_PACK_NAME, name)
                     .putExtra(ShareReceiverActivity.EXTRA_PACK_MB, "whisper".equals(kind) ? WhisperModelManager.approxMb(id) : 0)
                     .putExtra(ShareReceiverActivity.EXTRA_FA, isFa())
+                    .putExtra(ShareReceiverActivity.EXTRA_LANG, NativeI18n.lang(this))
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION));
         } catch (Throwable t) {
             showNotice(msg("برای ترجمه‌ی زنده، بسته‌ی آفلاین را از تنظیماتِ اپ دانلود کنید",

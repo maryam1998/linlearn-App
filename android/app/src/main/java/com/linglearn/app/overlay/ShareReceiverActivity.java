@@ -39,6 +39,14 @@ public class ShareReceiverActivity extends Activity {
     /** از ▶ حباب (وقتی «دسترسی به اعلان‌ها» نیست): توضیحِ شفاف + انتخابِ «همگام با پخش» یا «فقط متنِ کامل». */
     static final String EXTRA_YT_CHOOSE = "com.linglearn.app.YT_CHOOSE";
     static final String EXTRA_FA = "com.linglearn.app.FA";
+    /** زبانِ رابطِ اپ: fa / en / es / de / fr / ar (جایگزینِ EXTRA_FAِ دوحالته). */
+    static final String EXTRA_LANG = "com.linglearn.app.LANG";
+    private String uiLang = "en";
+    private String L(String fa, String en) { return NativeI18n.tr(uiLang, fa, en); }
+    private String intentLang(Intent in) {
+        String l = in.getStringExtra(EXTRA_LANG);
+        return l != null ? NativeI18n.normalize(l) : (in.getBooleanExtra(EXTRA_FA, true) ? "fa" : "en");
+    }
     private boolean ytFullClip = false;
 
     /** از 🎙 حباب، وقتی بسته‌ی تشخیص گفتارِ آفلاین روی گوشی نیست: پیامِ تأییدِ دانلود. */
@@ -54,12 +62,12 @@ public class ShareReceiverActivity extends Activity {
         fromClip = getIntent() != null && getIntent().getBooleanExtra(EXTRA_FROM_CLIP, false);
         if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_ASR_PACK, false)) {
             Intent in = getIntent();
-            showAsrPackDialog(in.getBooleanExtra(EXTRA_FA, true), in.getStringExtra(EXTRA_PACK_KIND),
+            showAsrPackDialog(intentLang(in), in.getStringExtra(EXTRA_PACK_KIND),
                     in.getStringExtra(EXTRA_PACK_ID), in.getStringExtra(EXTRA_PACK_NAME), in.getIntExtra(EXTRA_PACK_MB, 0));
             return;
         }
         if (getIntent() != null && getIntent().getBooleanExtra(EXTRA_YT_CHOOSE, false)) {
-            showYtChoice(getIntent().getBooleanExtra(EXTRA_FA, true));
+            showYtChoice(intentLang(getIntent()));
             return;
         }
         if (fromClip) {
@@ -82,61 +90,64 @@ public class ShareReceiverActivity extends Activity {
         if (hasFocus && fromClip) finishFromClip();
     }
 
-    private void showAsrPackDialog(final boolean fa, final String kind, final String id, String name, int mb) {
+    private void showAsrPackDialog(final String ui, final String kind, final String id, String name, int mb) {
+        uiLang = ui;
         final boolean whisper = "whisper".equals(kind);
-        String size = mb > 0 ? (fa ? "حدود " + mb + " مگابایت" : "about " + mb + " MB")
-                : (fa ? "چند ده تا چند صد مگابایت" : "tens to a few hundred MB");
-        String msg = fa
-                ? "ترجمه‌ی زنده با تشخیص گفتارِ آفلاین انجام می‌شود: پردازش کاملاً روی گوشی شماست، صدا به هیچ سروری ارسال نمی‌شود و صفحه روان می‌ماند.\n\n"
+        String size = mb > 0 ? L("حدود " + mb + " مگابایت", "about " + mb + " MB")
+                : L("چند ده تا چند صد مگابایت", "tens to a few hundred MB");
+        String msg = L("ترجمه‌ی زنده با تشخیص گفتارِ آفلاین انجام می‌شود: پردازش کاملاً روی گوشی شماست، صدا به هیچ سروری ارسال نمی‌شود و صفحه روان می‌ماند.",
+                "Live translation uses offline speech recognition: processing happens entirely on your phone, no audio is sent to any server, and the screen stays smooth.")
+                + "\n\n"
                 + (whisper
-                    ? "برای این زبان (یا حالت «خودکار») بسته‌ی چندزبانه‌ی Whisper لازم است. این بسته از بسته‌های اختصاصیِ هر زبان کندتر است و ترجمه ممکن است با چند ثانیه تأخیر نمایش داده شود.\n\n"
-                    : "برای زبان «" + name + "» لازم است بسته‌ی آفلاین یک‌بار دانلود شود.\n\n")
-                + "حجم بسته: " + size + " — پیشنهاد می‌شود با Wi‑Fi وصل باشید. دانلود در صورت قطع شدن از همان‌جا ادامه پیدا می‌کند.\n\n"
-                + "بدون این بسته، ترجمه‌ی زنده کار نمی‌کند. دانلود شود؟"
-                : "Live translation uses offline speech recognition: processing happens entirely on your phone, no audio is sent to any server, and the screen stays smooth.\n\n"
-                + (whisper
-                    ? "This language (or “Auto”) needs the multilingual Whisper pack. It is slower than the per-language packs, so translations may appear a few seconds late.\n\n"
-                    : "A one-time offline pack is required for “" + name + "”.\n\n")
-                + "Pack size: " + size + ". We recommend Wi‑Fi. An interrupted download resumes where it stopped.\n\n"
-                + "Without this pack, live translation will not work. Download it now?";
+                    ? L("برای این زبان (یا حالت «خودکار») بسته‌ی چندزبانه‌ی Whisper لازم است. این بسته از بسته‌های اختصاصیِ هر زبان کندتر است و ترجمه ممکن است با چند ثانیه تأخیر نمایش داده شود.",
+                        "This language (or “Auto”) needs the multilingual Whisper pack. It is slower than the per-language packs, so translations may appear a few seconds late.")
+                    : L("برای زبان «" + name + "» لازم است بسته‌ی آفلاین یک‌بار دانلود شود.",
+                        "A one-time offline pack is required for “" + name + "”."))
+                + "\n\n"
+                + L("حجم بسته: " + size + " — پیشنهاد می‌شود با Wi‑Fi وصل باشید. دانلود در صورت قطع شدن از همان‌جا ادامه پیدا می‌کند.",
+                    "Pack size: " + size + ". We recommend Wi‑Fi. An interrupted download resumes where it stopped.")
+                + "\n\n"
+                + L("بدون این بسته، ترجمه‌ی زنده کار نمی‌کند. دانلود شود؟",
+                    "Without this pack, live translation will not work. Download it now?");
         AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle(fa ? "دانلود بسته‌ی تشخیص گفتار آفلاین" : "Download offline speech pack")
+                .setTitle(L("دانلود بسته‌ی تشخیص گفتار آفلاین", "Download offline speech pack"))
                 .setMessage(msg)
-                .setPositiveButton(fa ? "دانلود" : "Download", (dlg, w) -> {
+                .setPositiveButton(L("دانلود", "Download"), (dlg, w) -> {
                     BubbleService.startAsrPackDownload(getApplicationContext(), kind, id);
                     finish();
                 })
-                .setNegativeButton(fa ? "فعلاً نه" : "Not now", (dlg, w) -> finish())
+                .setNegativeButton(L("فعلاً نه", "Not now"), (dlg, w) -> finish())
                 .create();
         d.setOnCancelListener(x -> finish());
         d.show();
     }
 
-    private void showYtChoice(final boolean fa) {
-        String msg = fa
-                ? "۱) همگام با پخش: جمله‌ی در حال پخش پررنگ می‌شود و دکمه‌های ⏮ و ↺ کار می‌کنند. این روش «دسترسی به اعلان‌ها» می‌خواهد. "
+    private void showYtChoice(final String ui) {
+        uiLang = ui;
+        String msg = L("۱) همگام با پخش: جمله‌ی در حال پخش پررنگ می‌شود و دکمه‌های ⏮ و ↺ کار می‌کنند. این روش «دسترسی به اعلان‌ها» می‌خواهد. "
                 + "فقط اعلانِ خودِ یوتیوب برای تشخیصِ ویدیو و زمانِ پخش بررسی می‌شود؛ اعلان‌های برنامه‌های دیگر خوانده یا ذخیره نمی‌شوند، "
-                + "و هر وقت خواستی از تنظیماتِ اندروید خاموشش کن.\n\n"
-                + "۲) فقط متنِ کامل: بدونِ هیچ دسترسی. لینکِ ویدیو را در یوتیوب کپی کن (Share ← Copy link)، بعد «فقط متنِ کامل» را بزن؛ "
-                + "کلِ زیرنویس یک‌جا می‌آید، بدونِ پررنگ‌شدن، با دکمه‌ی تکرارِ کلِ متن."
-                : "1) Synced: highlights the sentence being played; ⏮ and ↺ work. Needs “Notification access”. "
+                + "و هر وقت خواستی از تنظیماتِ اندروید خاموشش کن.",
+                "1) Synced: highlights the sentence being played; ⏮ and ↺ work. Needs “Notification access”. "
                 + "Only YouTube's own notification is checked (to detect the video and its play time); other apps' notifications are not read or stored. "
-                + "You can turn it off anytime in Android settings.\n\n"
-                + "2) Full text only: no permission. Copy the video link in YouTube (Share → Copy link), then tap “Full text only”; "
-                + "all subtitles load at once, with no highlighting, plus a repeat-all-text button.";
+                + "You can turn it off anytime in Android settings.")
+                + "\n\n"
+                + L("۲) فقط متنِ کامل: بدونِ هیچ دسترسی. لینکِ ویدیو را در یوتیوب کپی کن (Share ← Copy link)، بعد «فقط متنِ کامل» را بزن؛ "
+                + "کلِ زیرنویس یک‌جا می‌آید، بدونِ پررنگ‌شدن، با دکمه‌ی تکرارِ کلِ متن.",
+                "2) Full text only: no permission. Copy the video link in YouTube (Share → Copy link), then tap “Full text only”; "
+                + "all subtitles load at once, with no highlighting, plus a repeat-all-text button.");
         AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
-                .setTitle(fa ? "زیرنویس یوتیوب" : "YouTube subtitles")
+                .setTitle(L("زیرنویس یوتیوب", "YouTube subtitles"))
                 .setMessage(msg)
-                .setPositiveButton(fa ? "فقط متنِ کامل" : "Full text only", (dlg, w) -> {
+                .setPositiveButton(L("فقط متنِ کامل", "Full text only"), (dlg, w) -> {
                     ytFullClip = true; fromClip = true; clipDone = false;
                     // کلیپ‌بورد فقط وقتی خوانده می‌شود که پنجره فوکوس داشته باشد
                     new Handler(Looper.getMainLooper()).postDelayed(this::finishFromClip, 900);
                 })
-                .setNeutralButton(fa ? "همگام‌سازی" : "Synced", (dlg, w) -> {
+                .setNeutralButton(L("همگام‌سازی", "Synced"), (dlg, w) -> {
                     YtMedia.openAccessSettings(this);
                     finish();
                 })
-                .setNegativeButton(fa ? "بستن" : "Close", (dlg, w) -> finish())
+                .setNegativeButton(L("بستن", "Close"), (dlg, w) -> finish())
                 .create();
         d.setOnCancelListener(x -> finish());
         d.show();

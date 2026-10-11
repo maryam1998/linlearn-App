@@ -497,7 +497,7 @@ public class MagnifierService extends Service {
     // زبانِ متن‌های ذره‌بین = «زبان نرم‌افزار» در تنظیماتِ اپ (نه زبانِ مقصدِ ترجمه)
     private boolean uiFa() { return BubbleService.uiLangIsFa(this); }
 
-    private String msg(String fa, String en) { return uiFa() ? fa : en; }
+    private String msg(String fa, String en) { return NativeI18n.tr(NativeI18n.lang(this), fa, en); }
 
     private String sourceLang() {
         String s = prefs().getString("source", "en");

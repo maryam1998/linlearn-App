@@ -70,6 +70,8 @@ final class YtSubtitles {
         String tone();
         String langName(String code);
         boolean fa();
+        /** زبانِ رابطِ اپ: fa / en / es / de / fr / ar */
+        default String lang() { return fa() ? "fa" : "en"; }
         /** پیامِ کوتاهِ وضعیت؛ "" = پاک کن. */
         void notice(String message);
         /** کلِ زیرنویس (جمله‌به‌جمله) رسید: همه‌ی جمله‌ها یک‌جا و کم‌رنگ در پنل چیده شوند.
@@ -288,7 +290,7 @@ final class YtSubtitles {
         if (active) main.post(this::pump);
     }
 
-    private String msg(String fa, String en) { return host.fa() ? fa : en; }
+    private String msg(String fa, String en) { return NativeI18n.tr(host.lang(), fa, en); }
 
     // ════════════════════ ۱) ویدیو و زمانِ پخش ════════════════════
 
