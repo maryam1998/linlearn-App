@@ -361,7 +361,9 @@ public class BubbleService extends Service {
         long now = SystemClock.elapsedRealtime();
         boolean active = somethingPlaying(now);
         boolean busy = panelDragging || (wordCard != null && wordCard.getVisibility() == View.VISIBLE)
-                || (scroll != null && (scroll.frozen || SystemClock.uptimeMillis() - scroll.lastUserTouch < 6000));
+                || (scroll != null && (scroll.frozen || SystemClock.uptimeMillis() - scroll.lastUserTouch < 6000))
+                // تمرینِ shadowing: وسطِ ضبط/پخشِ صدای خودت کادر نباید جمع بشه (ضبط حداکثر ۱۰ دقیقه حساب می‌شود)
+                || (shadowRecording && now - shadowStartMs < 600000) || shadowPlayer != null;
         if (active || busy) lastActiveMs = now;
         if (!active) activeSinceMs = 0;
         else if (activeSinceMs == 0) activeSinceMs = now;
@@ -1215,6 +1217,7 @@ public class BubbleService extends Service {
     // ---------- 🎙 shadowing: ضبطِ صدای کاربر و پخشِ دوباره ----------
     private TextView tvShadowRec, tvShadowPlay;
     private boolean shadowRecording = false;
+    private long shadowStartMs = 0;
     private String shadowPath = null;
     private MediaPlayer shadowPlayer;
 
@@ -1241,6 +1244,7 @@ public class BubbleService extends Service {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
             startActivity(i);
             shadowRecording = true;
+            shadowStartMs = SystemClock.elapsedRealtime();
             shadowPath = null;
             updateShadowUi();
             lastActiveMs = SystemClock.elapsedRealtime();
@@ -1264,6 +1268,7 @@ public class BubbleService extends Service {
         s.uiHandlerPost(() -> {
             s.shadowRecording = false;
             s.shadowPath = path;
+            s.lastActiveMs = SystemClock.elapsedRealtime();
             s.updateShadowUi();
             if (path != null) s.shadowPlay();
         });
@@ -1291,7 +1296,7 @@ public class BubbleService extends Service {
         try {
             final MediaPlayer mp = new MediaPlayer();
             mp.setDataSource(shadowPath);
-            mp.setOnCompletionListener(m -> { try { m.release(); } catch (Exception ignored) {} if (shadowPlayer == m) shadowPlayer = null; });
+            mp.setOnCompletionListener(m -> { try { m.release(); } catch (Exception ignored) {} if (shadowPlayer == m) shadowPlayer = null; lastActiveMs = SystemClock.elapsedRealtime(); });
             mp.setOnErrorListener((m, w, e) -> { try { m.release(); } catch (Exception ignored) {} if (shadowPlayer == m) shadowPlayer = null; return true; });
             mp.prepare();
             mp.start();
