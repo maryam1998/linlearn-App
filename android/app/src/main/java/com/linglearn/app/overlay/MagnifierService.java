@@ -494,7 +494,8 @@ public class MagnifierService extends Service {
 
     private SharedPreferences prefs() { return getSharedPreferences(PREFS, MODE_PRIVATE); }
 
-    private boolean uiFa() { return "fa".equals(prefs().getString("target", "fa")); }
+    // زبانِ متن‌های ذره‌بین = «زبان نرم‌افزار» در تنظیماتِ اپ (نه زبانِ مقصدِ ترجمه)
+    private boolean uiFa() { return BubbleService.uiLangIsFa(this); }
 
     private String msg(String fa, String en) { return uiFa() ? fa : en; }
 

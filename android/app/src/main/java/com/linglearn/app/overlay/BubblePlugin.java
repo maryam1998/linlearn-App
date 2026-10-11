@@ -209,6 +209,14 @@ public class BubblePlugin extends Plugin {
         call.resolve();
     }
 
+    // setUiLang({ lang: "fa"|"en" }) — زبانِ رابطِ اپ؛ کادرِ ترجمه‌ی زنده و ذره‌بین هم به همین زبان نشون داده می‌شن
+    @PluginMethod
+    public void setUiLang(PluginCall call) {
+        BubbleService.saveUiLang(getContext(), call.getString("lang"));
+        BubbleService.settingsChanged();
+        call.resolve();
+    }
+
     // setDisplayMode({ mode: "both"|"original"|"translation" })
     @PluginMethod
     public void setDisplayMode(PluginCall call) {

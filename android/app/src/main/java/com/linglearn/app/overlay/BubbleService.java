@@ -645,7 +645,25 @@ public class BubbleService extends Service {
         return a.isEmpty() ? null : a.get(0);
     }
 
-    private boolean isFa() { return "fa".equals(targetLang()); }
+    // زبانِ متن‌های کادر (ترجمه‌ی زنده، کادرِ لغت، اعلان‌ها) = «زبان نرم‌افزار» در تنظیماتِ اپ،
+    // نه زبانِ مقصدِ ترجمه. اگه اپ هنوز زبانِ رابط رو نفرستاده بود، مثلِ قبل از زبانِ مقصد می‌خونه.
+    private boolean isFa() { return uiLangIsFa(this); }
+
+    /** true = رابطِ اپ فارسی است (برای BubbleService و MagnifierService مشترک). */
+    static boolean uiLangIsFa(Context ctx) {
+        SharedPreferences sp = ctx.getSharedPreferences(PREFS, MODE_PRIVATE);
+        String ui = sp.getString("uiLang", null);
+        if (ui == null || ui.isEmpty()) ui = sp.getString("target", "fa");
+        return "fa".equals(ui);
+    }
+
+    /** زبانِ رابطِ اپ ("fa" یا "en") را از وب‌اپ می‌گیرد و ذخیره می‌کند. */
+    public static void saveUiLang(Context ctx, String lang) {
+        if (lang == null) return;
+        String l = lang.trim().toLowerCase(java.util.Locale.ROOT);
+        if (!l.equals("fa") && !l.equals("en")) return;
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString("uiLang", l).apply();
+    }
 
     private void addBubbleIfNeeded() {
         if (bubble != null) return;
