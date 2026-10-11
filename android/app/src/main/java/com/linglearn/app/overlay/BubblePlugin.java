@@ -217,6 +217,37 @@ public class BubblePlugin extends Plugin {
         call.resolve();
     }
 
+    // 🔍 حبابِ ذره‌بین: magnifierStart({ targetLang?, targetLangs?, sourceLang? }) — اول مجوزِ ضبطِ صفحه از کاربر می‌پرسد
+    @PluginMethod
+    public void magnifierStart(PluginCall call) {
+        Context ctx = getContext();
+        if (!Settings.canDrawOverlays(ctx)) {
+            call.reject("Overlay permission not granted");
+            return;
+        }
+        BubbleService.saveLangs(ctx, call.getString("targetLang"), call.getString("sourceLang"));
+        BubbleService.saveTargets(ctx, targetsCsv(call));
+        Intent i = new Intent(ctx, ProjectionActivity.class)
+                .putExtra(ProjectionActivity.EXTRA_MAGNIFIER, true)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        ctx.startActivity(i);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void magnifierStop(PluginCall call) {
+        Context ctx = getContext();
+        ctx.stopService(new Intent(ctx, MagnifierService.class));
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void magnifierIsRunning(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("running", MagnifierService.running);
+        call.resolve(ret);
+    }
+
     @PluginMethod
     public void isRunning(PluginCall call) {
         JSObject ret = new JSObject();
